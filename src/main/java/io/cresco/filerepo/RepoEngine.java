@@ -99,7 +99,7 @@ public class RepoEngine {
 
             File folder = new File(scanDirString);
 
-            logger.info("scan dir: " + getRepoDir(scanRepo).getAbsolutePath());
+            logger.info("scan dir: " + scanDirString);
 
             File[] listOfFiles = folder.listFiles();
 
@@ -229,7 +229,7 @@ public class RepoEngine {
                                                      logger.error(ex.getMessage());
                                                     }
                                                 }
-                                                
+
                                             } else {
                                                 logger.error("Filename: " + fileName + " on transfer list, but not found locally!");
                                             }
@@ -281,9 +281,35 @@ public class RepoEngine {
         }
     }
 
+    private File getRootRepoDir() {
+        File repoDir = null;
+        try {
+
+            String repoDirString =  plugin.getConfig().getStringParam("repo_dir", "filerepo");
+
+
+            File tmpRepo = new File(repoDirString);
+            if(tmpRepo.isDirectory()) {
+                repoDir = tmpRepo;
+            } else {
+                tmpRepo.mkdir();
+                repoDir = tmpRepo;
+            }
+
+        } catch(Exception ex) {
+            ex.printStackTrace();
+        }
+        return repoDir;
+    }
+
     private File getRepoDir(String repoDirString) {
         File repoDir = null;
         try {
+
+            String rootRepo = getRootRepoDir().getAbsolutePath();
+
+            repoDirString = rootRepo + "/" + repoDirString;
+
 
             File tmpRepo = new File(repoDirString);
             if(tmpRepo.isDirectory()) {
@@ -320,8 +346,6 @@ public class RepoEngine {
         boolean isUploaded = false;
         try {
 
-
-
                 String fileSavePath = getRepoDir(repoName).getAbsolutePath() + "/" + fileName;
                 File checkFile = new File(fileSavePath);
 
@@ -349,6 +373,8 @@ public class RepoEngine {
                             isUploaded = true;
                         }
                     }
+                } else {
+                    logger.info("file exist : " + checkFile.exists() + " overwrite=" + overwrite);
                 }
 
 
