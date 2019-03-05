@@ -11,13 +11,13 @@
 
     <name>Cresco Repo</name>
     <description>Cresco framework plugin repo</description>
-    <url>https://github.com/CrescoEdge/repo</url>
+    <url>https://github.com/CrescoEdge/filerepo</url>
 
     <licenses>
         <license>
             <name>Apache License, Version 2.0</name>
             <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
-            <distribution>repo</distribution>
+            <distribution>filerepo</distribution>
         </license>
     </licenses>
 
@@ -36,7 +36,7 @@
     <scm>
         <connection>scm:git:git://github.com/CrescoEdge/filerepo.git</connection>
         <developerConnection>scm:git:git://github.com/CrescoEdge/filerepo.git</developerConnection>
-        <url>git@github.com:CrescoEdge/repo.git</url>
+        <url>git@github.com:CrescoEdge/filerepo.git</url>
     </scm>
 
 
@@ -142,11 +142,11 @@
                 <configuration>
                     <instructions>
                         <Bundle-SymbolicName>${project.groupId}.${project.artifactId}</Bundle-SymbolicName>
-                        <Bundle-Name>Repo</Bundle-Name>
-                        <Bundle-Description>Repo Plugin</Bundle-Description>
+                        <Bundle-Name>FileRepo</Bundle-Name>
+                        <Bundle-Description>FileRepo Plugin</Bundle-Description>
                         <Bundle-Vendor>Cresco.io</Bundle-Vendor>
                         <Bundle-Version>${project.version}-${maven.build.timestamp}</Bundle-Version>
-                        <Bundle-Activator>io.cresco.repo.Activator</Bundle-Activator>
+                        <Bundle-Activator>io.cresco.filerepo.Activator</Bundle-Activator>
                         <Import-Package>*;resolution:=optional</Import-Package>
                         <Embed-Dependency>!org.osgi.*;!osgi.cmpn.*;!library;*</Embed-Dependency>
                         <Bundle-RequiredExecutionEnvironment>JavaSE-1.8</Bundle-RequiredExecutionEnvironment>
