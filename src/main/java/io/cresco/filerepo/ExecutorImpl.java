@@ -221,10 +221,11 @@ public class ExecutorImpl implements Executor {
             if((fileName != null) && (fileMD5 != null) && (repoName != null) && (fileData != null)) {
 
                 try{
-                    overwrite = Boolean.parseBoolean(incoming.getParam("overwrite"));
-                    logger.error("putFile(" + fileName + ") = overwrite=true");
+                    if(incoming.getParam("overwrite") != null) {
+                        overwrite = Boolean.parseBoolean(incoming.getParam("overwrite"));
+                    }
                 } catch(Exception ex){
-                    //
+                    ex.printStackTrace();
                 }
 
                 if(repoEngine.putFile(fileName,fileMD5,repoName,fileData,overwrite)) {

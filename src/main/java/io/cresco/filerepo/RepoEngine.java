@@ -215,6 +215,21 @@ public class RepoEngine {
 
                                                 filePutRequest.setDataParam("filedata", java.nio.file.Files.readAllBytes(filePath));
 
+                                                MsgEvent filePutResponse = plugin.sendRPC(filePutRequest);
+                                                if(filePutResponse != null) {
+                                                    //incoming.setParam("uploaded", Boolean.TRUE.toString());
+                                                    try {
+                                                        if(!Boolean.parseBoolean(filePutResponse.getParam("uploaded"))) {
+                                                            logger.info("Error transfering : " + fileName + " to " +  region + " " + agent + " " + pluginID );
+                                                        } else {
+                                                            logger.info("Transfered : " + fileName);
+                                                        }
+                                                    } catch (Exception ex) {
+                                                     logger.error("Could not verify transfer");
+                                                     logger.error(ex.getMessage());
+                                                    }
+                                                }
+                                                
                                             } else {
                                                 logger.error("Filename: " + fileName + " on transfer list, but not found locally!");
                                             }
