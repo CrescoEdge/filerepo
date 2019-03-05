@@ -34,8 +34,8 @@
 
 
     <scm>
-        <connection>scm:git:git://github.com/CrescoEdge/repo.git</connection>
-        <developerConnection>scm:git:git://github.com/CrescoEdge/repo.git</developerConnection>
+        <connection>scm:git:git://github.com/CrescoEdge/filerepo.git</connection>
+        <developerConnection>scm:git:git://github.com/CrescoEdge/filerepo.git</developerConnection>
         <url>git@github.com:CrescoEdge/repo.git</url>
     </scm>
 
