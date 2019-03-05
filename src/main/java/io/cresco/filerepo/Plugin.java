@@ -67,6 +67,7 @@ public class Plugin implements PluginService {
                 this.logger = pluginBuilder.getLogger(Plugin.class.getName(), CLogger.Level.Info);
 
                 repoEngine = new RepoEngine(pluginBuilder);
+                logger.info("Starting repoEngine...");
 
                 this.executor = new ExecutorImpl(pluginBuilder, repoEngine);
                 pluginBuilder.setExecutor(executor);

@@ -61,6 +61,8 @@ public class ExecutorImpl implements Executor {
                     return putPluginJar(incoming);
                 case "putfile":
                     return putFile(incoming);
+                case "repolistin":
+                    return repoListIn(incoming);
 
             }
         }
@@ -211,7 +213,7 @@ public class ExecutorImpl implements Executor {
 
             String fileName = incoming.getParam("filename");
             String fileMD5 = incoming.getParam("md5");
-            String repoName = incoming.getParam("reponame");
+            String repoName = incoming.getParam("repo_name");
             byte[] fileData = incoming.getDataParam("filedata");
 
             boolean overwrite = false;
@@ -239,6 +241,27 @@ public class ExecutorImpl implements Executor {
 
         if(incoming.getParams().containsKey("filedata")) {
             incoming.removeParam("filedata");
+        }
+
+        return incoming;
+    }
+
+    private MsgEvent repoListIn(MsgEvent incoming) {
+
+        try {
+
+            String repoListStringIn = incoming.getCompressedParam("repolistin");
+            String repoIn = incoming.getParam("repo");
+
+            if((repoListStringIn != null) && (repoIn != null)) {
+
+                String repoDiffString = repoEngine.getFileRepoDiff(repoIn,repoListStringIn);
+                incoming.setCompressedParam("repodiff",repoDiffString);
+
+            }
+
+        } catch(Exception ex){
+            ex.printStackTrace();
         }
 
         return incoming;
