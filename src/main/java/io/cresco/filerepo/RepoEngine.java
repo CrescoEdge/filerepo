@@ -2,6 +2,7 @@ package io.cresco.filerepo;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import com.sun.org.apache.xpath.internal.operations.Bool;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
@@ -210,6 +211,9 @@ public class RepoEngine {
                                                 filePutRequest.setParam("filename", fileName);
                                                 filePutRequest.setParam("md5", fileObject.MD5);
                                                 filePutRequest.setParam("repo_name",scanRepo);
+                                                //overwrite remote files
+                                                filePutRequest.setParam("overwrite", Boolean.TRUE.toString());
+
 
                                                 Path filePath = Paths.get(fileObject.filePath);
 
@@ -285,7 +289,7 @@ public class RepoEngine {
         File repoDir = null;
         try {
 
-            String repoDirString =  plugin.getConfig().getStringParam("repo_dir", "filerepo");
+            String repoDirString =  plugin.getConfig().getStringParam("filerepo_dir", "filerepo");
 
 
             File tmpRepo = new File(repoDirString);
