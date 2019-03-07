@@ -173,7 +173,7 @@ public class RepoEngine {
 
                                 logger.error("SEND :" + region + " " + agent + " " + pluginID + " data");
 
-                                MsgEvent fileRepoRequest = plugin.getRegionalPluginMsgEvent(MsgEvent.Type.EXEC,agent,pluginID);
+                                MsgEvent fileRepoRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginID);
                                 fileRepoRequest.setParam("action","repolistin");
                                 String repoListStringIn = getFileRepoList(scanRepo);
 
@@ -205,7 +205,7 @@ public class RepoEngine {
 
                                             if(myFileMap.containsKey(fileName)) {
 
-                                                MsgEvent filePutRequest = plugin.getRegionalPluginMsgEvent(MsgEvent.Type.EXEC, agent, pluginID);
+                                                MsgEvent filePutRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginID);
                                                 filePutRequest.setParam("action", "putfile");
 
                                                 filePutRequest.setParam("filename", fileName);
