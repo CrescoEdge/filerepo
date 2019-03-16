@@ -108,7 +108,7 @@ public class RepoEngine {
                 if (listOfFiles[i].isFile()) {
                     String fileName = listOfFiles[i].getName();
                     String filePath = listOfFiles[i].getAbsolutePath();
-                    String MD5hash = plugin.getJarMD5(filePath);
+                    String MD5hash = plugin.getAgentService().getDataPlaneService().getMD5(filePath);
                     logger.info("fileName:" + fileName + " MD5:" + MD5hash + " filepath:" + filePath);
                     FileObject fileObject = new FileObject(fileName,MD5hash,scanRepo,filePath);
                     fileObjectMap.put(fileName, fileObject);
@@ -217,7 +217,8 @@ public class RepoEngine {
 
                                                 Path filePath = Paths.get(fileObject.filePath);
 
-                                                filePutRequest.setDataParam("filedata", java.nio.file.Files.readAllBytes(filePath));
+                                                //filePutRequest.setDataParam("filedata", java.nio.file.Files.readAllBytes(filePath));
+                                                filePutRequest.addFile(filePath.toAbsolutePath().toString());
 
                                                 MsgEvent filePutResponse = plugin.sendRPC(filePutRequest);
                                                 if(filePutResponse != null) {
@@ -359,7 +360,7 @@ public class RepoEngine {
                     Files.write(path, fileData);
                     File fileSaved = new File(fileSavePath);
                     if (fileSaved.isFile()) {
-                        String md5 = plugin.getJarMD5(fileSavePath);
+                        String md5 = plugin.getAgentService().getDataPlaneService().getMD5(fileSavePath);
                         if (fileMD5.equals(md5)) {
 
                             FileObject fileObject = new FileObject(fileName, fileMD5, repoName, fileSavePath);
@@ -380,6 +381,53 @@ public class RepoEngine {
                 } else {
                     logger.info("file exist : " + checkFile.exists() + " overwrite=" + overwrite);
                 }
+
+
+        } catch(Exception ex){
+            ex.printStackTrace();
+        }
+
+        return isUploaded;
+    }
+
+    public Boolean putFile(String fileName, String fileMD5, String repoName, String filePath, boolean overwrite) {
+
+        boolean isUploaded = false;
+        try {
+
+            String fileSavePath = getRepoDir(repoName).getAbsolutePath() + "/" + fileName;
+            File checkFile = new File(fileSavePath);
+
+            if((!checkFile.exists()) || (overwrite)) {
+
+                File fileSaved = new File(fileSavePath);
+
+                //move file from temp to requested location
+                Path tmpFilePath = Paths.get(filePath);
+                Files.move(tmpFilePath,fileSaved.toPath());
+
+                if (fileSaved.isFile()) {
+                    String md5 = plugin.getAgentService().getDataPlaneService().getMD5(fileSavePath);
+                    if (fileMD5.equals(md5)) {
+
+                        FileObject fileObject = new FileObject(fileName, fileMD5, repoName, fileSavePath);
+
+                        synchronized (lockFileMap) {
+                            if(!fileMap.containsKey(repoName)) {
+                                Map<String,FileObject> repoFileMap = new HashMap<>();
+                                repoFileMap.put(fileName,fileObject);
+                                fileMap.put(repoName, repoFileMap);
+                            } else {
+                                fileMap.get(repoName).put(fileName,fileObject);
+                            }
+                        }
+
+                        isUploaded = true;
+                    }
+                }
+            } else {
+                logger.info("file exist : " + checkFile.exists() + " overwrite=" + overwrite);
+            }
 
 
         } catch(Exception ex){

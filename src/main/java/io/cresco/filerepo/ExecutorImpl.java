@@ -214,11 +214,12 @@ public class ExecutorImpl implements Executor {
             String fileName = incoming.getParam("filename");
             String fileMD5 = incoming.getParam("md5");
             String repoName = incoming.getParam("repo_name");
-            byte[] fileData = incoming.getDataParam("filedata");
+            //byte[] fileData = incoming.getDataParam("filedata");
+            String filePath = incoming.getFileList().get(0);
 
             boolean overwrite = false;
 
-            if((fileName != null) && (fileMD5 != null) && (repoName != null) && (fileData != null)) {
+            if((fileName != null) && (fileMD5 != null) && (repoName != null) && (filePath != null)) {
 
                 try{
                     if(incoming.getParam("overwrite") != null) {
@@ -228,7 +229,7 @@ public class ExecutorImpl implements Executor {
                     ex.printStackTrace();
                 }
 
-                if(repoEngine.putFile(fileName,fileMD5,repoName,fileData,overwrite)) {
+                if(repoEngine.putFile(fileName,fileMD5,repoName,filePath,overwrite)) {
                     incoming.setParam("uploaded", Boolean.TRUE.toString());
                 } else {
                     incoming.setParam("uploaded", Boolean.FALSE.toString());
