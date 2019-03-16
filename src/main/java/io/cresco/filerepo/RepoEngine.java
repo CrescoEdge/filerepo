@@ -262,6 +262,7 @@ public class RepoEngine {
             public void run() {
                 try {
                     if(!inScan.get()) {
+                        inScan.set(true);
                         //build file list
                         buildRepoList();
                         //find other repos
