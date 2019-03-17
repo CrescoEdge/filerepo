@@ -59,10 +59,13 @@ public class ExecutorImpl implements Executor {
                     return getPluginJar(incoming);
                 case "putjar":
                     return putPluginJar(incoming);
-                case "putfile":
+                case "putfiles":
                     return putFile(incoming);
                 case "repolistin":
                     return repoListIn(incoming);
+                case "repoconfirm":
+                    confirmTransfer(incoming);
+                    break;
 
             }
         }
@@ -207,19 +210,24 @@ public class ExecutorImpl implements Executor {
         return incoming;
     }
 
+    private void confirmTransfer(MsgEvent incoming) {
+        repoEngine.confirmTransfer(incoming.getParam("transfer_id"));
+    }
+
     private MsgEvent putFile(MsgEvent incoming) {
 
         try {
 
-            String fileName = incoming.getParam("filename");
-            String fileMD5 = incoming.getParam("md5");
+            //String fileName = incoming.getParam("filename");
+            //String fileMD5 = incoming.getParam("md5");
             String repoName = incoming.getParam("repo_name");
             //byte[] fileData = incoming.getDataParam("filedata");
-            String filePath = incoming.getFileList().get(0);
+            //String filePath = incoming.getFileList().get(0);
+            List<String> fileList = incoming.getFileList();
 
             boolean overwrite = false;
 
-            if((fileName != null) && (fileMD5 != null) && (repoName != null) && (filePath != null)) {
+            if(fileList != null) {
 
                 try{
                     if(incoming.getParam("overwrite") != null) {
@@ -229,10 +237,14 @@ public class ExecutorImpl implements Executor {
                     ex.printStackTrace();
                 }
 
-                if(repoEngine.putFile(fileName,fileMD5,repoName,filePath,overwrite)) {
-                    incoming.setParam("uploaded", Boolean.TRUE.toString());
+                if(repoEngine.putFiles(fileList,repoName, overwrite)) {
+                    MsgEvent filesConfirm = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,incoming.getSrcRegion(),incoming.getSrcAgent(),incoming.getSrcPlugin());
+                    filesConfirm.setParam("action", "repoconfirm");
+                    filesConfirm.setParam("transfer_id", incoming.getParam("transfer_id"));
+                    plugin.msgOut(filesConfirm);
+                    logger.info("SEND CONFIRMATION MESSAGE!");
                 } else {
-                    incoming.setParam("uploaded", Boolean.FALSE.toString());
+                    logger.error("PUTFILES FAILED!!");
                 }
 
             }
@@ -245,7 +257,7 @@ public class ExecutorImpl implements Executor {
             incoming.removeParam("filedata");
         }
 
-        return incoming;
+        return null;
     }
 
     private MsgEvent repoListIn(MsgEvent incoming) {

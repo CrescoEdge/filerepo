@@ -24,7 +24,7 @@ public class RepoEngine {
 
     private Type repoListType;
 
-    private AtomicBoolean inScan = new AtomicBoolean();
+    private AtomicBoolean inScan = new AtomicBoolean(false);
 
     private AtomicBoolean lockFileMap = new AtomicBoolean();
     private Map<String, Map<String,FileObject>> fileMap;
@@ -32,7 +32,10 @@ public class RepoEngine {
     private Timer fileScanTimer;
 
     private String scanRepo;
-    String scanDirString;
+    private String scanDirString;
+
+    private String transferId;
+
 
     public RepoEngine(PluginBuilder pluginBuilder) {
 
@@ -48,6 +51,21 @@ public class RepoEngine {
 
 
         fileMap = Collections.synchronizedMap(new HashMap<>());
+
+    }
+
+    public void confirmTransfer(String incomingTransferId) {
+        try{
+            if(incomingTransferId != null) {
+                if(transferId.equals(incomingTransferId)) {
+                    transferId = null;
+                    inScan.set(false);
+                }
+            }
+        } catch (Exception ex) {
+            logger.error(ex.getMessage());
+            ex.printStackTrace();
+        }
 
     }
 
@@ -191,20 +209,38 @@ public class RepoEngine {
 
                                         Map<String,FileObject> sendFileMap = gson.fromJson(repoDiffString, repoListType);
 
-                                        Map<String,FileObject> myFileMap = new HashMap<>();
+                                        if(sendFileMap.size() > 0) {
 
-                                        synchronized (lockFileMap) {
-                                            if(fileMap.containsKey(scanRepo)) {
-                                                myFileMap.putAll(fileMap.get(scanRepo));
+                                            transferId = UUID.randomUUID().toString();
+
+                                            Map<String, FileObject> myFileMap = new HashMap<>();
+
+                                            synchronized (lockFileMap) {
+                                                if (fileMap.containsKey(scanRepo)) {
+                                                    myFileMap.putAll(fileMap.get(scanRepo));
+                                                }
                                             }
-                                        }
 
-                                        for (Map.Entry<String, FileObject> entry : sendFileMap.entrySet()) {
-                                            String fileName = entry.getKey();
-                                            FileObject fileObject = entry.getValue();
+                                            MsgEvent filePutRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginID);
+                                            filePutRequest.setParam("action", "putfiles");
 
-                                            if(myFileMap.containsKey(fileName)) {
+                                            //filePutRequest.setParam("filename", fileName);
+                                            //filePutRequest.setParam("md5", fileObject.MD5);
+                                            filePutRequest.setParam("repo_name", scanRepo);
+                                            filePutRequest.setParam("transfer_id", transferId);
+                                            //overwrite remote files
+                                            filePutRequest.setParam("overwrite", Boolean.TRUE.toString());
 
+                                            for (Map.Entry<String, FileObject> entry : sendFileMap.entrySet()) {
+                                                String fileName = entry.getKey();
+                                                FileObject fileObject = entry.getValue();
+
+                                                if (myFileMap.containsKey(fileName)) {
+
+                                                    Path filePath = Paths.get(fileObject.filePath);
+                                                    filePutRequest.addFile(filePath.toAbsolutePath().toString());
+
+                                                /*
                                                 MsgEvent filePutRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginID);
                                                 filePutRequest.setParam("action", "putfile");
 
@@ -234,12 +270,21 @@ public class RepoEngine {
                                                      logger.error(ex.getMessage());
                                                     }
                                                 }
-
-                                            } else {
-                                                logger.error("Filename: " + fileName + " on transfer list, but not found locally!");
+                                                */
+                                                } else {
+                                                    logger.error("Filename: " + fileName + " on transfer list, but not found locally!");
+                                                }
                                             }
+
+                                            //ready to send
+                                            plugin.msgOut(filePutRequest);
+
                                         }
                                     }
+
+                                    //
+
+
                                 }
                             }
                         }
@@ -261,13 +306,23 @@ public class RepoEngine {
         TimerTask fileScanTask = new TimerTask() {
             public void run() {
                 try {
+
                     if(!inScan.get()) {
+                        logger.error("\t\t ***STARTING SCAN " + inScan.get() + " tid:" + transferId);
                         inScan.set(true);
+                        logger.error("\t\t ***STARTED SCAN " + inScan.get());
                         //build file list
                         buildRepoList();
                         //find other repos
                         syncRegionFiles();
-                        inScan.set(false);
+                        logger.error("\t\t ***ENDING SCAN " + inScan.get());
+                        //inScan.set(false);
+                        logger.error("\t\t ***ENDED SCAN " + inScan.get());
+                        if(transferId == null) {
+                            inScan.set(false);
+                        }
+                    } else {
+                        logger.error("\t\t ***ALREADY IN SCAN");
                     }
 
                 } catch (Exception ex) {
@@ -428,6 +483,62 @@ public class RepoEngine {
                 }
             } else {
                 logger.info("file exist : " + checkFile.exists() + " overwrite=" + overwrite);
+            }
+
+
+        } catch(Exception ex){
+            ex.printStackTrace();
+        }
+
+        return isUploaded;
+    }
+
+    public Boolean putFiles(List<String> fileList, String repoName, boolean overwrite) {
+
+        boolean isUploaded = false;
+        try {
+
+            boolean isFault = false;
+
+            for(String incomingFileName : fileList) {
+
+                Path tmpFilePath = Paths.get(incomingFileName);
+
+                String fileSavePath = getRepoDir(repoName).getAbsolutePath() + "/" + tmpFilePath.getFileName();
+                File checkFile = new File(fileSavePath);
+
+                if ((!checkFile.exists()) || (overwrite)) {
+
+                    File fileSaved = new File(fileSavePath);
+
+                    //move file from temp to requested location
+                    Files.move(tmpFilePath, fileSaved.toPath());
+
+                    if (fileSaved.isFile()) {
+                        String md5 = plugin.getAgentService().getDataPlaneService().getMD5(fileSavePath);
+
+                            FileObject fileObject = new FileObject(fileSaved.getName(), md5, repoName, fileSavePath);
+
+                            synchronized (lockFileMap) {
+                                if (!fileMap.containsKey(repoName)) {
+                                    Map<String, FileObject> repoFileMap = new HashMap<>();
+                                    repoFileMap.put(fileSaved.getName(), fileObject);
+                                    fileMap.put(repoName, repoFileMap);
+                                } else {
+                                    fileMap.get(repoName).put(fileSaved.getName(), fileObject);
+                                }
+                            }
+
+                    } else {
+                        isFault = true;
+                    }
+                } else {
+                    logger.info("file exist : " + checkFile.exists() + " overwrite=" + overwrite);
+                }
+            }
+
+            if(!isFault) {
+                isUploaded = true;
             }
 
 
