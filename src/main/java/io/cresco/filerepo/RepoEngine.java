@@ -126,7 +126,7 @@ public class RepoEngine {
                 if (listOfFiles[i].isFile()) {
                     String fileName = listOfFiles[i].getName();
                     String filePath = listOfFiles[i].getAbsolutePath();
-                    String MD5hash = plugin.getAgentService().getDataPlaneService().getMD5(filePath);
+                    String MD5hash = plugin.getMD5(filePath);
                     logger.info("fileName:" + fileName + " MD5:" + MD5hash + " filepath:" + filePath);
                     FileObject fileObject = new FileObject(fileName,MD5hash,scanRepo,filePath);
                     fileObjectMap.put(fileName, fileObject);
@@ -416,7 +416,7 @@ public class RepoEngine {
                     Files.write(path, fileData);
                     File fileSaved = new File(fileSavePath);
                     if (fileSaved.isFile()) {
-                        String md5 = plugin.getAgentService().getDataPlaneService().getMD5(fileSavePath);
+                        String md5 = plugin.getMD5(fileSavePath);
                         if (fileMD5.equals(md5)) {
 
                             FileObject fileObject = new FileObject(fileName, fileMD5, repoName, fileSavePath);
@@ -463,7 +463,7 @@ public class RepoEngine {
                 Files.move(tmpFilePath,fileSaved.toPath());
 
                 if (fileSaved.isFile()) {
-                    String md5 = plugin.getAgentService().getDataPlaneService().getMD5(fileSavePath);
+                    String md5 = plugin.getMD5(fileSavePath);
                     if (fileMD5.equals(md5)) {
 
                         FileObject fileObject = new FileObject(fileName, fileMD5, repoName, fileSavePath);
@@ -512,10 +512,13 @@ public class RepoEngine {
                     File fileSaved = new File(fileSavePath);
 
                     //move file from temp to requested location
+                    if(fileSaved.exists()) {
+                        fileSaved.delete();
+                    }
                     Files.move(tmpFilePath, fileSaved.toPath());
 
                     if (fileSaved.isFile()) {
-                        String md5 = plugin.getAgentService().getDataPlaneService().getMD5(fileSavePath);
+                        String md5 = plugin.getMD5(fileSavePath);
 
                             FileObject fileObject = new FileObject(fileSaved.getName(), md5, repoName, fileSavePath);
 

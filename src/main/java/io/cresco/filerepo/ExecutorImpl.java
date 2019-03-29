@@ -155,7 +155,7 @@ public class ExecutorImpl implements Executor {
                 Files.write(path, incoming.getDataParam("jardata"));
                 File jarFileSaved = new File(jarFileSavePath);
                 if (jarFileSaved.isFile()) {
-                    String md5 = plugin.getJarMD5(jarFileSavePath);
+                    String md5 = plugin.getMD5(jarFileSavePath);
                     if (pluginMD5.equals(md5)) {
                         incoming.setParam("uploaded", pluginName);
 
