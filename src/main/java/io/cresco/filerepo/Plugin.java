@@ -82,6 +82,8 @@ public class Plugin implements PluginService {
 
                 repoEngine.startScan();
 
+                logger.info("Started repoEngine...");
+
             }
             return true;
         } catch(Exception ex) {
