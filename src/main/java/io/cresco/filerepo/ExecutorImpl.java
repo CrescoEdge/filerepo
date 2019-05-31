@@ -267,11 +267,14 @@ public class ExecutorImpl implements Executor {
             String repoListStringIn = incoming.getCompressedParam("repolistin");
             String repoIn = incoming.getParam("repo");
 
+            //if((repoListStringIn != null) && (repoIn != null)) {
             if((repoListStringIn != null) && (repoIn != null)) {
 
                 String repoDiffString = repoEngine.getFileRepoDiff(repoIn,repoListStringIn);
                 incoming.setCompressedParam("repodiff",repoDiffString);
 
+            } else {
+                logger.error("repoListStringIn | repoIn == NULL");
             }
 
         } catch(Exception ex){

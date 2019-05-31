@@ -152,7 +152,8 @@ public class RepoEngine {
         long period =  plugin.getConfig().getLongParam("scan_period", 15000L);
 
         if((scanDirString != null) && (scanRepo != null)) {
-            logger.info("Starting file scan : " + scanDirString + " repo:" + scanRepo);
+        //if(scanDirString != null) {
+        logger.info("Starting file scan : " + scanDirString + " repo:" + scanRepo);
             startScan(delay, period);
         }
 
