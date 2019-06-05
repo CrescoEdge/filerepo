@@ -159,6 +159,7 @@ public class RepoEngine {
 
     }
 
+
     private void syncRegionFiles() {
         String returnString = null;
         try {
@@ -241,37 +242,7 @@ public class RepoEngine {
                                                     Path filePath = Paths.get(fileObject.filePath);
                                                     filePutRequest.addFile(filePath.toAbsolutePath().toString());
 
-                                                /*
-                                                MsgEvent filePutRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginID);
-                                                filePutRequest.setParam("action", "putfile");
 
-                                                filePutRequest.setParam("filename", fileName);
-                                                filePutRequest.setParam("md5", fileObject.MD5);
-                                                filePutRequest.setParam("repo_name",scanRepo);
-                                                //overwrite remote files
-                                                filePutRequest.setParam("overwrite", Boolean.TRUE.toString());
-
-
-                                                Path filePath = Paths.get(fileObject.filePath);
-
-                                                //filePutRequest.setDataParam("filedata", java.nio.file.Files.readAllBytes(filePath));
-                                                filePutRequest.addFile(filePath.toAbsolutePath().toString());
-
-                                                MsgEvent filePutResponse = plugin.sendRPC(filePutRequest);
-                                                if(filePutResponse != null) {
-                                                    //incoming.setParam("uploaded", Boolean.TRUE.toString());
-                                                    try {
-                                                        if(!Boolean.parseBoolean(filePutResponse.getParam("uploaded"))) {
-                                                            logger.info("Error transfering : " + fileName + " to " +  region + " " + agent + " " + pluginID );
-                                                        } else {
-                                                            logger.info("Transfered : " + fileName);
-                                                        }
-                                                    } catch (Exception ex) {
-                                                     logger.error("Could not verify transfer");
-                                                     logger.error(ex.getMessage());
-                                                    }
-                                                }
-                                                */
                                                 } else {
                                                     logger.error("Filename: " + fileName + " on transfer list, but not found locally!");
                                                 }
@@ -301,6 +272,7 @@ public class RepoEngine {
             ex.printStackTrace();
         }
     }
+
 
     public void startScan(long delay, long period) {
 
@@ -347,7 +319,7 @@ public class RepoEngine {
         File repoDir = null;
         try {
 
-            String repoDirString =  plugin.getConfig().getStringParam("filerepo_dir", "filerepo");
+            String repoDirString =  plugin.getConfig().getStringParam("repo_dir", "filerepo");
 
 
             File tmpRepo = new File(repoDirString);
@@ -494,7 +466,7 @@ public class RepoEngine {
         return isUploaded;
     }
 
-    public Boolean putFiles(List<String> fileList, String repoName, boolean overwrite) {
+    public Boolean putFiles(List<String> fileList, String repoName, boolean overwrite, boolean isLocal) {
 
         boolean isUploaded = false;
         try {
@@ -516,7 +488,13 @@ public class RepoEngine {
                     if(fileSaved.exists()) {
                         fileSaved.delete();
                     }
-                    Files.move(tmpFilePath, fileSaved.toPath());
+
+                    //if local copy, if remote move temp to correct
+                    if(isLocal) {
+                     Files.copy(tmpFilePath, fileSaved.toPath());
+                    } else {
+                        Files.move(tmpFilePath, fileSaved.toPath());
+                    }
 
                     if (fileSaved.isFile()) {
                         String md5 = plugin.getMD5(fileSavePath);

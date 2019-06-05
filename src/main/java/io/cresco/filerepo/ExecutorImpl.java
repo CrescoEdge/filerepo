@@ -122,7 +122,7 @@ public class ExecutorImpl implements Executor {
         File repoDir = null;
         try {
 
-            String repoDirString =  plugin.getConfig().getStringParam("repo_dir", "repo");
+            String repoDirString =  plugin.getConfig().getStringParam("repo_dir", "filerepo");
 
             File tmpRepo = new File(repoDirString);
             if(tmpRepo.isDirectory()) {
@@ -226,6 +226,7 @@ public class ExecutorImpl implements Executor {
             List<String> fileList = incoming.getFileList();
 
             boolean overwrite = false;
+            boolean isLocal = false;
 
             if(fileList != null) {
 
@@ -237,7 +238,11 @@ public class ExecutorImpl implements Executor {
                     ex.printStackTrace();
                 }
 
-                if(repoEngine.putFiles(fileList,repoName, overwrite)) {
+                if((incoming.getSrcAgent().equals(incoming.getDstAgent())) && (incoming.getSrcRegion().equals(incoming.getDstRegion()))) {
+                    isLocal = true;
+                }
+
+                if(repoEngine.putFiles(fileList,repoName, overwrite, isLocal)) {
                     MsgEvent filesConfirm = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,incoming.getSrcRegion(),incoming.getSrcAgent(),incoming.getSrcPlugin());
                     filesConfirm.setParam("action", "repoconfirm");
                     filesConfirm.setParam("transfer_id", incoming.getParam("transfer_id"));
