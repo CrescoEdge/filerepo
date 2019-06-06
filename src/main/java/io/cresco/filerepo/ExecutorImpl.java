@@ -20,7 +20,6 @@ public class ExecutorImpl implements Executor {
     private Gson gson;
     private RepoEngine repoEngine;
 
-
     public ExecutorImpl(PluginBuilder pluginBuilder, RepoEngine repoEngine) {
         this.plugin = pluginBuilder;
         logger = plugin.getLogger(ExecutorImpl.class.getName(), CLogger.Level.Info);
@@ -211,7 +210,7 @@ public class ExecutorImpl implements Executor {
     }
 
     private void confirmTransfer(MsgEvent incoming) {
-        repoEngine.confirmTransfer(incoming.getParam("transfer_id"));
+        repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
     }
 
     private MsgEvent putFile(MsgEvent incoming) {
@@ -220,7 +219,6 @@ public class ExecutorImpl implements Executor {
 
             //String fileName = incoming.getParam("filename");
             //String fileMD5 = incoming.getParam("md5");
-            String repoName = incoming.getParam("repo_name");
             //byte[] fileData = incoming.getDataParam("filedata");
             //String filePath = incoming.getFileList().get(0);
             List<String> fileList = incoming.getFileList();
@@ -228,7 +226,10 @@ public class ExecutorImpl implements Executor {
             boolean overwrite = false;
             boolean isLocal = false;
 
-            if(fileList != null) {
+            if((fileList != null) && incoming.paramsContains("repo_name")){
+
+                String repoName = incoming.getParam("repo_name");
+
 
                 try{
                     if(incoming.getParam("overwrite") != null) {
@@ -271,21 +272,35 @@ public class ExecutorImpl implements Executor {
 
             String repoListStringIn = incoming.getCompressedParam("repolistin");
             String repoIn = incoming.getParam("repo");
+            String transferId = incoming.getParam("transfer_id");
 
-            //if((repoListStringIn != null) && (repoIn != null)) {
-            if((repoListStringIn != null) && (repoIn != null)) {
+            if((repoListStringIn != null) && (repoIn != null) && (transferId != null)) {
 
-                String repoDiffString = repoEngine.getFileRepoDiff(repoIn,repoListStringIn);
-                incoming.setCompressedParam("repodiff",repoDiffString);
+                //this needs to be a new thread
+                repoEngine.getFileRepoDiff(repoIn,repoListStringIn, transferId, incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
+
+                incoming.setParam("status_code","10");
+                incoming.setParam("status_desc","New transferID accepted");
+
+                logger.info("repoListIn OK");
+                //String repoDiffString = repoEngine.getFileRepoDiff(repoIn,repoListStringIn);
+                //incoming.setCompressedParam("repodiff",repoDiffString);
+
 
             } else {
+                incoming.setParam("status_code","9");
+                incoming.setParam("status_desc","repoListIn repoListStringIn | repoIn | transferId == NULL!");
                 logger.error("repoListStringIn | repoIn == NULL");
             }
 
         } catch(Exception ex){
+            incoming.setParam("status_code","9");
+            incoming.setParam("status_desc","repoListIn exception " + ex.getMessage());
             ex.printStackTrace();
         }
-
+        if(incoming.paramsContains("repolistin")) {
+            incoming.removeParam("repolistin");
+        }
         return incoming;
     }
 
