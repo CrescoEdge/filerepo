@@ -96,6 +96,7 @@ public class RepoEngine {
                 synchronized (lockPeerUpdateQueueMap) {
                     if(!peerUpdateQueueMap.containsKey(repoId)) {
                         peerUpdateQueueMap.put(repoId,new LinkedList());
+                        //we need to add transfer_id 0 here if the transfer is not zero
                         logger.info("getFileRepoDiff() creating new queuMap for " + repoIn + " repo: " + scanRepo);
                     }
                     logger.info("getFileRepoDiff() adding transfer_id: " + transferId + " to queueMap for " + repoIn + " repo: " + scanRepo);
