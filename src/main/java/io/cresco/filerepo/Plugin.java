@@ -66,9 +66,13 @@ public class Plugin implements PluginService {
                 pluginBuilder = new PluginBuilder(this.getClass().getName(), context, map);
                 this.logger = pluginBuilder.getLogger(Plugin.class.getName(), CLogger.Level.Info);
 
-                repoEngine = new RepoEngine(pluginBuilder);
+                //Log message to notify of plugin initialization
                 logger.info("Starting repoEngine...");
 
+                //Starting the RepoEngine Threads
+                repoEngine = new RepoEngine(pluginBuilder);
+
+                //Starting custom message handler
                 this.executor = new ExecutorImpl(pluginBuilder, repoEngine);
                 pluginBuilder.setExecutor(executor);
 
@@ -77,11 +81,13 @@ public class Plugin implements PluginService {
                     Thread.sleep(1000);
                 }
 
-                //set plugin active
+                //setting plugin active on the agent
                 pluginBuilder.setIsActive(true);
 
+                //Starting any configured file scans
                 repoEngine.startScan();
 
+                //Log message to notify of plugin startup
                 logger.info("Started repoEngine...");
 
 
