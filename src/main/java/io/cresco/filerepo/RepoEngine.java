@@ -47,11 +47,13 @@ public class RepoEngine {
 
     private int transferId = -1;
 
+    private  DBEngine dbEngine;
 
-    public RepoEngine(PluginBuilder pluginBuilder) {
+    public RepoEngine(PluginBuilder pluginBuilder, DBEngine dbEngine) {
 
         this.plugin = pluginBuilder;
         logger = plugin.getLogger(ExecutorImpl.class.getName(), CLogger.Level.Info);
+        this.dbEngine = dbEngine;
         gson = new Gson();
 
         this.crescoType = new TypeToken<Map<String, List<Map<String, String>>>>() {
@@ -247,6 +249,63 @@ public class RepoEngine {
             fileDiffMap = new HashMap<>();
 
             //get all files in the scan directory
+            File folder = new File(scanDirString);
+            File[] listOfFiles = folder.listFiles();
+
+
+            for (int i = 0; i < listOfFiles.length; i++) {
+                if (listOfFiles[i].isFile()) {
+                    String fileName = listOfFiles[i].getName();
+                    String filePath = listOfFiles[i].getAbsolutePath();
+                    long lastModified = listOfFiles[i].lastModified();
+
+                    boolean add = false;
+                    boolean update = false;
+
+                    //see if file is in the database
+                    long lastModifiedDb = dbEngine.getLastModified(filePath);
+                    logger.trace("file: " + filePath + " lastmodified: " + lastModified + " dblastmodified: " + lastModifiedDb);
+                    if(lastModifiedDb == -1) {
+                        add = true;
+                    } else if (lastModifiedDb < lastModified) {
+                        update = true;
+                    } else if (lastModifiedDb > lastModified) {
+                        logger.error("How can an older file be recored in DB? lastModifiedDb > lastModified ");
+                        update = true;
+                    }
+
+                    String MD5hash = plugin.getMD5(filePath);
+                    logger.trace("fileName:" + filePath+ " MD5:" + MD5hash + " filepath:" + filePath);
+
+                    if(add || update) {
+                        FileObject fileObject = new FileObject(fileName, MD5hash, scanRepo, filePath, lastModified);
+                        fileDiffMap.put(filePath,fileObject);
+                    }
+
+                    if(add) {
+                        dbEngine.addFile(filePath, MD5hash,lastModified);
+                    }
+
+                    if(update) {
+                        dbEngine.updateFile(filePath,MD5hash,0,lastModified);
+                    }
+                }
+            }
+
+        }catch (Exception ex) {
+            logger.error(ex.getMessage());
+        }
+        return fileDiffMap;
+    }
+
+    private Map<String,FileObject> buildRepoListOld() {
+
+        Map<String,FileObject> fileDiffMap = null;
+        try {
+
+            fileDiffMap = new HashMap<>();
+
+            //get all files in the scan directory
             logger.info("scan dir: " + scanDirString);
             File folder = new File(scanDirString);
             File[] listOfFiles = folder.listFiles();
@@ -262,7 +321,10 @@ public class RepoEngine {
                     String fileName = listOfFiles[i].getName();
                     long lastModified = listOfFiles[i].lastModified();
 
+
                     boolean update = false;
+
+
 
                     synchronized (lockFileMap) {
                         if(fileMap.get(scanRepo).containsKey(fileName)) {
@@ -278,6 +340,7 @@ public class RepoEngine {
                         String filePath = listOfFiles[i].getAbsolutePath();
                         String MD5hash = plugin.getMD5(filePath);
                         logger.info("fileName:" + fileName + " MD5:" + MD5hash + " filepath:" + filePath);
+                        //dbEngine.addFile(filePath,MD5hash, lastModified);
                         FileObject fileObject = new FileObject(fileName, MD5hash, scanRepo, filePath, lastModified);
                         synchronized (lockFileMap) {
                             fileMap.get(scanRepo).put(fileName, fileObject);
@@ -427,7 +490,7 @@ public class RepoEngine {
     }
     */
 
-    private void syncRegionFiles(Map<String,FileObject> fileDiffMap) {
+    private void syncRegionFilesOLD(Map<String,FileObject> fileDiffMap) {
         String returnString = null;
         try {
 
@@ -534,6 +597,88 @@ public class RepoEngine {
                                         }
                                     }
                                     */
+
+                                } else {
+                                    logger.error("Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " failed to respond!");
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    logger.error("syncRegionFiles() No filerepo found by global controller");
+                }
+            } else {
+                logger.error("syncRegionFiles() Null response from global controller");
+            }
+
+        }catch (Exception ex) {
+            ex.printStackTrace();
+        }
+    }
+
+    private void syncRegionFiles(Map<String,FileObject> fileDiffMap) {
+        String returnString = null;
+        try {
+
+            MsgEvent request = plugin.getGlobalControllerMsgEvent(MsgEvent.Type.EXEC);
+            request.setParam("action", "listpluginsbytype");
+            request.setParam("action_plugintype_id", "pluginname");
+            request.setParam("action_plugintype_value", "io.cresco.filerepo");
+            MsgEvent response = plugin.sendRPC(request);
+
+            if (response != null) {
+
+                returnString = response.getCompressedParam("pluginsbytypelist");
+
+                Map<String, List<Map<String, String>>> myRepoMap = gson.fromJson(returnString, crescoType);
+
+                if (myRepoMap != null) {
+
+                    if (myRepoMap.containsKey("plugins")) {
+
+                        for (Map<String, String> repoMap : myRepoMap.get("plugins")) {
+
+                            if ((plugin.getRegion().equals(repoMap.get("region"))) && (plugin.getAgent().equals(repoMap.get("agent"))) && (plugin.getPluginID().equals(repoMap.get("pluginid")))) {
+                                //do nothing if self
+                                //logger.info("found self");
+                            } else if (plugin.getRegion().equals(repoMap.get("region"))) {
+                                //This is another filerepo in my region, I need to send it data
+                                String region = repoMap.get("region");
+                                String agent = repoMap.get("agent");
+                                String pluginID = repoMap.get("pluginid");
+
+                                logger.error("SEND :" + region + " " + agent + " " + pluginID + " data");
+
+                                MsgEvent fileRepoRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginID);
+                                fileRepoRequest.setParam("action","repolistin");
+                                //String repoListStringIn = getFileRepoList(scanRepo);
+                                String repoListStringIn = gson.toJson(fileDiffMap);
+                                fileRepoRequest.setCompressedParam("repolistin",repoListStringIn);
+                                fileRepoRequest.setParam("repo",scanRepo);
+                                fileRepoRequest.setParam("transfer_id", String.valueOf(transferId));
+
+                                logger.info("repoListStringIn: " + repoListStringIn);
+
+                                MsgEvent fileRepoResponse = plugin.sendRPC(fileRepoRequest);
+
+                                if(fileRepoResponse != null) {
+
+                                    logger.info("Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " responded");
+
+                                    if(fileRepoResponse.paramsContains("status_code") && fileRepoResponse.paramsContains("status_desc")) {
+                                        int status_code = Integer.parseInt(fileRepoResponse.getParam("status_code"));
+                                        String status_desc = fileRepoResponse.getParam("status_code");
+                                        if(status_code != 10) {
+                                            logger.error("Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " filerepo update failed status_code: " + status_code + " status_desc:" + status_desc);
+                                        } else {
+                                            for (Map.Entry<String, FileObject> entry : fileDiffMap.entrySet()) {
+                                                //String key = entry.getKey();
+                                                FileObject fileObject = entry.getValue();
+                                                dbEngine.updateFile(fileObject.filePath, fileObject.MD5, 1, fileObject.lastModified);
+                                            }
+                                        }
+                                    }
+
 
                                 } else {
                                     logger.error("Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " failed to respond!");

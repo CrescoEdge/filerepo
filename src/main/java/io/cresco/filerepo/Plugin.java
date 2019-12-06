@@ -27,6 +27,7 @@ public class Plugin implements PluginService {
     private Executor executor;
     private CLogger logger;
     private Map<String,Object> map;
+    private DBEngine dbEngine;
 
     private RepoEngine repoEngine;
 
@@ -66,11 +67,36 @@ public class Plugin implements PluginService {
                 pluginBuilder = new PluginBuilder(this.getClass().getName(), context, map);
                 this.logger = pluginBuilder.getLogger(Plugin.class.getName(), CLogger.Level.Info);
 
+                //Plugin is either receving or sending
+                String scanDirString =  pluginBuilder.getConfig().getStringParam("scan_dir");
+                String scanRepo =  pluginBuilder.getConfig().getStringParam("scan_repo");
+                String repoDirString =  pluginBuilder.getConfig().getStringParam("repo_dir");
+
+                boolean isSending = false;
+                boolean isReceving = false;
+
+                if((scanDirString != null) && (scanRepo != null) && (repoDirString != null)) {
+                    logger.error("fileRepo can't be both sending and receving");
+                    return false;
+                } else if((scanDirString != null) && (scanRepo != null) && (repoDirString == null)) {
+                    isSending = true;
+                    logger.info("fileRepo configured as sender: scan_repo: " + scanRepo + " scan_dir:" + scanDirString);
+
+                } else if((scanDirString == null) && (scanRepo != null) && (repoDirString != null)) {
+                    isReceving = true;
+                    logger.info("fileRepo configured as sender: scan_repo: " + scanRepo + " scan_dir:" + scanDirString);
+                } else {
+                    logger.error("no configuration found for either sending and receving");
+                    return false;
+                }
+
                 //Log message to notify of plugin initialization
                 logger.info("Starting repoEngine...");
 
+                dbEngine = new DBEngine(pluginBuilder);
                 //Starting the RepoEngine Threads
-                repoEngine = new RepoEngine(pluginBuilder);
+                repoEngine = new RepoEngine(pluginBuilder, dbEngine);
+
 
                 //Starting custom message handler
                 this.executor = new ExecutorImpl(pluginBuilder, repoEngine);
@@ -84,8 +110,10 @@ public class Plugin implements PluginService {
                 //setting plugin active on the agent
                 pluginBuilder.setIsActive(true);
 
-                //Starting any configured file scans
-                repoEngine.startScan();
+                if(isSending) {
+                    //Starting any configured file scans
+                    repoEngine.startScan();
+                }
 
                 //Log message to notify of plugin startup
                 logger.info("Started repoEngine...");
@@ -104,7 +132,9 @@ public class Plugin implements PluginService {
     public boolean isStopped() {
 
         if(pluginBuilder != null) {
-            repoEngine.stopScan();
+            if(repoEngine != null) {
+                repoEngine.stopScan();
+            }
             pluginBuilder.setExecutor(null);
             pluginBuilder.setIsActive(false);
         }
