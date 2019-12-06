@@ -69,7 +69,7 @@ public class Plugin implements PluginService {
 
                 //Plugin is either receving or sending
                 String scanDirString =  pluginBuilder.getConfig().getStringParam("scan_dir");
-                String scanRepo =  pluginBuilder.getConfig().getStringParam("scan_repo");
+                String scanRepo =  pluginBuilder.getConfig().getStringParam("repo");
                 String repoDirString =  pluginBuilder.getConfig().getStringParam("repo_dir");
 
                 boolean isSending = false;
@@ -84,11 +84,13 @@ public class Plugin implements PluginService {
 
                 } else if((scanDirString == null) && (scanRepo != null) && (repoDirString != null)) {
                     isReceving = true;
-                    logger.info("fileRepo configured as sender: scan_repo: " + scanRepo + " scan_dir:" + scanDirString);
+                    logger.info("fileRepo configured as recever: scan_repo: " + scanRepo + " repo_dir:" + repoDirString);
                 } else {
                     logger.error("no configuration found for either sending and receving");
                     return false;
                 }
+
+                logger.error(pluginBuilder.getConfig().getStringParam("edges"));
 
                 //Log message to notify of plugin initialization
                 logger.info("Starting repoEngine...");

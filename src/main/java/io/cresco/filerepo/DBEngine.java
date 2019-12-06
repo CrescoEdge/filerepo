@@ -65,7 +65,6 @@ public class DBEngine {
                     //File dbsource = new File(defaultDBName);
                     if (dbsource.exists()) {
                         logger.info("DB SOURCE EXIST");
-                        //delete(dbsource);
                     } else {
                         //dbsource.mkdir();
                         logger.info("CREATING DB");
@@ -170,6 +169,7 @@ public class DBEngine {
             queryString = "UPDATE filelist SET filepath=" + filepath + ", md5='" + md5 + "', insync=" + insync + ", lastmodified='" + String.valueOf(lastmodified) + "'"
                     + " WHERE filepath='" + filepath + "'";
 
+            logger.error(queryString);
             try (Connection conn = ds.getConnection()) {
                 try (Statement stmt = conn.createStatement()) {
 
