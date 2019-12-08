@@ -1,6 +1,5 @@
 package io.cresco.filerepo;
 
-import com.google.gson.Gson;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 import org.apache.commons.dbcp2.*;
@@ -11,12 +10,10 @@ import javax.sql.DataSource;
 import java.io.File;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.lang.reflect.Type;
 import java.nio.file.Paths;
 import java.sql.*;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 
 
 public class DBEngine {
@@ -53,10 +50,10 @@ public class DBEngine {
             ds = setupDataSource(dbConnectionString);
 
                     if (dbsource.exists()) {
-                        logger.info("DB SOURCE EXIST: " + dbsource.getAbsolutePath() );
+                        //logger.info("DB SOURCE EXIST: " + dbsource.getAbsolutePath() );
                     } else {
                         //dbsource.mkdir();
-                        logger.info("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
+                        //logger.info("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
                         initDB();
                     }
 
@@ -155,7 +152,7 @@ public class DBEngine {
         try {
 
             String queryString = null;
-            queryString = "UPDATE filelist SET filepath=" + filepath + ", md5='" + md5 + "', insync=" + insync + ", lastmodified='" + String.valueOf(lastmodified) + "'"
+            queryString = "UPDATE filelist SET filepath=''" + filepath + ", md5='" + md5 + "', insync=" + insync + ", lastmodified='" + String.valueOf(lastmodified) + "'"
                     + " WHERE filepath='" + filepath + "'";
 
             logger.error(queryString);

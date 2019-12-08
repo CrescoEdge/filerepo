@@ -40,12 +40,15 @@ public class RepoEngine {
     private AtomicBoolean lockPeerUpdateQueueMap = new AtomicBoolean();
     private Map<String, Queue<Map<String,String>>> peerUpdateQueueMap;
 
-    private Type type;
+    private Type edgeType;
+    private Type mapType;
 
     private Timer fileScanTimer;
 
     private String scanRepo;
     private String scanDirString;
+
+    private List<Map<String,String>> iNodeList;
 
     private int transferId = -1;
 
@@ -64,9 +67,13 @@ public class RepoEngine {
         this.repoListType = new TypeToken<Map<String,FileObject>>() {
         }.getType();
 
-        this.type = new TypeToken<List<gEdge>>() {
+        this.edgeType = new TypeToken<List<gEdge>>() {
         }.getType();
 
+        this.mapType = new TypeToken<Map<String,String>>() {
+        }.getType();
+
+        iNodeList = new ArrayList<>();
 
         fileMap = Collections.synchronizedMap(new HashMap<>());
         peerVersionMap = Collections.synchronizedMap(new HashMap<>());
@@ -257,48 +264,50 @@ public class RepoEngine {
             File folder = new File(scanDirString);
             File[] listOfFiles = folder.listFiles();
 
+            if(listOfFiles != null) {
+                for (int i = 0; i < listOfFiles.length; i++) {
+                    if (listOfFiles[i].isFile()) {
+                        String fileName = listOfFiles[i].getName();
+                        String filePath = listOfFiles[i].getAbsolutePath();
+                        long lastModified = listOfFiles[i].lastModified();
 
-            for (int i = 0; i < listOfFiles.length; i++) {
-                if (listOfFiles[i].isFile()) {
-                    String fileName = listOfFiles[i].getName();
-                    String filePath = listOfFiles[i].getAbsolutePath();
-                    long lastModified = listOfFiles[i].lastModified();
+                        boolean add = false;
+                        boolean update = false;
 
-                    boolean add = false;
-                    boolean update = false;
+                        //see if file is in the database
+                        long lastModifiedDb = dbEngine.getLastModified(filePath);
+                        logger.trace("file: " + filePath + " lastmodified: " + lastModified + " dblastmodified: " + lastModifiedDb);
+                        if (lastModifiedDb == -1) {
+                            add = true;
+                        } else if (lastModifiedDb < lastModified) {
+                            update = true;
+                        } else if (lastModifiedDb > lastModified) {
+                            logger.error("How can an older file be recored in DB? lastModifiedDb > lastModified ");
+                            update = true;
+                        }
 
-                    //see if file is in the database
-                    long lastModifiedDb = dbEngine.getLastModified(filePath);
-                    logger.trace("file: " + filePath + " lastmodified: " + lastModified + " dblastmodified: " + lastModifiedDb);
-                    if(lastModifiedDb == -1) {
-                        add = true;
-                    } else if (lastModifiedDb < lastModified) {
-                        update = true;
-                    } else if (lastModifiedDb > lastModified) {
-                        logger.error("How can an older file be recored in DB? lastModifiedDb > lastModified ");
-                        update = true;
-                    }
+                        String MD5hash = plugin.getMD5(filePath);
+                        logger.trace("fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
 
-                    String MD5hash = plugin.getMD5(filePath);
-                    logger.trace("fileName:" + filePath+ " MD5:" + MD5hash + " filepath:" + filePath);
+                        if (add || update) {
+                            FileObject fileObject = new FileObject(fileName, MD5hash, scanRepo, filePath, lastModified);
+                            fileDiffMap.put(filePath, fileObject);
+                        }
 
-                    if(add || update) {
-                        FileObject fileObject = new FileObject(fileName, MD5hash, scanRepo, filePath, lastModified);
-                        fileDiffMap.put(filePath,fileObject);
-                    }
+                        if (add) {
+                            dbEngine.addFile(filePath, MD5hash, lastModified);
+                        }
 
-                    if(add) {
-                        dbEngine.addFile(filePath, MD5hash,lastModified);
-                    }
-
-                    if(update) {
-                        dbEngine.updateFile(filePath,MD5hash,0,lastModified);
+                        if (update) {
+                            dbEngine.updateFile(filePath, MD5hash, 0, lastModified);
+                        }
                     }
                 }
             }
 
         }catch (Exception ex) {
             logger.error(ex.getMessage());
+            ex.printStackTrace();
         }
         return fileDiffMap;
     }
@@ -375,7 +384,7 @@ public class RepoEngine {
         if((scanDirString != null) && (scanRepo != null)) {
         //if(scanDirString != null) {
         logger.info("Starting file scan : " + scanDirString + " repo:" + scanRepo);
-            //startScan(delay, period);
+            startScan(delay, period);
         }
 
     }
@@ -506,7 +515,7 @@ public class RepoEngine {
         }
     }
 
-    private void syncRegionFiles(Map<String,FileObject> fileDiffMap) {
+    private void syncRegionFiles2(Map<String,FileObject> fileDiffMap) {
         String returnString = null;
         try {
 
@@ -588,6 +597,69 @@ public class RepoEngine {
         }
     }
 
+    private void syncRegionFiles(Map<String,FileObject> fileDiffMap) {
+        String returnString = null;
+        try {
+                if(iNodeList.size() == 0) {
+                    updateNodeMap();
+                }
+
+                        for (Map<String, String> repoMap : iNodeList) {
+
+                            if ((plugin.getRegion().equals(repoMap.get("region_id"))) && (plugin.getAgent().equals(repoMap.get("agent_id"))) && (plugin.getPluginID().equals(repoMap.get("plugin_id")))) {
+                                //do nothing if self
+                                //logger.info("found self");
+                                //} else if (plugin.getRegion().equals(repoMap.get("region_id"))) {
+                            } else {
+                                //This is another filerepo in my region, I need to send it data
+                                String region = repoMap.get("region_id");
+                                String agent = repoMap.get("agent_id");
+                                String pluginID = repoMap.get("plugin_id");
+
+                                logger.error("SEND :" + region + " " + agent + " " + pluginID + " data");
+
+                                MsgEvent fileRepoRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginID);
+                                fileRepoRequest.setParam("action","repolistin");
+                                //String repoListStringIn = getFileRepoList(scanRepo);
+                                String repoListStringIn = gson.toJson(fileDiffMap);
+                                fileRepoRequest.setCompressedParam("repolistin",repoListStringIn);
+                                fileRepoRequest.setParam("repo",scanRepo);
+                                fileRepoRequest.setParam("transfer_id", String.valueOf(transferId));
+
+                                logger.info("repoListStringIn: " + repoListStringIn);
+
+                                MsgEvent fileRepoResponse = plugin.sendRPC(fileRepoRequest);
+
+                                if(fileRepoResponse != null) {
+
+                                    logger.info("Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " responded");
+
+                                    if(fileRepoResponse.paramsContains("status_code") && fileRepoResponse.paramsContains("status_desc")) {
+                                        int status_code = Integer.parseInt(fileRepoResponse.getParam("status_code"));
+                                        String status_desc = fileRepoResponse.getParam("status_code");
+                                        if(status_code != 10) {
+                                            logger.error("Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " filerepo update failed status_code: " + status_code + " status_desc:" + status_desc);
+                                        } else {
+                                            for (Map.Entry<String, FileObject> entry : fileDiffMap.entrySet()) {
+                                                //String key = entry.getKey();
+                                                FileObject fileObject = entry.getValue();
+                                                dbEngine.updateFile(fileObject.filePath, fileObject.MD5, 1, fileObject.lastModified);
+                                            }
+                                        }
+                                    }
+
+
+                                } else {
+                                    logger.error("Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " failed to respond!");
+                                }
+                            }
+                        }
+
+        }catch (Exception ex) {
+            ex.printStackTrace();
+        }
+    }
+
 
     public void startScan(long delay, long period) {
 
@@ -596,57 +668,33 @@ public class RepoEngine {
                 try {
 
                     if(plugin.isActive()) {
-                        logger.error("TRYING 0");
-                        String edgeMapString = plugin.getConfig().getStringParam("edges");
-                        logger.error("TRYING 1");
-                        List<gEdge> edgeList = jsonToEdgeList(edgeMapString);
-                        logger.error("TRYING 2");
-                        if (edgeList != null) {
-                            for (gEdge edge : edgeList) {
 
-                                logger.error(edge.edge_id + " from: " + edge.node_from + " to: " + edge.node_to);
-                                logger.error("1");
-                                MsgEvent req = plugin.getGlobalControllerMsgEvent(MsgEvent.Type.EXEC);
-                                req.setParam("action", "getinodestatus");
-                                req.setParam("inode_id", edge.node_to);
-                                logger.error("2");
-                                MsgEvent resp = plugin.sendRPC(req);
-                                //MsgEvent resp = pluginBuilder.sendRPC(req);
-                                logger.error("3");
-                                logger.error("[" + resp.getParams() + "]");
-                                //String pnode = resp.getCompressedParam("pnode");
-                                //logger.error("4");
-                                //logger.error(pnode);
+                            if (!inScan.get()) {
 
+                                logger.error("\t\t ***STARTING SCAN " + inScan.get() + " tid:" + transferId);
+                                inScan.set(true);
 
-                            }
-                        }
+                                logger.error("\t\t ***STARTED SCAN " + inScan.get());
+                                //build file list
+                                Map<String, FileObject> diffList = buildRepoList();
+                                if (diffList.size() > 0) {
+                                    //start sync
+                                    transferId++;
+                                    //find other repos
+                                    logger.error("SYNC Files");
+                                    syncRegionFiles(diffList);
+                                }
 
-                        if (!inScan.get()) {
+                                logger.error("\t\t ***ENDING SCAN " + inScan.get());
+                                //inScan.set(false);
+                                logger.error("\t\t ***ENDED SCAN " + inScan.get());
 
-                            logger.error("\t\t ***STARTING SCAN " + inScan.get() + " tid:" + transferId);
-                            inScan.set(true);
+                                inScan.set(false);
 
-                            logger.error("\t\t ***STARTED SCAN " + inScan.get());
-                            //build file list
-                            Map<String, FileObject> diffList = buildRepoList();
-                            if (diffList.size() > 0) {
-                                //start sync
-                                transferId++;
-                                //find other repos
-                                logger.error("SYNC Files");
-                                syncRegionFiles(diffList);
+                            } else {
+                                logger.error("\t\t ***ALREADY IN SCAN");
                             }
 
-                            logger.error("\t\t ***ENDING SCAN " + inScan.get());
-                            //inScan.set(false);
-                            logger.error("\t\t ***ENDED SCAN " + inScan.get());
-
-                            inScan.set(false);
-
-                        } else {
-                            logger.error("\t\t ***ALREADY IN SCAN");
-                        }
                     } else {
                         logger.error("NO ACTIVE");
                     }
@@ -884,16 +932,34 @@ public class RepoEngine {
 
         return isUploaded;
     }
-    public List<gEdge> jsonToEdgeList(String json) {
+    private List<gEdge> jsonToEdgeList(String json) {
         List<gEdge> returnMap = null;
         try{
-            returnMap = gson.fromJson(json,type);
+            returnMap = gson.fromJson(json,edgeType);
         } catch (Exception ex) {
             ex.printStackTrace();
             logger.error(ex.getMessage());
         }
         return returnMap;
 
+    }
+
+    private void updateNodeMap() {
+
+        String edgeMapString = plugin.getConfig().getStringParam("edges");
+        List<gEdge> edgeList = jsonToEdgeList(edgeMapString);
+        if (edgeList != null) {
+            for (gEdge edge : edgeList) {
+                logger.error(edge.edge_id + " from: " + edge.node_from + " to: " + edge.node_to);
+                MsgEvent req = plugin.getGlobalControllerMsgEvent(MsgEvent.Type.EXEC);
+                req.setParam("action", "getinodestatus");
+                req.setParam("inode_id", edge.node_to);
+                MsgEvent resp = plugin.sendRPC(req);
+                String inodeString = resp.getCompressedParam("inodemap");
+                Map<String, String> inodeMap = gson.fromJson(inodeString, mapType);
+                iNodeList.add(inodeMap);
+            }
+        }
     }
 
 }

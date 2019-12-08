@@ -34,7 +34,6 @@ public class Plugin implements PluginService {
     private Map<String,Object> map;
     private DBEngine dbEngine;
     private Gson gson;
-    private Type type;
 
     private RepoEngine repoEngine;
 
@@ -83,9 +82,6 @@ public class Plugin implements PluginService {
             if(pluginBuilder == null) {
                 pluginBuilder = new PluginBuilder(this.getClass().getName(), context, map);
                 this.logger = pluginBuilder.getLogger(Plugin.class.getName(), CLogger.Level.Info);
-                this.type = new TypeToken<List<gEdge>>() {
-                }.getType();
-                this.gson = new Gson();
 
                 //Plugin is either receving or sending
                 String scanDirString =  pluginBuilder.getConfig().getStringParam("scan_dir");
@@ -164,18 +160,5 @@ public class Plugin implements PluginService {
         }
         return true;
     }
-
-    public List<gEdge> jsonToEdgeList(String json) {
-        List<gEdge> returnMap = null;
-        try{
-            returnMap = gson.fromJson(json,type);
-        } catch (Exception ex) {
-            ex.printStackTrace();
-            logger.error(ex.getMessage());
-        }
-        return returnMap;
-
-    }
-
 
 }
