@@ -15,7 +15,6 @@ import java.sql.*;
 import java.util.ArrayList;
 import java.util.List;
 
-
 public class DBEngine {
 
     private DataSource ds;
@@ -121,7 +120,7 @@ public class DBEngine {
 
             String queryString = "SELECT lastmodified FROM filelist WHERE filepath = '" + filepath +"'";
 
-            logger.error("QUERY: " + queryString);
+            //logger.error("QUERY: " + queryString);
 
             try (Connection conn = ds.getConnection()) {
                 try (Statement stmt = conn.createStatement()) {
@@ -152,10 +151,9 @@ public class DBEngine {
         try {
 
             String queryString = null;
-            queryString = "UPDATE filelist SET filepath=''" + filepath + ", md5='" + md5 + "', insync=" + insync + ", lastmodified='" + String.valueOf(lastmodified) + "'"
+            queryString = "UPDATE filelist SET filepath='" + filepath + "', md5='" + md5 + "', insync=" + insync + ", lastmodified='" + String.valueOf(lastmodified) + "'"
                     + " WHERE filepath='" + filepath + "'";
 
-            logger.error(queryString);
             try (Connection conn = ds.getConnection()) {
                 try (Statement stmt = conn.createStatement()) {
 

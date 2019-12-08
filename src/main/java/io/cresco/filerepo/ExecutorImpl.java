@@ -271,18 +271,17 @@ public class ExecutorImpl implements Executor {
         try {
 
             String repoListStringIn = incoming.getCompressedParam("repolistin");
-            String repoIn = incoming.getParam("repo");
             String transferId = incoming.getParam("transfer_id");
 
-            if((repoListStringIn != null) && (repoIn != null) && (transferId != null)) {
+            if((repoListStringIn != null) && (transferId != null)) {
 
                 //this needs to be a new thread
-                repoEngine.getFileRepoDiff(repoIn,repoListStringIn, transferId, incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
+                repoEngine.getFileRepoDiff(repoListStringIn, transferId, incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
 
                 incoming.setParam("status_code","10");
                 incoming.setParam("status_desc","New transferID accepted");
 
-                logger.info("repoListIn OK");
+                //logger.info("repoListIn OK");
                 //String repoDiffString = repoEngine.getFileRepoDiff(repoIn,repoListStringIn);
                 //incoming.setCompressedParam("repodiff",repoDiffString);
 
