@@ -1,7 +1,10 @@
 package io.cresco.filerepo;
 
 
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import io.cresco.library.agent.AgentService;
+import io.cresco.library.app.gEdge;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
@@ -10,6 +13,8 @@ import io.cresco.library.utilities.CLogger;
 import org.osgi.framework.BundleContext;
 import org.osgi.service.component.annotations.*;
 
+import java.lang.reflect.Type;
+import java.util.List;
 import java.util.Map;
 
 @Component(
@@ -28,6 +33,8 @@ public class Plugin implements PluginService {
     private CLogger logger;
     private Map<String,Object> map;
     private DBEngine dbEngine;
+    private Gson gson;
+    private Type type;
 
     private RepoEngine repoEngine;
 
@@ -54,6 +61,16 @@ public class Plugin implements PluginService {
     }
 
     @Override
+    public boolean isActive() {
+        return pluginBuilder.isActive();
+    }
+
+    @Override
+    public void setIsActive(boolean isActive) {
+        pluginBuilder.setIsActive(isActive);
+    }
+
+    @Override
     public boolean inMsg(MsgEvent incoming) {
         pluginBuilder.msgIn(incoming);
         return true;
@@ -66,11 +83,19 @@ public class Plugin implements PluginService {
             if(pluginBuilder == null) {
                 pluginBuilder = new PluginBuilder(this.getClass().getName(), context, map);
                 this.logger = pluginBuilder.getLogger(Plugin.class.getName(), CLogger.Level.Info);
+                this.type = new TypeToken<List<gEdge>>() {
+                }.getType();
+                this.gson = new Gson();
 
                 //Plugin is either receving or sending
                 String scanDirString =  pluginBuilder.getConfig().getStringParam("scan_dir");
                 String scanRepo =  pluginBuilder.getConfig().getStringParam("repo");
                 String repoDirString =  pluginBuilder.getConfig().getStringParam("repo_dir");
+
+                if(pluginBuilder.getConfig().getStringParam("edges") == null) {
+                    logger.error("No edge mapping provided!");
+                    return false;
+                }
 
                 boolean isSending = false;
                 boolean isReceving = false;
@@ -90,7 +115,6 @@ public class Plugin implements PluginService {
                     return false;
                 }
 
-                logger.error(pluginBuilder.getConfig().getStringParam("edges"));
 
                 //Log message to notify of plugin initialization
                 logger.info("Starting repoEngine...");
@@ -110,7 +134,7 @@ public class Plugin implements PluginService {
                 }
 
                 //setting plugin active on the agent
-                pluginBuilder.setIsActive(true);
+                //pluginBuilder.setIsActive(true);
 
                 if(isSending) {
                     //Starting any configured file scans
@@ -119,8 +143,6 @@ public class Plugin implements PluginService {
 
                 //Log message to notify of plugin startup
                 logger.info("Started repoEngine...");
-
-
 
             }
             return true;
@@ -143,6 +165,17 @@ public class Plugin implements PluginService {
         return true;
     }
 
+    public List<gEdge> jsonToEdgeList(String json) {
+        List<gEdge> returnMap = null;
+        try{
+            returnMap = gson.fromJson(json,type);
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            logger.error(ex.getMessage());
+        }
+        return returnMap;
+
+    }
 
 
 }

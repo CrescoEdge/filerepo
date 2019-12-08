@@ -1,7 +1,6 @@
 package io.cresco.filerepo;
 
 import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 import org.apache.commons.dbcp2.*;
@@ -23,8 +22,6 @@ import java.util.Map;
 public class DBEngine {
 
     private DataSource ds;
-    private Gson gson;
-    private Type type;
     private CLogger logger;
 
     private List<String> tablesNames;
@@ -36,41 +33,33 @@ public class DBEngine {
         try {
             logger = plugin.getLogger(DBEngine.class.getName(), CLogger.Level.Info);
 
-            String dataPath = "cresco-data/plugin-data/" + plugin.getPluginID() + "/";
-            System.setProperty("derby.system.home", new File(dataPath).getAbsolutePath());
-
             this.pluginBuilder = plugin;
 
             tablesNames = new ArrayList<>();
             tablesNames.add("filelist");
 
+            String dbName = "filerepo-db";
+            String dbPath = plugin.getPluginDataDirectory() + "/derbydb-home/" + dbName;
 
-            this.gson = new Gson();
-            this.type = new TypeToken<Map<String, List<Map<String, String>>>>() {
-            }.getType();
-
-            String defaultDBName = "filerepo-db";
-            String dbName = plugin.getConfig().getStringParam("db_name", defaultDBName);
+            File dbsource = Paths.get(dbPath).toFile();
 
             String dbDriver = plugin.getConfig().getStringParam("db_driver", "org.apache.derby.jdbc.EmbeddedDriver");
-            String dbConnectionString = plugin.getConfig().getStringParam("db_jdbc", "jdbc:derby:" + dbName + ";create=true");
+            String dbConnectionString = plugin.getConfig().getStringParam("db_jdbc", "jdbc:derby:" + dbsource.getAbsolutePath()  + ";create=true");
+            //String dbConnectionString = plugin.getConfig().getStringParam("db_jdbc", "jdbc:hsqldb:" + dbsource2.getAbsolutePath() + ";ifexists=false");
 
             Class.forName(dbDriver);
+            //Class.forName("org.hsqldb.jdbc.JDBCDriver");
 
             ds = setupDataSource(dbConnectionString);
 
-
-                if (dbName.equals(defaultDBName)) {
-                    File dbsource = Paths.get(dataPath + defaultDBName).toFile();
-                    //File dbsource = new File(defaultDBName);
                     if (dbsource.exists()) {
-                        logger.info("DB SOURCE EXIST");
+                        logger.info("DB SOURCE EXIST: " + dbsource.getAbsolutePath() );
                     } else {
                         //dbsource.mkdir();
-                        logger.info("CREATING DB");
+                        logger.info("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
                         initDB();
                     }
-                }
+
 
         } catch (Exception ex) {
             ex.printStackTrace();

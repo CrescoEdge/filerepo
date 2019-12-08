@@ -2,6 +2,7 @@ package io.cresco.filerepo;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import io.cresco.library.app.gEdge;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
@@ -39,6 +40,7 @@ public class RepoEngine {
     private AtomicBoolean lockPeerUpdateQueueMap = new AtomicBoolean();
     private Map<String, Queue<Map<String,String>>> peerUpdateQueueMap;
 
+    private Type type;
 
     private Timer fileScanTimer;
 
@@ -60,6 +62,9 @@ public class RepoEngine {
         }.getType();
 
         this.repoListType = new TypeToken<Map<String,FileObject>>() {
+        }.getType();
+
+        this.type = new TypeToken<List<gEdge>>() {
         }.getType();
 
 
@@ -364,131 +369,16 @@ public class RepoEngine {
         //long period = 15000L;
 
         scanDirString =  plugin.getConfig().getStringParam("scan_dir");
-        scanRepo =  plugin.getConfig().getStringParam("scan_repo");
+        scanRepo =  plugin.getConfig().getStringParam("repo");
         long period =  plugin.getConfig().getLongParam("scan_period", 15000L);
 
         if((scanDirString != null) && (scanRepo != null)) {
         //if(scanDirString != null) {
         logger.info("Starting file scan : " + scanDirString + " repo:" + scanRepo);
-            startScan(delay, period);
+            //startScan(delay, period);
         }
 
     }
-
-    /*
-    private void syncRegionFiles() {
-        String returnString = null;
-        try {
-
-            MsgEvent request = plugin.getGlobalControllerMsgEvent(MsgEvent.Type.EXEC);
-            request.setParam("action", "listpluginsbytype");
-            request.setParam("action_plugintype_id", "pluginname");
-            request.setParam("action_plugintype_value", "io.cresco.filerepo");
-            MsgEvent response = plugin.sendRPC(request);
-
-            if (response != null) {
-
-                returnString = response.getCompressedParam("pluginsbytypelist");
-
-                Map<String, List<Map<String, String>>> myRepoMap = gson.fromJson(returnString, crescoType);
-
-                if (myRepoMap != null) {
-
-                    if (myRepoMap.containsKey("plugins")) {
-
-                        for (Map<String, String> repoMap : myRepoMap.get("plugins")) {
-
-                            if ((plugin.getRegion().equals(repoMap.get("region"))) && (plugin.getAgent().equals(repoMap.get("agent"))) && (plugin.getPluginID().equals(repoMap.get("pluginid")))) {
-                                //do nothing if self
-                                //logger.info("found self");
-                            } else if (plugin.getRegion().equals(repoMap.get("region"))) {
-                                //This is another filerepo in my region, I need to send it data
-                                String region = repoMap.get("region");
-                                String agent = repoMap.get("agent");
-                                String pluginID = repoMap.get("pluginid");
-
-                                logger.error("SEND :" + region + " " + agent + " " + pluginID + " data");
-
-                                MsgEvent fileRepoRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginID);
-                                fileRepoRequest.setParam("action","repolistin");
-                                String repoListStringIn = getFileRepoList(scanRepo);
-
-                                logger.info("repoListStringIn: " + repoListStringIn);
-
-                                fileRepoRequest.setCompressedParam("repolistin",repoListStringIn);
-                                fileRepoRequest.setParam("repo",scanRepo);
-
-                                MsgEvent fileRepoResponse = plugin.sendRPC(fileRepoRequest);
-
-                                if(fileRepoResponse != null) {
-                                    String repoDiffString = fileRepoResponse.getCompressedParam("repodiff");
-                                    if(repoDiffString != null) {
-                                        logger.info("repoDiffString: " + repoDiffString);
-
-                                        Map<String,FileObject> sendFileMap = gson.fromJson(repoDiffString, repoListType);
-
-                                        if(sendFileMap.size() > 0) {
-
-                                            //transferId = UUID.randomUUID().toString();
-
-                                            Map<String, FileObject> myFileMap = new HashMap<>();
-
-                                            synchronized (lockFileMap) {
-                                                if (fileMap.containsKey(scanRepo)) {
-                                                    myFileMap.putAll(fileMap.get(scanRepo));
-                                                }
-                                            }
-
-                                            MsgEvent filePutRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginID);
-                                            filePutRequest.setParam("action", "putfiles");
-
-                                            //filePutRequest.setParam("filename", fileName);
-                                            //filePutRequest.setParam("md5", fileObject.MD5);
-                                            filePutRequest.setParam("repo_name", scanRepo);
-                                            filePutRequest.setParam("transfer_id", String.valueOf(transferId));
-                                            //overwrite remote files
-                                            filePutRequest.setParam("overwrite", Boolean.TRUE.toString());
-
-                                            for (Map.Entry<String, FileObject> entry : sendFileMap.entrySet()) {
-                                                String fileName = entry.getKey();
-                                                FileObject fileObject = entry.getValue();
-
-                                                if (myFileMap.containsKey(fileName)) {
-
-                                                    Path filePath = Paths.get(fileObject.filePath);
-                                                    filePutRequest.addFile(filePath.toAbsolutePath().toString());
-
-
-                                                } else {
-                                                    logger.error("Filename: " + fileName + " on transfer list, but not found locally!");
-                                                }
-                                            }
-
-                                            //ready to send
-                                            plugin.msgOut(filePutRequest);
-
-                                        }
-                                    }
-
-                                    //
-
-
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    logger.error("syncRegionFiles() No filerepo found by global controller");
-                }
-            } else {
-                logger.error("syncRegionFiles() Null response from global controller");
-            }
-
-        }catch (Exception ex) {
-            ex.printStackTrace();
-        }
-    }
-    */
 
     private void syncRegionFilesOLD(Map<String,FileObject> fileDiffMap) {
         String returnString = null;
@@ -705,30 +595,60 @@ public class RepoEngine {
             public void run() {
                 try {
 
-                    if(!inScan.get()) {
+                    if(plugin.isActive()) {
+                        logger.error("TRYING 0");
+                        String edgeMapString = plugin.getConfig().getStringParam("edges");
+                        logger.error("TRYING 1");
+                        List<gEdge> edgeList = jsonToEdgeList(edgeMapString);
+                        logger.error("TRYING 2");
+                        if (edgeList != null) {
+                            for (gEdge edge : edgeList) {
 
-                        logger.error("\t\t ***STARTING SCAN " + inScan.get() + " tid:" + transferId);
-                        inScan.set(true);
+                                logger.error(edge.edge_id + " from: " + edge.node_from + " to: " + edge.node_to);
+                                logger.error("1");
+                                MsgEvent req = plugin.getGlobalControllerMsgEvent(MsgEvent.Type.EXEC);
+                                req.setParam("action", "getinodestatus");
+                                req.setParam("inode_id", edge.node_to);
+                                logger.error("2");
+                                MsgEvent resp = plugin.sendRPC(req);
+                                //MsgEvent resp = pluginBuilder.sendRPC(req);
+                                logger.error("3");
+                                logger.error("[" + resp.getParams() + "]");
+                                //String pnode = resp.getCompressedParam("pnode");
+                                //logger.error("4");
+                                //logger.error(pnode);
 
-                        logger.error("\t\t ***STARTED SCAN " + inScan.get());
-                        //build file list
-                        Map<String,FileObject> diffList = buildRepoList();
-                        if(diffList.size() > 0) {
-                            //start sync
-                            transferId++;
-                            //find other repos
-                            logger.error("SYNC Files");
-                            syncRegionFiles(diffList);
+
+                            }
                         }
 
-                        logger.error("\t\t ***ENDING SCAN " + inScan.get());
-                        //inScan.set(false);
-                        logger.error("\t\t ***ENDED SCAN " + inScan.get());
+                        if (!inScan.get()) {
 
-                        inScan.set(false);
+                            logger.error("\t\t ***STARTING SCAN " + inScan.get() + " tid:" + transferId);
+                            inScan.set(true);
 
+                            logger.error("\t\t ***STARTED SCAN " + inScan.get());
+                            //build file list
+                            Map<String, FileObject> diffList = buildRepoList();
+                            if (diffList.size() > 0) {
+                                //start sync
+                                transferId++;
+                                //find other repos
+                                logger.error("SYNC Files");
+                                syncRegionFiles(diffList);
+                            }
+
+                            logger.error("\t\t ***ENDING SCAN " + inScan.get());
+                            //inScan.set(false);
+                            logger.error("\t\t ***ENDED SCAN " + inScan.get());
+
+                            inScan.set(false);
+
+                        } else {
+                            logger.error("\t\t ***ALREADY IN SCAN");
+                        }
                     } else {
-                        logger.error("\t\t ***ALREADY IN SCAN");
+                        logger.error("NO ACTIVE");
                     }
 
                 } catch (Exception ex) {
@@ -964,6 +884,16 @@ public class RepoEngine {
 
         return isUploaded;
     }
+    public List<gEdge> jsonToEdgeList(String json) {
+        List<gEdge> returnMap = null;
+        try{
+            returnMap = gson.fromJson(json,type);
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            logger.error(ex.getMessage());
+        }
+        return returnMap;
 
+    }
 
 }
