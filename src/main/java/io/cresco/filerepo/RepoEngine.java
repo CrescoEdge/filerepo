@@ -53,6 +53,8 @@ public class RepoEngine {
 
     private  DBEngine dbEngine;
 
+    private boolean isCEP = false;
+
     public RepoEngine(PluginBuilder pluginBuilder, DBEngine dbEngine) {
 
         this.plugin = pluginBuilder;

@@ -1,10 +1,7 @@
 package io.cresco.filerepo;
 
 
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
 import io.cresco.library.agent.AgentService;
-import io.cresco.library.app.gEdge;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
@@ -13,8 +10,6 @@ import io.cresco.library.utilities.CLogger;
 import org.osgi.framework.BundleContext;
 import org.osgi.service.component.annotations.*;
 
-import java.lang.reflect.Type;
-import java.util.List;
 import java.util.Map;
 
 @Component(
@@ -33,9 +28,10 @@ public class Plugin implements PluginService {
     private CLogger logger;
     private Map<String,Object> map;
     private DBEngine dbEngine;
-    private Gson gson;
 
     private RepoEngine repoEngine;
+
+
 
     @Activate
     void activate(BundleContext context, Map<String,Object> map) {
@@ -125,6 +121,7 @@ public class Plugin implements PluginService {
 
                 //setting plugin active on the agent
                 //pluginBuilder.setIsActive(true);
+
 
                 if(isSending) {
                     //Starting any configured file scans
