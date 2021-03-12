@@ -196,6 +196,7 @@ public class RepoEngine {
                         String fileName = listOfFiles[i].getName();
                         String filePath = listOfFiles[i].getAbsolutePath();
                         long lastModified = listOfFiles[i].lastModified();
+                        long filesize = listOfFiles[i].length();
 
                         boolean add = false;
                         boolean update = false;
@@ -212,20 +213,20 @@ public class RepoEngine {
                             update = true;
                         }
 
-                        String MD5hash = plugin.getMD5(filePath);
-                        logger.trace("fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
-
+                        String MD5hash = null;
                         if (add || update) {
-                            FileObject fileObject = new FileObject(fileName, MD5hash, filePath, lastModified);
+                            MD5hash = plugin.getMD5(filePath);
+                            logger.trace("fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
+                            FileObject fileObject = new FileObject(fileName, MD5hash, filePath, lastModified, filesize);
                             fileDiffMap.put(filePath, fileObject);
                         }
 
                         if (add) {
-                            dbEngine.addFile(filePath, MD5hash, lastModified);
+                            dbEngine.addFile(filePath, MD5hash, lastModified, filesize);
                         }
 
                         if (update) {
-                            dbEngine.updateFile(filePath, MD5hash, 0, lastModified);
+                            dbEngine.updateFile(filePath, MD5hash, 0, lastModified, filesize);
                         }
                     }
                 }
@@ -289,7 +290,7 @@ public class RepoEngine {
                                 for (Map.Entry<String, FileObject> entry : fileDiffMap.entrySet()) {
                                     //String key = entry.getKey();
                                     FileObject fileObject = entry.getValue();
-                                    dbEngine.updateFile(fileObject.filePath, fileObject.MD5, 1, fileObject.lastModified);
+                                    dbEngine.updateFile(fileObject.filePath, fileObject.MD5, 1, fileObject.lastModified, fileObject.filesize);
                                 }
                                 logger.info("Transfered " + fileDiffMap.size() + " files to " + pluginID);
                             }
@@ -468,7 +469,7 @@ public class RepoEngine {
                         String md5 = plugin.getMD5(fileSavePath);
 
                         //given there is no last modified provided by the transfer, we will create a last modified locally time
-                        FileObject fileObject = new FileObject(fileSaved.getName(), md5, fileSavePath, System.currentTimeMillis());
+                        FileObject fileObject = new FileObject(fileSaved.getName(), md5, fileSavePath, System.currentTimeMillis(), fileSaved.length());
 
                         synchronized (lockFileMap) {
                             if (!fileMap.containsKey(repoName)) {

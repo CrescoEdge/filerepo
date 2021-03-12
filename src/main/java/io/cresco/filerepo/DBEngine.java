@@ -14,6 +14,7 @@ import java.nio.file.Paths;
 import java.sql.*;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 public class DBEngine {
 
@@ -122,6 +123,8 @@ public class DBEngine {
                 "   md5 varchar(255)," +
                 "   insync int," +
                 "   lastmodified varchar(255)" +
+                "   filesize varchar(255)" +
+                "   insync int," +
                 ")";
 
 
@@ -136,7 +139,7 @@ public class DBEngine {
         }
     }
 
-    public void addFile(String filepath, String md5, long lastmodified) {
+    public void addFile(String filepath, String md5, long lastmodified, long filesize) {
 
         try {
 
@@ -146,8 +149,8 @@ public class DBEngine {
 
                 try (Statement stmt = conn.createStatement()) {
 
-                    String insertFilePathString = "insert into filelist (filepath, md5, insync, lastmodified) " +
-                            "values ('" + filepath + "','" + md5 + "'," + 0 + ",'" + String.valueOf(lastmodified) + "')";
+                    String insertFilePathString = "insert into filelist (filepath, md5, insync, lastmodified, filesize) " +
+                            "values ('" + filepath + "','" + md5 + "'," + 0 + ",'" + String.valueOf(lastmodified) + "','" + String.valueOf(filesize) +"')";
 
                     stmt.executeUpdate(insertFilePathString);
                     conn.commit();
@@ -193,12 +196,77 @@ public class DBEngine {
         return lastModified;
     }
 
-    public int updateFile(String filepath, String md5, int insync, long lastmodified) {
+    public long getFileSize(String filepath) {
+        long filesize = -1;
+        try {
+
+            String queryString = "SELECT filesize FROM filelist WHERE filepath = '" + filepath +"'";
+
+            //logger.error("QUERY: " + queryString);
+
+            try (Connection conn = ds.getConnection()) {
+                try (Statement stmt = conn.createStatement()) {
+
+                    try(ResultSet rs = stmt.executeQuery(queryString)) {
+
+                        if (rs.next()) {
+                            filesize = rs.getLong(1);
+                        }
+
+                    }
+                }
+            }
+
+        } catch(Exception ex) {
+            ex.printStackTrace();
+            System.out.println(ex.getMessage());
+            StringWriter errors = new StringWriter();
+            ex.printStackTrace(new PrintWriter(errors));
+            System.out.println(errors.toString());
+        }
+
+        return filesize;
+    }
+
+    public String getMD5(String filepath) {
+        String md5 = null;
+        try {
+
+            String queryString = "SELECT md5 FROM filelist WHERE filepath = '" + filepath +"'";
+
+            //logger.error("QUERY: " + queryString);
+
+            try (Connection conn = ds.getConnection()) {
+                try (Statement stmt = conn.createStatement()) {
+
+                    try(ResultSet rs = stmt.executeQuery(queryString)) {
+
+                        if (rs.next()) {
+                            md5 = rs.getString(1);
+                        }
+
+                    }
+                }
+            }
+
+        } catch(Exception ex) {
+            ex.printStackTrace();
+            System.out.println(ex.getMessage());
+            StringWriter errors = new StringWriter();
+            ex.printStackTrace(new PrintWriter(errors));
+            System.out.println(errors.toString());
+        }
+
+        return md5;
+    }
+
+
+    public int updateFile(String filepath, String md5, int insync, long lastmodified, long filesize) {
         int queryReturn = -1;
         try {
 
             String queryString = null;
-            queryString = "UPDATE filelist SET filepath='" + filepath + "', md5='" + md5 + "', insync=" + insync + ", lastmodified='" + String.valueOf(lastmodified) + "'"
+            queryString = "UPDATE filelist SET filepath='" + filepath + "', md5='" + md5 + "', insync=" + insync + "', filesize='" + String.valueOf(filesize) + "', lastmodified='" + String.valueOf(lastmodified) + "'"
                     + " WHERE filepath='" + filepath + "'";
 
             try (Connection conn = ds.getConnection()) {
