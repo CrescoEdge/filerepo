@@ -24,6 +24,11 @@ public class DBEngine {
 
     private PluginBuilder pluginBuilder;
 
+    private PoolableConnectionFactory poolableConnectionFactory;
+    private ObjectPool<PoolableConnection> connectionPool;
+    private PoolingDataSource<PoolableConnection> dataSource;
+    private File dbsource;
+
     public DBEngine(PluginBuilder plugin) {
 
         try {
@@ -61,6 +66,48 @@ public class DBEngine {
             ex.printStackTrace();
         }
     }
+
+    public boolean shutdown() {
+        boolean isShutdown = false;
+        try {
+            //shutdown connections
+            dataSource.close();
+            connectionPool.close();
+
+            //shutdown database, catch acception
+            try {
+                //shutdown the database
+                //String shutdownString =  "jdbc:derby:" + dbPath + ";shutdown=true";
+                String shutdownString = "jdbc:derby:" + dbsource.getAbsolutePath() + ";shutdown=true";
+                DriverManager.getConnection(shutdownString);
+            } catch (SQLException e) {
+                if (e.getErrorCode() == 50000) {
+                /*
+                XJ015 (with SQLCODE 50000) is the expected (successful)
+                SQLSTATE for complete system shutdown. 08006 (with SQLCODE 45000), on the other hand, is the expected SQLSTATE for shutdown of only an individual database.
+                 */
+                    isShutdown = true;
+
+                } else {
+                    e.printStackTrace();
+                }
+            }
+            //unload drivers
+            //DriverManager.getConnection("jdbc:derby:;shutdown=true");
+            Driver d= new org.apache.derby.jdbc.EmbeddedDriver();
+            //Driver d= new org.hsqldb.jdbc.JDBCDriver();
+            DriverManager.deregisterDriver(d);
+
+            Driver da= new org.apache.derby.jdbc.AutoloadedDriver();
+            DriverManager.deregisterDriver(da);
+
+        }
+        catch (Exception ex) {
+            ex.printStackTrace();
+        }
+        return isShutdown;
+    }
+
 
     public void initDB() {
 
@@ -172,11 +219,11 @@ public class DBEngine {
     ///
 
 
-    public static DataSource setupDataSource(String connectURI) {
+    public DataSource setupDataSource(String connectURI) {
         return setupDataSource(connectURI,null,null);
     }
 
-    public static DataSource setupDataSource(String connectURI, String login, String password) {
+    public DataSource setupDataSource(String connectURI, String login, String password) {
         //
         // First, we'll create a ConnectionFactory that the
         // pool will use to create Connections.
@@ -198,7 +245,7 @@ public class DBEngine {
         // the "real" Connections created by the ConnectionFactory with
         // the classes that implement the pooling functionality.
         //
-        PoolableConnectionFactory poolableConnectionFactory =
+        poolableConnectionFactory =
                 new PoolableConnectionFactory(connectionFactory, null);
 
 
@@ -210,7 +257,7 @@ public class DBEngine {
         // We'll use a GenericObjectPool instance, although
         // any ObjectPool implementation will suffice.
         //
-        ObjectPool<PoolableConnection> connectionPool =
+        connectionPool =
                 new GenericObjectPool<>(poolableConnectionFactory);
 
         // Set the factory's pool property to the owning pool
@@ -222,7 +269,7 @@ public class DBEngine {
         // Finally, we create the PoolingDriver itself,
         // passing in the object pool we created.
         //
-        PoolingDataSource<PoolableConnection> dataSource =
+        dataSource =
                 new PoolingDataSource<>(connectionPool);
 
         return dataSource;

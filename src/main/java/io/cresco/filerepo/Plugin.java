@@ -16,7 +16,6 @@ import java.util.Map;
         service = { PluginService.class },
         scope=ServiceScope.PROTOTYPE,
         configurationPolicy = ConfigurationPolicy.REQUIRE,
-        servicefactory = true,
         reference=@Reference(name="io.cresco.library.agent.AgentService", service= AgentService.class)
 )
 
@@ -80,31 +79,9 @@ public class Plugin implements PluginService {
                 this.logger = pluginBuilder.getLogger(Plugin.class.getName(), CLogger.Level.Info);
 
                 //Plugin is either receving or sending
-                String scanDirString =  pluginBuilder.getConfig().getStringParam("scan_dir");
-                String repoDirString =  pluginBuilder.getConfig().getStringParam("repo_dir");
-
-                if(pluginBuilder.getConfig().getStringParam("edges") == null) {
-                    logger.error("No edge mapping provided!");
-                    return false;
-                }
-
-                boolean isSending = false;
-                //boolean isReceving = false;
-
-                if((scanDirString != null) && (repoDirString != null)) {
-                    logger.error("fileRepo can't be both sending and receving");
-                    return false;
-                } else if((scanDirString != null) && (repoDirString == null)) {
-                    isSending = true;
-                    logger.info("fileRepo configured as sender: scan_dir:" + scanDirString);
-
-                } else if((scanDirString == null) && (repoDirString != null)) {
-                    //isReceving = true;
-                    logger.info("fileRepo configured as recever: repo_dir:" + repoDirString);
-                } else {
-                    logger.error("no configuration found for either sending and receving");
-                    return false;
-                }
+                String outgoingPathString =  pluginBuilder.getConfig().getStringParam("outgoing_storage_path");
+                String incomingPathString =  pluginBuilder.getConfig().getStringParam("incoming_storage_path");
+                String fileRepoName =  pluginBuilder.getConfig().getStringParam("filerepo_name");
 
                 dbEngine = new DBEngine(pluginBuilder);
                 //Starting the RepoEngine Threads
@@ -119,17 +96,10 @@ public class Plugin implements PluginService {
                     Thread.sleep(1000);
                 }
 
-                //setting plugin active on the agent
-                //pluginBuilder.setIsActive(true);
-
-
-                if(isSending) {
-                    //Starting any configured file scans
-                    repoEngine.startScan();
-                }
-
+                repoEngine.start();
                 //Log message to notify of plugin startup
                 logger.info("repoEngine Started");
+
 
             }
             return true;
@@ -144,8 +114,13 @@ public class Plugin implements PluginService {
 
         if(pluginBuilder != null) {
             if(repoEngine != null) {
-                repoEngine.stopScan();
+                repoEngine.shutdown();
             }
+
+            if(dbEngine != null) {
+                dbEngine.shutdown();
+            }
+
             pluginBuilder.setExecutor(null);
             pluginBuilder.setIsActive(false);
         }
