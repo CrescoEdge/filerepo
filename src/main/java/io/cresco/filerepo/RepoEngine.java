@@ -540,7 +540,7 @@ public class RepoEngine {
                 try {
 
                     if (msg instanceof TextMessage) {
-                        logger.info(" SUB REC MESSAGE:" + ((TextMessage) msg).getText());
+                        logger.debug(" SUB REC MESSAGE:" + ((TextMessage) msg).getText());
                         Map<String, String> incomingMap = gson.fromJson(((TextMessage) msg).getText(), mapType);
                         if(incomingMap.containsKey("action")) {
                             if(incomingMap.containsKey("filerepo_name")) {
@@ -627,7 +627,7 @@ public class RepoEngine {
             updateMessage.setBooleanProperty("broadcast",Boolean.TRUE);
 
             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage);
-            logger.error("SENDING MESSAGE: " + update.toString());
+            logger.debug("SENDING MESSAGE: " + update.toString());
 
         } catch (Exception ex) {
             logger.error("failed to update subscribers");
@@ -644,7 +644,7 @@ public class RepoEngine {
                 try {
 
                     if (msg instanceof TextMessage) {
-                        logger.info(" REPO REC MESSAGE:" + ((TextMessage) msg).getText());
+                        logger.debug(" REPO REC MESSAGE:" + ((TextMessage) msg).getText());
                         Map<String, String> incomingMap = gson.fromJson(((TextMessage) msg).getText(), mapType);
                         if(incomingMap.containsKey("action")) {
                             if(incomingMap.containsKey("filerepo_name")) {
