@@ -77,7 +77,6 @@ public class DBEngine {
                 //shutdown the database
                 //String shutdownString =  "jdbc:derby:" + dbPath + ";shutdown=true";
                 if(dbsource.exists()) {
-                    logger.error("DB shutdown as expected");
                     String shutdownString = "jdbc:derby:" + dbsource.getAbsolutePath() + ";shutdown=true";
                     //String shutdownString = "jdbc:derby:;shutdown=true";
                     DriverManager.getConnection(shutdownString);
@@ -86,8 +85,6 @@ public class DBEngine {
                     dataSource.close();
                     connectionPool.close();
 
-                } else {
-                    logger.error("Why does db not exists");
                 }
             } catch (SQLException e) {
                 if (e.getErrorCode() == 50000) {
