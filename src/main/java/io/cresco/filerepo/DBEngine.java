@@ -43,7 +43,7 @@ public class DBEngine {
             String dbName = "filerepo-db";
             String dbPath = plugin.getPluginDataDirectory() + "/derbydb-home/" + dbName;
 
-            File dbsource = Paths.get(dbPath).toFile();
+            dbsource = Paths.get(dbPath).toFile();
 
             String dbDriver = plugin.getConfig().getStringParam("db_driver", "org.apache.derby.jdbc.EmbeddedDriver");
             String dbConnectionString = plugin.getConfig().getStringParam("db_jdbc", "jdbc:derby:" + dbsource.getAbsolutePath()  + ";create=true");
@@ -71,16 +71,24 @@ public class DBEngine {
     public boolean shutdown() {
         boolean isShutdown = false;
         try {
-            //shutdown connections
-            dataSource.close();
-            connectionPool.close();
 
             //shutdown database, catch acception
             try {
                 //shutdown the database
                 //String shutdownString =  "jdbc:derby:" + dbPath + ";shutdown=true";
-                String shutdownString = "jdbc:derby:" + dbsource.getAbsolutePath() + ";shutdown=true";
-                DriverManager.getConnection(shutdownString);
+                if(dbsource.exists()) {
+                    logger.error("DB shutdown as expected");
+                    String shutdownString = "jdbc:derby:" + dbsource.getAbsolutePath() + ";shutdown=true";
+                    //String shutdownString = "jdbc:derby:;shutdown=true";
+                    DriverManager.getConnection(shutdownString);
+
+                    //shutdown connections
+                    dataSource.close();
+                    connectionPool.close();
+
+                } else {
+                    logger.error("Why does db not exists");
+                }
             } catch (SQLException e) {
                 if (e.getErrorCode() == 50000) {
                 /*
@@ -89,18 +97,21 @@ public class DBEngine {
                  */
                     isShutdown = true;
 
+                } else if (e.getErrorCode() == 45000) {
+                    isShutdown = true;
+
                 } else {
                     e.printStackTrace();
                 }
             }
             //unload drivers
             //DriverManager.getConnection("jdbc:derby:;shutdown=true");
-            Driver d= new org.apache.derby.jdbc.EmbeddedDriver();
+            //Driver d= new org.apache.derby.jdbc.EmbeddedDriver();
             //Driver d= new org.hsqldb.jdbc.JDBCDriver();
-            DriverManager.deregisterDriver(d);
+            //DriverManager.deregisterDriver(d);
 
-            Driver da= new org.apache.derby.jdbc.AutoloadedDriver();
-            DriverManager.deregisterDriver(da);
+            //Driver da= new org.apache.derby.jdbc.AutoloadedDriver();
+            //DriverManager.deregisterDriver(da);
 
         }
         catch (Exception ex) {
@@ -122,9 +133,8 @@ public class DBEngine {
                 "   filepath varchar(1000) primary key NOT NULL," +
                 "   md5 varchar(255)," +
                 "   insync int," +
-                "   lastmodified varchar(255)" +
+                "   lastmodified varchar(255)," +
                 "   filesize varchar(255)" +
-                "   insync int," +
                 ")";
 
 
@@ -266,7 +276,7 @@ public class DBEngine {
         try {
 
             String queryString = null;
-            queryString = "UPDATE filelist SET filepath='" + filepath + "', md5='" + md5 + "', insync=" + insync + "', filesize='" + String.valueOf(filesize) + "', lastmodified='" + String.valueOf(lastmodified) + "'"
+            queryString = "UPDATE filelist SET filepath='" + filepath + "', md5='" + md5 + "', insync=" + insync + ", filesize='" + String.valueOf(filesize) + "', lastmodified='" + String.valueOf(lastmodified) + "'"
                     + " WHERE filepath='" + filepath + "'";
 
             try (Connection conn = ds.getConnection()) {

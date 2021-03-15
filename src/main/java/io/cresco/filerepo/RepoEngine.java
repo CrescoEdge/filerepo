@@ -161,9 +161,9 @@ public class RepoEngine {
     public void shutdown() {
 
         stopScan();
-        if(fileRepoName != null) {
-            repoBroadcast(fileRepoName,"shutdown");
-        }
+        //if(fileRepoName != null) {
+        //    repoBroadcast(fileRepoName,"shutdown");
+        //}
         for(String listenerid : listenerList) {
             plugin.getAgentService().getDataPlaneService().removeMessageListener(listenerid);
         }
@@ -391,7 +391,6 @@ public class RepoEngine {
                                     logger.debug("UPDATING " + repoId + " transferid: " + currentTransferId);
 
                                     for (Map.Entry<String, FileObject> diffEntry : remoteRepoFiles .entrySet()) {
-                                        String fileName = diffEntry.getKey();
                                         FileObject fileObject = diffEntry.getValue();
 
                                         //public Path downloadRemoteFile(String remoteRegion, String remoteAgent, String remoteFilePath, String localFilePath) {
@@ -399,9 +398,20 @@ public class RepoEngine {
                                         logger.debug("localDir: " + localDir.getAbsolutePath());
                                         Path localPath = Paths.get(localDir.getAbsolutePath() + "/" + fileObject.fileName);
                                         logger.debug("localFilePath: " + localPath.toFile().getAbsolutePath());
+                                        //check that file exists
+                                        boolean downloadFile = true;
+                                        if(localPath.toFile().exists()) {
+                                            if(localPath.toFile().length() == fileObject.filesize) {
+                                                if(fileObject.MD5.equals(plugin.getMD5(localPath.toAbsolutePath().toString()))) {
+                                                    downloadFile = false;
+                                                }
+                                            }
+                                        }
+                                        if(downloadFile) {
+                                            Path tmpFile = plugin.getAgentService().getDataPlaneService().downloadRemoteFile(region, agent, fileObject.filePath, localPath.toFile().getAbsolutePath());
+                                            logger.debug("Synced " + tmpFile.toFile().getAbsolutePath());
+                                        }
 
-                                        Path tmpFile = plugin.getAgentService().getDataPlaneService().downloadRemoteFile(region,agent,fileObject.filePath, localPath.toFile().getAbsolutePath());
-                                        logger.debug("Synced " + tmpFile.toFile().getAbsolutePath());
                                     }
 
                                     logger.debug("SENDING UPDATE " + repoId);

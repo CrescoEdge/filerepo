@@ -115,10 +115,12 @@ public class Plugin implements PluginService {
         if(pluginBuilder != null) {
             if(repoEngine != null) {
                 repoEngine.shutdown();
+                repoEngine = null;
             }
 
             if(dbEngine != null) {
                 dbEngine.shutdown();
+                dbEngine = null;
             }
 
             pluginBuilder.setExecutor(null);
