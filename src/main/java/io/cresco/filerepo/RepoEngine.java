@@ -111,6 +111,7 @@ public class RepoEngine {
         stopScan();
 
         //start listening
+        logger.info("Creating Repo Listener for: " + fileRepoName);
         createRepoSubListener(fileRepoName);
 
         //create timer task
@@ -122,7 +123,7 @@ public class RepoEngine {
 
                             if (!inScan.get()) {
 
-                                //logger.error("\t\t ***STARTING SCAN " + inScan.get() + " tid:" + transferId);
+                                logger.info("\t\t ***STARTING SCAN " + inScan.get() + " tid:" + transferId);
                                 inScan.set(true);
 
                                 //let everyone know scan is starting
@@ -156,7 +157,7 @@ public class RepoEngine {
 
         fileScanTimer = new Timer("Timer");
         fileScanTimer.scheduleAtFixedRate(fileScanTask, delay, period);
-        logger.debug("filescantimer : set : " + period);
+        logger.info("filescantimer : set : " + period);
     }
 
     public void shutdown() {
@@ -173,8 +174,11 @@ public class RepoEngine {
 
     public void stopScan() {
         if(fileScanTimer != null) {
+            logger.warn("Stopping existing scan");
             fileScanTimer.cancel();
             fileScanTimer = null;
+        } else {
+            logger.warn("No scan currently active");
         }
     }
 
@@ -204,13 +208,18 @@ public class RepoEngine {
             File[] listOfFiles = null;
             boolean scanRecursive = plugin.getConfig().getBooleanParam("scan_recursive",false);
             if(scanRecursive) {
+                logger.error("SCAN RECURSIVE");
                 List<File> tp = new ArrayList<>();
                 List<File> fn = getFileNames(tp,Paths.get(scanDirString));
+                for(File f : fn) {
+                    logger.error("File: " + f.getAbsolutePath());
+                }
 
                 listOfFiles = new File[fn.size()];
                 listOfFiles = fn.toArray(listOfFiles);
 
             } else {
+                logger.error("NOT SCAN RECURSIVE");
                 //get all files in the scan directory
                 File folder = new File(scanDirString);
                 listOfFiles = folder.listFiles();
