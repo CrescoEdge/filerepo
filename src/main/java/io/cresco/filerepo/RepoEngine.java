@@ -13,6 +13,7 @@ import java.io.File;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.Type;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -177,6 +178,20 @@ public class RepoEngine {
         }
     }
 
+    private List<File> getFileNames(List<File> fileNames, Path dir) {
+        try(DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+            for (Path path : stream) {
+                if(path.toFile().isDirectory()) {
+                    getFileNames(fileNames, path);
+                } else {
+                    fileNames.add(path.toFile());
+                }
+            }
+        } catch(Exception e) {
+            e.printStackTrace();
+        }
+        return fileNames;
+    }
 
     //build and sync
     private Map<String,FileObject> getFileRepoDiff() {
@@ -186,9 +201,20 @@ public class RepoEngine {
 
             fileDiffMap = new HashMap<>();
 
-            //get all files in the scan directory
-            File folder = new File(scanDirString);
-            File[] listOfFiles = folder.listFiles();
+            File[] listOfFiles = null;
+            boolean scanRecursive = plugin.getConfig().getBooleanParam("scan_recursive",false);
+            if(scanRecursive) {
+                List<File> tp = new ArrayList<>();
+                List<File> fn = getFileNames(tp,Paths.get(scanDirString));
+
+                listOfFiles = new File[fn.size()];
+                listOfFiles = fn.toArray(listOfFiles);
+
+            } else {
+                //get all files in the scan directory
+                File folder = new File(scanDirString);
+                listOfFiles = folder.listFiles();
+            }
 
             if(listOfFiles != null) {
                 for (int i = 0; i < listOfFiles.length; i++) {
