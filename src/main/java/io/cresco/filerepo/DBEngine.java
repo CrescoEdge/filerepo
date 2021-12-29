@@ -13,6 +13,7 @@ import java.io.StringWriter;
 import java.nio.file.Paths;
 import java.sql.*;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -171,6 +172,45 @@ public class DBEngine {
 
     }
 
+    public List<Map<String,String>> getRepoList() {
+        List<Map<String,String>> repoFileList = null;
+        try {
+
+            repoFileList = new ArrayList<>();
+
+            String queryString = "SELECT filepath, md5, lastmodified, filesize FROM filelist";
+
+            //logger.error("QUERY: " + queryString);
+
+            try (Connection conn = ds.getConnection()) {
+                try (Statement stmt = conn.createStatement()) {
+
+                    try(ResultSet rs = stmt.executeQuery(queryString)) {
+
+                        while (rs.next()) {
+                            Map<String,String> fileMap = new HashMap<>();
+                            fileMap.put("filepath",rs.getString("filepath"));
+                            fileMap.put("md5",rs.getString("md5"));
+                            fileMap.put("lastmodified",rs.getString("lastmodified"));
+                            fileMap.put("filesize",rs.getString("filesize"));
+                            repoFileList.add(fileMap);
+                        }
+
+                    }
+                }
+            }
+
+        } catch(Exception ex) {
+            ex.printStackTrace();
+            System.out.println(ex.getMessage());
+            StringWriter errors = new StringWriter();
+            ex.printStackTrace(new PrintWriter(errors));
+            System.out.println(errors.toString());
+        }
+
+        return repoFileList;
+    }
+
     public long getLastModified(String filepath) {
         long lastModified = -1;
         try {
@@ -267,7 +307,6 @@ public class DBEngine {
         return md5;
     }
 
-
     public int updateFile(String filepath, String md5, int insync, long lastmodified, long filesize) {
         int queryReturn = -1;
         try {
@@ -284,6 +323,25 @@ public class DBEngine {
                 }
             }
 
+
+        } catch(Exception ex) {
+            ex.printStackTrace();
+        }
+        return queryReturn;
+    }
+
+    public int deleteFile(String filepath) {
+        int queryReturn = -1;
+        try {
+
+            String queryString = null;
+            queryString = "DELETE FROM filelist WHERE filepath='" + filepath + "'";
+
+            try (Connection conn = ds.getConnection()) {
+                try (Statement stmt = conn.createStatement()) {
+                    queryReturn = stmt.executeUpdate(queryString);
+                }
+            }
 
         } catch(Exception ex) {
             ex.printStackTrace();

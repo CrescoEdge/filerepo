@@ -480,6 +480,37 @@ public class RepoEngine {
 
     }
 
+    public String getFileRepoString(String repoName) {
+        String repoString = null;
+        try {
+
+            List<Map<String,String>> repoFileList = dbEngine.getRepoList();
+            repoString = gson.toJson(repoFileList);
+
+        } catch (Exception ex) {
+            logger.error("getFileRepoString: " + ex.getMessage());
+        }
+        return repoString;
+    }
+
+    public Boolean removeFile(String fileRepoName, String fileName) {
+        boolean isRemoved = false;
+        try {
+
+            File checkFile = Paths.get(getRepoDir().getAbsolutePath() + "/" + fileName).toFile();
+            if(checkFile.exists()) {
+                int deleteStatus = dbEngine.deleteFile(checkFile.getAbsolutePath());
+                logger.error("delete status: " + deleteStatus);
+                isRemoved = checkFile.delete();
+            }
+
+        } catch (Exception ex) {
+            logger.error("removeFile: " + ex.getMessage());
+            isRemoved = false;
+        }
+        return isRemoved;
+    }
+
     public Boolean putFiles(List<String> fileList, String repoName, boolean overwrite, boolean isLocal) {
 
         boolean isUploaded = false;
@@ -491,10 +522,12 @@ public class RepoEngine {
 
                 Path tmpFilePath = Paths.get(incomingFileName);
 
+                logger.info("incoming file: " + tmpFilePath);
+
                 String fileSavePath = getRepoDir().getAbsolutePath() + "/" + tmpFilePath.getFileName();
                 File checkFile = new File(fileSavePath);
 
-                if ((!checkFile.exists()) || (overwrite)) {
+                if ((checkFile.exists() && overwrite) || (!checkFile.exists())) {
 
                     File fileSaved = new File(fileSavePath);
 
@@ -511,26 +544,19 @@ public class RepoEngine {
                     }
 
                     if (fileSaved.isFile()) {
-                        String md5 = plugin.getMD5(fileSavePath);
 
-                        //given there is no last modified provided by the transfer, we will create a last modified locally time
-                        FileObject fileObject = new FileObject(fileSaved.getName(), md5, fileSavePath, System.currentTimeMillis(), fileSaved.length());
+                        String filePath = fileSaved.getAbsolutePath();
+                        String MD5hash = plugin.getMD5(fileSavePath);
+                        long lastModified = fileSaved.lastModified();
+                        long filesize = fileSaved.length();
 
-                        synchronized (lockFileMap) {
-                            if (!fileMap.containsKey(repoName)) {
-                                Map<String, FileObject> repoFileMap = new HashMap<>();
-                                repoFileMap.put(fileSaved.getName(), fileObject);
-                                fileMap.put(repoName, repoFileMap);
-                            } else {
-                                fileMap.get(repoName).put(fileSaved.getName(), fileObject);
-                            }
-                        }
+                        dbEngine.addFile(filePath, MD5hash, lastModified, filesize);
 
                     } else {
                         isFault = true;
                     }
                 } else {
-                    logger.info("file exist : " + checkFile.exists() + " overwrite=" + overwrite);
+                    logger.info("file " + checkFile.getAbsolutePath() + " exist : " + checkFile.exists() + " overwrite=" + overwrite);
                 }
             }
 
@@ -545,6 +571,7 @@ public class RepoEngine {
 
         return isUploaded;
     }
+
 
     //sub functions
     private void updateSubscribe(Map<String, String> incomingMap) {
@@ -824,8 +851,10 @@ public class RepoEngine {
         File repoDir = null;
         try {
 
-            String rootRepo = getRootRepoDir().getAbsolutePath();
-
+            String rootRepo = plugin.getConfig().getStringParam("scan_dir");
+            if(rootRepo == null) {
+                rootRepo = getRootRepoDir().getAbsolutePath();
+            }
             File tmpRepo = new File(rootRepo);
             if(tmpRepo.isDirectory()) {
                 repoDir = tmpRepo;

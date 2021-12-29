@@ -1,12 +1,15 @@
 package io.cresco.filerepo;
 
+import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
+import javax.jms.TextMessage;
 import java.io.File;
+import java.lang.reflect.Type;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -18,14 +21,14 @@ public class ExecutorImpl implements Executor {
     private CLogger logger;
     private Gson gson;
     private RepoEngine repoEngine;
+    private Type listType;
 
     public ExecutorImpl(PluginBuilder pluginBuilder, RepoEngine repoEngine) {
         this.plugin = pluginBuilder;
         logger = plugin.getLogger(ExecutorImpl.class.getName(), CLogger.Level.Info);
         gson = new Gson();
-
         this.repoEngine = repoEngine;
-
+        listType = new TypeToken<ArrayList<String>>(){}.getType();
     }
 
     @Override
@@ -53,12 +56,18 @@ public class ExecutorImpl implements Executor {
 
                 case "repolist":
                     return repoList(incoming);
+                case "getrepofilelist":
+                    return getRepoFileList(incoming);
                 case "getjar":
                     return getPluginJar(incoming);
                 case "putjar":
                     return putPluginJar(incoming);
                 case "putfiles":
-                    return putFile(incoming);
+                    return putFiles(incoming);
+                case "removefile":
+                    return removeFile(incoming);
+                case "putfilesremote":
+                    return putFileRemote(incoming);
                 case "repolistin":
                     return repoListIn(incoming);
                 case "repoconfirm":
@@ -75,6 +84,29 @@ public class ExecutorImpl implements Executor {
     public MsgEvent executeWATCHDOG(MsgEvent incoming) { return null;}
     @Override
     public MsgEvent executeKPI(MsgEvent incoming) { return null; }
+
+    private MsgEvent getRepoFileList(MsgEvent msg) {
+
+        try {
+            if(msg.paramsContains("repo_name")) {
+               String repo_name = msg.getParam("repo_name");
+               msg.setCompressedParam("repofilelist", repoEngine.getFileRepoString(repo_name));
+               msg.setParam("status","10");
+               msg.setParam("status_desc","found list");
+            } else {
+                msg.setParam("status","9");
+                msg.setParam("status_desc","list not found");
+            }
+
+        }catch (Exception ex) {
+            logger.error(ex.getMessage());
+            msg.setParam("status","8");
+            msg.setParam("status_desc",ex.getMessage());
+        }
+
+        return msg;
+
+    }
 
     private MsgEvent repoList(MsgEvent msg) {
 
@@ -139,7 +171,6 @@ public class ExecutorImpl implements Executor {
     private MsgEvent putPluginJar(MsgEvent incoming) {
 
         try {
-
 
             String pluginName = incoming.getParam("pluginname");
             String pluginMD5 = incoming.getParam("md5");
@@ -212,10 +243,89 @@ public class ExecutorImpl implements Executor {
         repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
     }
 
-    private MsgEvent putFile(MsgEvent incoming) {
+    private MsgEvent putFileRemote(MsgEvent incoming) {
 
         try {
 
+            if(incoming.paramsContains("file_list") && incoming.paramsContains("dst_region")
+                    && incoming.paramsContains("dst_agent") && incoming.paramsContains("dst_plugin")
+                    && incoming.paramsContains("repo_name") )  {
+
+                logger.error("1");
+                String fileListString = incoming.getCompressedParam("file_list");
+                List<String> fileList = gson.fromJson(fileListString, listType);
+                String dst_region = incoming.getParam("dst_region");
+                String dst_agent = incoming.getParam("dst_agent");
+                String dst_plugin = incoming.getParam("dst_plugin");
+                String repo_name = incoming.getParam("repo_name");
+                logger.error("2");
+                MsgEvent filesTransfer = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,dst_region, dst_agent, dst_plugin);
+                filesTransfer.setParam("action", "putfiles");
+                filesTransfer.setParam("repo_name",repo_name);
+                filesTransfer.addFiles(fileList);
+                logger.error(filesTransfer.getParams().toString());
+                logger.error("3");
+                plugin.msgOut(filesTransfer);
+                //plugin.sendRPC(filesTransfer);
+
+                logger.error("4");
+
+                incoming.setParam("status","10");
+                incoming.setParam("status_desc","request sent");
+
+            } else {
+                logger.error("filelist not found");
+            }
+
+        } catch(Exception ex){
+            logger.error("putFileRemote: " + ex.getMessage());
+            ex.printStackTrace();
+        }
+
+        if(incoming.getParams().containsKey("filedata")) {
+            incoming.removeParam("filedata");
+        }
+
+        return incoming;
+    }
+
+    private MsgEvent removeFile(MsgEvent incoming) {
+
+        try {
+
+            if(incoming.paramsContains("repo_name") && incoming.paramsContains("file_name")){
+
+                String repoName = incoming.getParam("repo_name");
+                String fileName = incoming.getParam("file_name");
+
+                boolean isRemoved = repoEngine.removeFile(repoName, fileName);
+                if(isRemoved) {
+                    incoming.setParam("status","10");
+                    incoming.setParam("status_desc","file removed");
+                } else {
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","file not removed");
+                }
+
+
+            } else {
+                logger.error("No repo name found");
+                incoming.setParam("status","9");
+                incoming.setParam("status_desc","No repo or file name name found");
+            }
+
+        } catch(Exception ex){
+            logger.error("removeFile: " + ex.getMessage());
+            incoming.setParam("status","8");
+            incoming.setParam("status_desc","remove error: " + ex.getMessage());
+        }
+
+        return incoming;
+    }
+
+    private MsgEvent putFiles(MsgEvent incoming) {
+
+        try {
             //String fileName = incoming.getParam("filename");
             //String fileMD5 = incoming.getParam("md5");
             //byte[] fileData = incoming.getDataParam("filedata");
@@ -252,6 +362,8 @@ public class ExecutorImpl implements Executor {
                     logger.error("PUTFILES FAILED!!");
                 }
 
+            } else {
+                logger.error("No repo name found");
             }
 
         } catch(Exception ex){
@@ -301,6 +413,5 @@ public class ExecutorImpl implements Executor {
         }
         return incoming;
     }
-
 
 }
