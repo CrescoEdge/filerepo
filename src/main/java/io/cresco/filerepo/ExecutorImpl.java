@@ -251,24 +251,21 @@ public class ExecutorImpl implements Executor {
                     && incoming.paramsContains("dst_agent") && incoming.paramsContains("dst_plugin")
                     && incoming.paramsContains("repo_name") )  {
 
-                logger.error("1");
                 String fileListString = incoming.getCompressedParam("file_list");
                 List<String> fileList = gson.fromJson(fileListString, listType);
                 String dst_region = incoming.getParam("dst_region");
                 String dst_agent = incoming.getParam("dst_agent");
                 String dst_plugin = incoming.getParam("dst_plugin");
                 String repo_name = incoming.getParam("repo_name");
-                logger.error("2");
+
                 MsgEvent filesTransfer = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,dst_region, dst_agent, dst_plugin);
                 filesTransfer.setParam("action", "putfiles");
                 filesTransfer.setParam("repo_name",repo_name);
                 filesTransfer.addFiles(fileList);
-                logger.error(filesTransfer.getParams().toString());
-                logger.error("3");
+                logger.info("File Transfer Params: " + filesTransfer.getParams().toString());
                 plugin.msgOut(filesTransfer);
                 //plugin.sendRPC(filesTransfer);
 
-                logger.error("4");
 
                 incoming.setParam("status","10");
                 incoming.setParam("status_desc","request sent");
