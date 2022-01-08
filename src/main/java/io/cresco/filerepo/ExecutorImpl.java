@@ -58,6 +58,8 @@ public class ExecutorImpl implements Executor {
                     return repoList(incoming);
                 case "getrepofilelist":
                     return getRepoFileList(incoming);
+                case "clearrepo":
+                    return clearRepo(incoming);
                 case "getjar":
                     return getPluginJar(incoming);
                 case "putjar":
@@ -281,6 +283,38 @@ public class ExecutorImpl implements Executor {
 
         if(incoming.getParams().containsKey("filedata")) {
             incoming.removeParam("filedata");
+        }
+
+        return incoming;
+    }
+
+    private MsgEvent clearRepo(MsgEvent incoming) {
+
+        try {
+
+            if(incoming.paramsContains("repo_name")){
+
+                String repoName = incoming.getParam("repo_name");
+
+                boolean isCleared = repoEngine.clearRepo();
+                if(isCleared) {
+                    incoming.setParam("status","10");
+                    incoming.setParam("status_desc","repo cleared");
+                } else {
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","repo cleared");
+                }
+
+            } else {
+                logger.error("No repo name found");
+                incoming.setParam("status","9");
+                incoming.setParam("status_desc","No repo or file name name found");
+            }
+
+        } catch(Exception ex){
+            logger.error("clearrepo: " + ex.getMessage());
+            incoming.setParam("status","8");
+            incoming.setParam("status_desc","clear repo error: " + ex.getMessage());
         }
 
         return incoming;

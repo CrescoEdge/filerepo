@@ -493,6 +493,41 @@ public class RepoEngine {
         return repoString;
     }
 
+    public Boolean clearRepo() {
+        boolean isRemoved = false;
+        try {
+
+            while (inScan.get()) {
+                Thread.sleep(1000);
+                logger.info("Waiting for file scan to stop");
+            }
+            //Stop scanning so we can clear out files
+            inScan.set(true);
+
+            //List all files recorded in repo and remove them
+            List<Map<String,String>> repoFileList = dbEngine.getRepoList();
+            for(Map<String,String> filerecord : repoFileList) {
+                File removeFile = Paths.get(filerecord.get("filepath")).toFile();
+                dbEngine.deleteFile(removeFile.getAbsolutePath());
+                removeFile.delete();
+            }
+            //delete any files or directories not recorded in repo dir
+            Files.walk(Paths.get(getRepoDir().getAbsolutePath()))
+                    .filter(Files::isRegularFile)
+                    .map(Path::toFile)
+                    .forEach(File::delete);
+
+            //release scan
+            inScan.set(false);
+            isRemoved = true;
+
+        } catch (Exception ex) {
+            logger.error("removeFile: " + ex.getMessage());
+            isRemoved = false;
+        }
+        return isRemoved;
+    }
+
     public Boolean removeFile(String fileRepoName, String fileName) {
         boolean isRemoved = false;
         try {
