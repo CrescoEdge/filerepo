@@ -56,10 +56,10 @@ public class DBEngine {
             ds = setupDataSource(dbConnectionString);
 
                     if (dbsource.exists()) {
-                        //logger.info("DB SOURCE EXIST: " + dbsource.getAbsolutePath() );
+                        logger.debug("DB SOURCE EXIST: " + dbsource.getAbsolutePath() );
                     } else {
                         //dbsource.mkdir();
-                        //logger.info("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
+                        logger.info("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
                         initDB();
                     }
 

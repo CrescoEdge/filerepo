@@ -45,6 +45,7 @@ public class RepoEngine {
     private Type mapType;
 
     private Timer fileScanTimer;
+    private Timer repoBroadcastTimer;
 
     private String scanDirString;
 
@@ -123,11 +124,8 @@ public class RepoEngine {
 
                             if (!inScan.get()) {
 
-                                logger.info("\t\t ***STARTING SCAN " + inScan.get() + " tid:" + transferId);
+                                logger.info("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
                                 inScan.set(true);
-
-                                //let everyone know scan is starting
-                                repoBroadcast(fileRepoName,"discover");
 
                                 //build file list
                                 Map<String, FileObject> diffList = getFileRepoDiff();
@@ -155,9 +153,33 @@ public class RepoEngine {
             }
         };
 
+        //create timer task
+        TimerTask repoBroadcastTask = new TimerTask() {
+            public void run() {
+                try {
+
+                    if(plugin.isActive()) {
+
+                        //let everyone know repo exists
+                        repoBroadcast(fileRepoName,"discover");
+
+                    } else {
+                        logger.error("NOT ACTIVE");
+                    }
+
+                } catch (Exception ex) {
+                    ex.printStackTrace();
+                }
+            }
+        };
+
         fileScanTimer = new Timer("Timer");
         fileScanTimer.scheduleAtFixedRate(fileScanTask, delay, period);
         logger.info("filescantimer : set : " + period);
+
+        repoBroadcastTimer = new Timer("BroadCastTimer");
+        repoBroadcastTimer.scheduleAtFixedRate(repoBroadcastTask, delay, period);
+        logger.info("broadcasttimer : set : " + period);
     }
 
     public void shutdown() {
@@ -208,7 +230,7 @@ public class RepoEngine {
             File[] listOfFiles = null;
             boolean scanRecursive = plugin.getConfig().getBooleanParam("scan_recursive",false);
             if(scanRecursive) {
-                logger.error("SCAN RECURSIVE");
+                logger.debug("SCAN RECURSIVE");
                 List<File> tp = new ArrayList<>();
                 List<File> fn = getFileNames(tp,Paths.get(scanDirString));
                 for(File f : fn) {
@@ -219,7 +241,7 @@ public class RepoEngine {
                 listOfFiles = fn.toArray(listOfFiles);
 
             } else {
-                logger.error("NOT SCAN RECURSIVE");
+                logger.debug("NOT SCAN RECURSIVE");
                 //get all files in the scan directory
                 File folder = new File(scanDirString);
                 listOfFiles = folder.listFiles();
@@ -238,30 +260,35 @@ public class RepoEngine {
 
                         //see if file is in the database
                         long lastModifiedDb = dbEngine.getLastModified(filePath);
-                        logger.trace("file: " + filePath + " lastmodified: " + lastModified + " dblastmodified: " + lastModifiedDb);
+                        logger.trace("found file: " + filePath + " lastmodified: " + lastModified + " dblastmodified: " + lastModifiedDb);
                         if (lastModifiedDb == -1) {
                             add = true;
+                            logger.trace("add file: " + filePath);
                         } else if (lastModifiedDb < lastModified) {
                             update = true;
+                            logger.trace("add file: " + filePath);
                         } else if (lastModifiedDb > lastModified) {
                             logger.error("How can an older file be recored in DB? lastModifiedDb > lastModified ");
                             update = true;
+                            logger.trace("update file: " + filePath);
                         }
 
                         String MD5hash = null;
                         if (add || update) {
                             MD5hash = plugin.getMD5(filePath);
-                            logger.trace("fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
+                            logger.trace("generate MD5 for fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
                             FileObject fileObject = new FileObject(fileName, MD5hash, filePath, lastModified, filesize);
                             fileDiffMap.put(filePath, fileObject);
                         }
 
                         if (add) {
                             dbEngine.addFile(filePath, MD5hash, lastModified, filesize);
+                            logger.trace("DB insert fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
                         }
 
                         if (update) {
                             dbEngine.updateFile(filePath, MD5hash, 0, lastModified, filesize);
+                            logger.trace("DB update fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
                         }
                     }
                 }
@@ -486,6 +513,7 @@ public class RepoEngine {
 
             List<Map<String,String>> repoFileList = dbEngine.getRepoList();
             repoString = gson.toJson(repoFileList);
+            logger.debug("repoList: " + repoString);
 
         } catch (Exception ex) {
             logger.error("getFileRepoString: " + ex.getMessage());
