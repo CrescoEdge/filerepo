@@ -161,7 +161,7 @@ public class RepoEngine {
                     if(plugin.isActive()) {
 
                         //let everyone know repo exists
-                        repoBroadcast(fileRepoName,"discover");
+                        repoBroadcast(fileRepoName,"discover", transferId);
 
                     } else {
                         logger.error("NOT ACTIVE");
@@ -735,7 +735,7 @@ public class RepoEngine {
 
 
     //repo functions
-    public void repoBroadcast(String filerepoName, String action) {
+    public void repoBroadcast(String filerepoName, String action, int transferId) {
 
         try {
 
@@ -745,6 +745,7 @@ public class RepoEngine {
             update.put("repo_region_id", plugin.getRegion());
             update.put("repo_agent_id",plugin.getAgent());
             update.put("repo_plugin_id",plugin.getPluginID());
+            update.put("transfer_id", String.valueOf(transferId));
 
             TextMessage updateMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
             updateMessage.setText(gson.toJson(update));
