@@ -130,9 +130,7 @@ public class RepoEngine {
                                 //build file list
                                 Map<String, FileObject> diffList = getFileRepoDiff();
                                 if (diffList.size() > 0) {
-                                    //start sync
-                                    transferId++;
-                                    //find other repos
+
                                     logger.debug("SYNC Files");
                                     syncRegionFiles(diffList);
                                 }
@@ -237,6 +235,7 @@ public class RepoEngine {
                     logger.error("File: " + f.getAbsolutePath());
                 }
 
+
                 listOfFiles = new File[fn.size()];
                 listOfFiles = fn.toArray(listOfFiles);
 
@@ -290,6 +289,13 @@ public class RepoEngine {
                             dbEngine.updateFile(filePath, MD5hash, 0, lastModified, filesize);
                             logger.trace("DB update fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
                         }
+
+                        if (add || update) {
+                            //start sync
+                            transferId++;
+                            //find other repos
+                        }
+
                     }
                 }
             }
