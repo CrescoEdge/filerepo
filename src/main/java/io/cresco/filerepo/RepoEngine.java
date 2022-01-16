@@ -753,7 +753,7 @@ public class RepoEngine {
             updateMessage.setBooleanProperty("broadcast",Boolean.TRUE);
 
             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage);
-            logger.debug("SENDING MESSAGE: " + update.toString());
+            logger.debug("SENDING MESSAGE: " + update);
 
         } catch (Exception ex) {
             logger.error("failed to update subscribers");
