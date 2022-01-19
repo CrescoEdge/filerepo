@@ -140,7 +140,9 @@ public class DBEngine {
             try(Connection conn = ds.getConnection()) {
                 try (Statement stmt = conn.createStatement()) {
                     stmt.executeUpdate(createFileList);
+                    stmt.close();
                 }
+                conn.close();
             }
         } catch(Exception ex) {
             ex.printStackTrace();
@@ -162,7 +164,9 @@ public class DBEngine {
 
                     stmt.executeUpdate(insertFilePathString);
                     conn.commit();
+                    stmt.close();
                 }
+                conn.close();
 
             }
 
@@ -196,8 +200,13 @@ public class DBEngine {
                             repoFileList.add(fileMap);
                         }
 
+                        rs.close();
                     }
+
+                    stmt.close();
                 }
+
+                conn.close();
             }
 
         } catch(Exception ex) {
@@ -228,8 +237,11 @@ public class DBEngine {
                             lastModified = rs.getLong(1);
                         }
 
+                        rs.close();
                     }
+                    stmt.close();
                 }
+                conn.close();
             }
 
         } catch(Exception ex) {
@@ -260,8 +272,13 @@ public class DBEngine {
                             filesize = rs.getLong(1);
                         }
 
+                        rs.close();
                     }
+
+                    stmt.close();
                 }
+
+                conn.close();
             }
 
         } catch(Exception ex) {
@@ -292,8 +309,13 @@ public class DBEngine {
                             md5 = rs.getString(1);
                         }
 
+                        rs.close();
                     }
+
+                    stmt.close();
                 }
+                
+                conn.close();
             }
 
         } catch(Exception ex) {
@@ -320,7 +342,9 @@ public class DBEngine {
 
                     queryReturn = stmt.executeUpdate(queryString);
 
+                    stmt.close();
                 }
+                conn.close();
             }
 
 
@@ -340,7 +364,9 @@ public class DBEngine {
             try (Connection conn = ds.getConnection()) {
                 try (Statement stmt = conn.createStatement()) {
                     queryReturn = stmt.executeUpdate(queryString);
+                    stmt.close();
                 }
+                conn.close();
             }
 
         } catch(Exception ex) {
