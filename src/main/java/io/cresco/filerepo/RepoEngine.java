@@ -158,6 +158,7 @@ public class RepoEngine {
 
                     if(plugin.isActive()) {
 
+                        logger.info("\t\t ***BROADCASTING repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
                         //let everyone know repo exists
                         repoBroadcast(fileRepoName,"discover", transferId);
 
@@ -614,12 +615,14 @@ public class RepoEngine {
 
                     if (fileSaved.isFile()) {
 
-                        String filePath = fileSaved.getAbsolutePath();
-                        String MD5hash = plugin.getMD5(fileSavePath);
-                        long lastModified = fileSaved.lastModified();
-                        long filesize = fileSaved.length();
+                        if(!plugin.getConfig().getBooleanParam("enable_scan",Boolean.TRUE)) {
+                            String filePath = fileSaved.getAbsolutePath();
+                            String MD5hash = plugin.getMD5(fileSavePath);
+                            long lastModified = fileSaved.lastModified();
+                            long filesize = fileSaved.length();
 
-                        dbEngine.addFile(filePath, MD5hash, lastModified, filesize);
+                            dbEngine.addFile(filePath, MD5hash, lastModified, filesize);
+                        }
 
                     } else {
                         isFault = true;
