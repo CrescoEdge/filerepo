@@ -32,25 +32,14 @@ public class ExecutorImpl implements Executor {
     }
 
     @Override
-    public MsgEvent executeCONFIG(MsgEvent incoming) {
-        logger.error("executeCONFIG called and returns null");
-        return null;
-    }
+    public MsgEvent executeCONFIG(MsgEvent incoming) { return null; }
+    
     @Override
-    public MsgEvent executeDISCOVER(MsgEvent incoming) {
-        logger.error("executeDISCOVER called and returns null");
-        return null;
-    }
+    public MsgEvent executeDISCOVER(MsgEvent incoming) { return null; }
     @Override
-    public MsgEvent executeERROR(MsgEvent incoming) {
-        logger.error("executeERROR called and returns null");
-        return null;
-    }
+    public MsgEvent executeERROR(MsgEvent incoming) { return null; }
     @Override
-    public MsgEvent executeINFO(MsgEvent incoming) { 
-        logger.error("executeINFO called and returns null");
-        return null; 
-    }
+    public MsgEvent executeINFO(MsgEvent incoming) { return null; }
     @Override
     public MsgEvent executeEXEC(MsgEvent incoming) {
 
@@ -83,20 +72,15 @@ public class ExecutorImpl implements Executor {
 
             }
         }
-        logger.error("executeEXEC called and returns null");
         return null;
 
     }
+
     @Override
-    public MsgEvent executeWATCHDOG(MsgEvent incoming) { 
-        logger.error("executeWATCHDOG called and returns null");
-        return null;
-    }
+    public MsgEvent executeWATCHDOG(MsgEvent incoming) { return null; }
+    
     @Override
-    public MsgEvent executeKPI(MsgEvent incoming) { 
-        logger.error("executeKPI called and returns null");
-        return null;
-    }
+    public MsgEvent executeKPI(MsgEvent incoming) { return null; }
 
     private MsgEvent getRepoFileList(MsgEvent msg) {
         long startTime = System.currentTimeMillis();
