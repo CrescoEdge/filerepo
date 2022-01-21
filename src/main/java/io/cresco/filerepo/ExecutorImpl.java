@@ -33,21 +33,26 @@ public class ExecutorImpl implements Executor {
 
     @Override
     public MsgEvent executeCONFIG(MsgEvent incoming) {
+        logger.error("executeCONFIG called and returns null");
         return null;
     }
     @Override
     public MsgEvent executeDISCOVER(MsgEvent incoming) {
+        logger.error("executeDISCOVER called and returns null");
         return null;
     }
     @Override
     public MsgEvent executeERROR(MsgEvent incoming) {
+        logger.error("executeERROR called and returns null");
         return null;
     }
     @Override
-    public MsgEvent executeINFO(MsgEvent incoming) { return null; }
+    public MsgEvent executeINFO(MsgEvent incoming) { 
+        logger.error("executeINFO called and returns null");
+        return null; 
+    }
     @Override
     public MsgEvent executeEXEC(MsgEvent incoming) {
-
 
         logger.debug("Processing Exec message : " + incoming.getParams());
 
@@ -78,14 +83,20 @@ public class ExecutorImpl implements Executor {
 
             }
         }
+        logger.error("executeEXEC called and returns null");
         return null;
-
 
     }
     @Override
-    public MsgEvent executeWATCHDOG(MsgEvent incoming) { return null;}
+    public MsgEvent executeWATCHDOG(MsgEvent incoming) { 
+        logger.error("executeWATCHDOG called and returns null");
+        return null;
+    }
     @Override
-    public MsgEvent executeKPI(MsgEvent incoming) { return null; }
+    public MsgEvent executeKPI(MsgEvent incoming) { 
+        logger.error("executeKPI called and returns null");
+        return null;
+    }
 
     private MsgEvent getRepoFileList(MsgEvent msg) {
         long startTime = System.currentTimeMillis();
@@ -132,7 +143,6 @@ public class ExecutorImpl implements Executor {
             logger.error(ex.getMessage());
         }
 
-
         return msg;
 
     }
@@ -155,7 +165,6 @@ public class ExecutorImpl implements Executor {
     private File getRepoDir() {
         File repoDir = null;
         try {
-
             String repoDirString =  plugin.getConfig().getStringParam("repo_dir", "filerepo");
 
             File tmpRepo = new File(repoDirString);
