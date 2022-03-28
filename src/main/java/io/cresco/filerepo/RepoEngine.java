@@ -90,9 +90,8 @@ public class RepoEngine {
     }
 
     public void start() {
-        long delay  = 5000L;
-        //long period = 15000L;
 
+        long delay =  plugin.getConfig().getLongParam("scan_delay", 5000L);
         long period =  plugin.getConfig().getLongParam("scan_period", 15000L);
 
         if((scanDirString != null) && (fileRepoName != null)) {
@@ -122,6 +121,9 @@ public class RepoEngine {
 
                     if(plugin.isActive()) {
 
+                        //check file location
+                        if(Paths.get(scanDirString).toFile().exists()) {
+
                             if (!inScan.get()) {
 
                                 logger.info("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
@@ -140,6 +142,9 @@ public class RepoEngine {
                             } else {
                                 logger.error("\t\t ***ALREADY IN SCAN");
                             }
+                        } else {
+                            logger.error("\t\t ***FILE LOCATION " + scanDirString + " NO LONGER EXISTS");
+                        }
 
                     } else {
                         logger.error("NO ACTIVE");

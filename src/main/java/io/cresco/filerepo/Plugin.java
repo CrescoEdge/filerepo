@@ -79,9 +79,9 @@ public class Plugin implements PluginService {
                 this.logger = pluginBuilder.getLogger(Plugin.class.getName(), CLogger.Level.Info);
 
                 //Plugin is either receving or sending
-                String outgoingPathString =  pluginBuilder.getConfig().getStringParam("outgoing_storage_path");
-                String incomingPathString =  pluginBuilder.getConfig().getStringParam("incoming_storage_path");
-                String fileRepoName =  pluginBuilder.getConfig().getStringParam("filerepo_name");
+                //String outgoingPathString =  pluginBuilder.getConfig().getStringParam("outgoing_storage_path");
+                //String incomingPathString =  pluginBuilder.getConfig().getStringParam("incoming_storage_path");
+                //String fileRepoName =  pluginBuilder.getConfig().getStringParam("filerepo_name");
 
                 dbEngine = new DBEngine(pluginBuilder);
                 //Starting the RepoEngine Threads
