@@ -56,6 +56,8 @@ public class ExecutorImpl implements Executor {
                     return clearRepo(incoming);
                 case "getjar":
                     return getPluginJar(incoming);
+                case "getfile":
+                    return getFile(incoming);
                 case "putjar":
                     return putPluginJar(incoming);
                 case "putfiles":
@@ -231,6 +233,37 @@ public class ExecutorImpl implements Executor {
                 }
             }
         } catch(Exception ex) {
+            ex.printStackTrace();
+        }
+        return incoming;
+    }
+
+    private MsgEvent getFile(MsgEvent incoming) {
+
+        try {
+
+            if(incoming.getParam("filename") != null){
+                String filename = incoming.getParam("filename");
+                Path filePath = Paths.get(getRepoDir().getAbsolutePath(), filename);
+                Map<String,String> fileInfo = repoEngine.getFileInfo(filePath.toFile().getAbsolutePath());
+
+                if(fileInfo != null) {
+                    incoming.setCompressedParam("file_metadata",gson.toJson(fileInfo));
+                    incoming.setDataParam("filedata", Files.readAllBytes(filePath));
+                    incoming.setParam("status","10");
+                    incoming.setParam("status_desc","found list");
+                } else {
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","fileInfo == null");
+                }
+            } else {
+                incoming.setParam("status","8");
+                incoming.setParam("status_desc","no filename parameter");
+            }
+
+        } catch(Exception ex) {
+            incoming.setParam("status","7");
+            incoming.setParam("status_desc","getFile error " + ex.getMessage());
             ex.printStackTrace();
         }
         return incoming;

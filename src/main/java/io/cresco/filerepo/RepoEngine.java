@@ -17,6 +17,9 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -517,6 +520,10 @@ public class RepoEngine {
 
         }
 
+    }
+
+    public Map<String,String> getFileInfo(String filePath) {
+        return dbEngine.getFileInfo(filePath);
     }
 
     public String getFileRepoString(String repoName) {

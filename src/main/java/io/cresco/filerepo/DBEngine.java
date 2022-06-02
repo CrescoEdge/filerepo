@@ -220,6 +220,46 @@ public class DBEngine {
         return repoFileList;
     }
 
+    public Map<String,String> getFileInfo(String filePath) {
+        Map<String,String> fileInfo = null;
+        try {
+
+            String queryString = "SELECT filepath, md5, lastmodified, filesize FROM filelist WHERE filepath = '" + filePath + "'";
+
+            try (Connection conn = ds.getConnection()) {
+                try (Statement stmt = conn.createStatement()) {
+
+                    try(ResultSet rs = stmt.executeQuery(queryString)) {
+
+                        if(rs.next()) {
+                            fileInfo = new HashMap<>();
+                            fileInfo.put("filepath", rs.getString("filepath"));
+                            fileInfo.put("md5", rs.getString("md5"));
+                            fileInfo.put("lastmodified", rs.getString("lastmodified"));
+                            fileInfo.put("filesize", rs.getString("filesize"));
+                        }
+
+                        rs.close();
+                    }
+
+                    stmt.close();
+                }
+
+                conn.close();
+            }
+
+        } catch(Exception ex) {
+            ex.printStackTrace();
+            System.out.println(ex.getMessage());
+            StringWriter errors = new StringWriter();
+            ex.printStackTrace(new PrintWriter(errors));
+            System.out.println(errors.toString());
+        }
+
+        return fileInfo;
+    }
+
+
     public long getLastModified(String filepath) {
         long lastModified = -1;
         try {
