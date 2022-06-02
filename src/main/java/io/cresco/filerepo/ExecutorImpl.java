@@ -244,7 +244,12 @@ public class ExecutorImpl implements Executor {
 
             if(incoming.getParam("file_name") != null){
                 String filename = incoming.getParam("file_name");
-                Path filePath = Paths.get(getRepoDir().getAbsolutePath(), filename);
+                //logger.error("file_name: " + filename);
+
+                ///opt/cresco/filerepo/extract_dump_7e90b402-8076-11ec-bc89-0242ac11001a.json
+                Path filePath = Paths.get(repoEngine.getRepoDir().getAbsolutePath(), filename);
+                incoming.setParam("file_path",filePath.toFile().getAbsolutePath());
+                //logger.error("file_path: " + filePath.toFile().getAbsolutePath());
                 Map<String,String> fileInfo = repoEngine.getFileInfo(filePath.toFile().getAbsolutePath());
 
                 if(fileInfo != null) {

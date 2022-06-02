@@ -932,7 +932,7 @@ public class RepoEngine {
         return repoDir;
     }
 
-    private File getRepoDir() {
+    public File getRepoDir() {
         File repoDir = null;
         try {
 
