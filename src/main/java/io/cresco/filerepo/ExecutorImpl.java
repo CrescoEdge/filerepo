@@ -242,14 +242,14 @@ public class ExecutorImpl implements Executor {
 
         try {
 
-            if(incoming.getParam("filename") != null){
-                String filename = incoming.getParam("filename");
+            if(incoming.getParam("file_name") != null){
+                String filename = incoming.getParam("file_name");
                 Path filePath = Paths.get(getRepoDir().getAbsolutePath(), filename);
                 Map<String,String> fileInfo = repoEngine.getFileInfo(filePath.toFile().getAbsolutePath());
 
                 if(fileInfo != null) {
                     incoming.setCompressedParam("file_metadata",gson.toJson(fileInfo));
-                    incoming.setDataParam("filedata", Files.readAllBytes(filePath));
+                    incoming.setDataParam("file_data", Files.readAllBytes(filePath));
                     incoming.setParam("status","10");
                     incoming.setParam("status_desc","found list");
                 } else {
