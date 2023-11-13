@@ -53,13 +53,6 @@
 
     <dependencies>
 
-        <dependency>
-            <groupId>io.cresco</groupId>
-            <artifactId>library</artifactId>
-            <version>1.1-SNAPSHOT</version>
-            <scope>provided</scope>
-        </dependency>
-
         <!-- https://mvnrepository.com/artifact/org.osgi/org.osgi.core -->
 
         <dependency>
@@ -141,13 +134,13 @@
             <version>${derby.version}</version>
         </dependency>
 
-        <!--
         <dependency>
-            <groupId>org.hsqldb</groupId>
-            <artifactId>hsqldb</artifactId>
-            <version>2.5.0</version>
+            <groupId>io.cresco</groupId>
+            <artifactId>library</artifactId>
+            <version>1.1-SNAPSHOT</version>
+            <scope>provided</scope>
         </dependency>
-        -->
+
 
     </dependencies>
 
