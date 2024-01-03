@@ -95,7 +95,6 @@ public class Plugin implements PluginService {
                     logger.info("Plugin " + pluginBuilder.getPluginID() + " waiting on Agent Init");
                     Thread.sleep(1000);
                 }
-
                 
                 boolean enableScan = pluginBuilder.getConfig().getBooleanParam("enable_scan",Boolean.TRUE);
                 if(enableScan) {
