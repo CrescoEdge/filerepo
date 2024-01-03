@@ -484,6 +484,7 @@ public class RepoEngine {
                                                 }
                                             }
                                         }
+
                                         if(downloadFile) {
                                             Path tmpFile = plugin.getAgentService().getDataPlaneService().downloadRemoteFile(region, agent, fileObject.filePath, localPath.toFile().getAbsolutePath());
                                             logger.debug("Synced " + tmpFile.toFile().getAbsolutePath());
@@ -784,7 +785,6 @@ public class RepoEngine {
     }
 
     private void createRepoSubListener(String filerepoName) {
-
 
         javax.jms.MessageListener ml = new javax.jms.MessageListener() {
             public void onMessage(Message msg) {
