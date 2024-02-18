@@ -61,6 +61,7 @@ public class RepoEngine {
 
     private List<String> listenerList;
 
+    private List<String> streamListenerList;
     private String fileRepoName;
 
     public RepoEngine(PluginBuilder pluginBuilder, DBEngine dbEngine) {
@@ -82,6 +83,8 @@ public class RepoEngine {
 
         listenerList = new ArrayList<>();
 
+        streamListenerList = new ArrayList<>();
+
         fileMap = Collections.synchronizedMap(new HashMap<>());
         peerVersionMap = Collections.synchronizedMap(new HashMap<>());
         peerUpdateStateMap = Collections.synchronizedMap(new HashMap<>());
@@ -100,6 +103,7 @@ public class RepoEngine {
         if((scanDirString != null) && (fileRepoName != null)) {
             logger.info("Starting file scan : " + scanDirString + " filerepo: " + fileRepoName);
             startScan(delay, period);
+            createStreamListener(fileRepoName);
         } else if((scanDirString == null) && (fileRepoName != null)) {
             logger.info("Start listening for filerepo: " + fileRepoName);
             createSubListener(fileRepoName);
@@ -726,6 +730,55 @@ public class RepoEngine {
         listenerList.add(node_from_listner_id);
 
     }
+
+    private void createStreamListener(String filerepoName) {
+
+
+        javax.jms.MessageListener ml = new javax.jms.MessageListener() {
+            public void onMessage(Message msg) {
+                try {
+
+                    if (msg instanceof TextMessage) {
+                        logger.debug(" SUB REC MESSAGE:" + ((TextMessage) msg).getText());
+                        Map<String, String> incomingMap = gson.fromJson(((TextMessage) msg).getText(), mapType);
+                        if(incomingMap.containsKey("action")) {
+                            if(incomingMap.containsKey("filerepo_name")) {
+
+                                String actionType = incomingMap.get("action");
+                                switch (actionType) {
+                                    case "discover":
+                                        updateSubscribe(incomingMap);
+                                        break;
+
+                                    default:
+                                        logger.error("unknown actionType: " + actionType);
+                                        break;
+                                }
+
+
+                            } else {
+                                logger.error("action called without filerepo_name");
+                            }
+                        } else {
+                            logger.error("createSubListener no action in message");
+                            logger.error(incomingMap.toString());
+                        }
+
+                    }
+                } catch(Exception ex) {
+
+                    ex.printStackTrace();
+                }
+            }
+        };
+
+        String queryString = "filerepo_name='" + filerepoName + "' AND broadcast";
+        String node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
+
+        streamListenerList.add(node_from_listner_id);
+
+    }
+
 
     public void subMessage(String filerepoName, String regionId, String agentId, String pluginId, String action) {
 

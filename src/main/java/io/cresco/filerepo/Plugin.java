@@ -30,8 +30,6 @@ public class Plugin implements PluginService {
 
     private RepoEngine repoEngine;
 
-
-
     @Activate
     void activate(BundleContext context, Map<String,Object> map) {
 
@@ -84,6 +82,7 @@ public class Plugin implements PluginService {
                 //String fileRepoName =  pluginBuilder.getConfig().getStringParam("filerepo_name");
 
                 dbEngine = new DBEngine(pluginBuilder);
+
                 //Starting the RepoEngine Threads
                 repoEngine = new RepoEngine(pluginBuilder, dbEngine);
 
@@ -95,7 +94,7 @@ public class Plugin implements PluginService {
                     logger.info("Plugin " + pluginBuilder.getPluginID() + " waiting on Agent Init");
                     Thread.sleep(1000);
                 }
-                
+
                 boolean enableScan = pluginBuilder.getConfig().getBooleanParam("enable_scan",Boolean.TRUE);
                 if(enableScan) {
                     repoEngine.start();
@@ -116,6 +115,7 @@ public class Plugin implements PluginService {
     public boolean isStopped() {
 
         if(pluginBuilder != null) {
+
             if(repoEngine != null) {
                 repoEngine.shutdown();
                 repoEngine = null;
