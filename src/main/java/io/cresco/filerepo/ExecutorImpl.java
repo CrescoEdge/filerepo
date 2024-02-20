@@ -1,15 +1,23 @@
 package io.cresco.filerepo;
 
+import com.google.common.io.ByteStreams;
 import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
+import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
+import javax.jms.BytesMessage;
 import javax.jms.TextMessage;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.io.RandomAccessFile;
 import java.lang.reflect.Type;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -58,6 +66,8 @@ public class ExecutorImpl implements Executor {
                     return getPluginJar(incoming);
                 case "getfile":
                     return getFile(incoming);
+                case "streamfile":
+                    return streamFile(incoming);
                 case "putjar":
                     return putPluginJar(incoming);
                 case "putfiles":
@@ -273,6 +283,89 @@ public class ExecutorImpl implements Executor {
         }
         return incoming;
     }
+
+    private void streamFile(Map<String,String> transferInfo) {
+        logger.error("STARTING STREAM : DEVELOPMENTAL");
+        logger.error("TRANSFERINFO: " + transferInfo);
+        try {
+
+            new Thread() {
+                public void run() {
+                    try {
+
+                        int BUFFER_SIZE = 1024 * 1024;
+                        long startByte = Long.parseLong(transferInfo.get("start_byte"));
+                        long byteLength = Long.parseLong(transferInfo.get("byte_length"));
+
+                        RandomAccessFile raf = new RandomAccessFile(transferInfo.get("file_path"), "r");
+                        raf.seek(startByte);
+                        InputStream rafIs = Channels.newInputStream(raf.getChannel());
+                        InputStream is = ByteStreams.limit(rafIs, byteLength);
+
+                        byte[] buffer = new byte[BUFFER_SIZE];
+                        int read = 0;
+                        while( ( read = is.read( buffer ) ) > 0 ){
+                            BytesMessage updateMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
+                            updateMessage.writeBytes(buffer);
+                            updateMessage.setStringProperty(transferInfo.get("ident_key"), transferInfo.get("ident_id"));
+                            updateMessage.setStringProperty("transfer_id", transferInfo.get("transfer_id"));
+                            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage);
+                        }
+
+                        is.close();
+                        rafIs.close();
+                        raf.close();
+
+
+                    } catch(Exception ex) {
+                        logger.error("streamFile error: " + ex.getMessage());
+                    }
+                }
+            }.start();
+
+
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+
+    }
+    private MsgEvent streamFile(MsgEvent incoming) {
+
+        try {
+
+            if(incoming.getParam("file_path") != null){
+                String filePath = incoming.getParam("file_path");
+
+                Map<String,String> fileInfo = repoEngine.getFileInfo(filePath);
+                if(fileInfo != null) {
+                    fileInfo.put("transfer_id", incoming.getParam("transfer_id"));
+                    fileInfo.put("file_path", incoming.getParam("file_path"));
+                    fileInfo.put("start_byte", incoming.getParam("start_byte"));
+                    fileInfo.put("byte_length", incoming.getParam("byte_length"));
+                    fileInfo.put("ident_key", incoming.getParam("ident_key"));
+                    fileInfo.put("ident_id", incoming.getParam("ident_id"));
+                    //transfer in new thread, send recept
+                    streamFile(fileInfo);
+
+                    incoming.setParam("status","10");
+                    incoming.setParam("status_desc","stream active");
+                } else {
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","fileInfo == null");
+                }
+            } else {
+                incoming.setParam("status","8");
+                incoming.setParam("status_desc","no filename parameter");
+            }
+
+        } catch(Exception ex) {
+            incoming.setParam("status","7");
+            incoming.setParam("status_desc","getFile error " + ex.getMessage());
+            ex.printStackTrace();
+        }
+        return incoming;
+    }
+
 
     private void confirmTransfer(MsgEvent incoming) {
         repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
