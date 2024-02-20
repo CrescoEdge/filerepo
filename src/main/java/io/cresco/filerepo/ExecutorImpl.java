@@ -285,8 +285,8 @@ public class ExecutorImpl implements Executor {
     }
 
     private void streamFile(Map<String,String> transferInfo) {
-        logger.error("STARTING STREAM : DEVELOPMENTAL");
-        logger.error("TRANSFERINFO: " + transferInfo);
+        logger.warn("STARTING STREAM : EXPERIMENTAL");
+        logger.info("TRANSFERINFO: " + transferInfo);
         try {
 
             new Thread() {
