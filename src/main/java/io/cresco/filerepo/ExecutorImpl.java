@@ -10,6 +10,7 @@ import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
 import javax.jms.BytesMessage;
+import javax.jms.DeliveryMode;
 import javax.jms.TextMessage;
 import java.io.File;
 import java.io.FileInputStream;
@@ -22,6 +23,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ExecutorImpl implements Executor {
 
@@ -31,12 +33,17 @@ public class ExecutorImpl implements Executor {
     private RepoEngine repoEngine;
     private Type listType;
 
+    private final AtomicBoolean transferLock = new AtomicBoolean();
+
+    private Map<String,StreamObject> transferStreams;
+
     public ExecutorImpl(PluginBuilder pluginBuilder, RepoEngine repoEngine) {
         this.plugin = pluginBuilder;
         logger = plugin.getLogger(ExecutorImpl.class.getName(), CLogger.Level.Info);
         gson = new Gson();
         this.repoEngine = repoEngine;
         listType = new TypeToken<ArrayList<String>>(){}.getType();
+        transferStreams = Collections.synchronizedMap(new HashMap<>());
     }
 
     @Override
@@ -67,7 +74,11 @@ public class ExecutorImpl implements Executor {
                 case "getfile":
                     return getFile(incoming);
                 case "streamfile":
-                    return streamFile(incoming);
+                    streamFile(incoming);
+                    break;
+                case "streamfilecancel":
+                    streamFileCancel(incoming);
+                    break;
                 case "putjar":
                     return putPluginJar(incoming);
                 case "putfiles":
@@ -285,8 +296,9 @@ public class ExecutorImpl implements Executor {
     }
 
     private void streamFile(Map<String,String> transferInfo) {
-        logger.warn("STARTING STREAM : EXPERIMENTAL");
-        logger.info("TRANSFERINFO: " + transferInfo);
+        String transferId = transferInfo.get("transfer_id");
+        logger.info("transferid: " + transferId + " TRANSFERINFO: " + transferInfo);
+
         try {
 
             new Thread() {
@@ -296,20 +308,36 @@ public class ExecutorImpl implements Executor {
                         int BUFFER_SIZE = 1024 * 1024;
                         long startByte = Long.parseLong(transferInfo.get("start_byte"));
                         long byteLength = Long.parseLong(transferInfo.get("byte_length"));
+                        String filePath = transferInfo.get("file_path");
+                        StreamObject streamObject = new StreamObject(transferId, filePath, startByte, byteLength);
+                        synchronized (transferLock) {
+                            transferStreams.put(transferId, streamObject);
+                        }
 
-                        RandomAccessFile raf = new RandomAccessFile(transferInfo.get("file_path"), "r");
+                        RandomAccessFile raf = new RandomAccessFile(filePath, "r");
                         raf.seek(startByte);
                         InputStream rafIs = Channels.newInputStream(raf.getChannel());
                         InputStream is = ByteStreams.limit(rafIs, byteLength);
 
                         byte[] buffer = new byte[BUFFER_SIZE];
                         int read = 0;
-                        while( ( read = is.read( buffer ) ) > 0 ){
+                        boolean isActive = true;
+                        while( (( read = is.read( buffer ) ) > 0 ) && isActive ){
                             BytesMessage updateMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
                             updateMessage.writeBytes(buffer);
                             updateMessage.setStringProperty(transferInfo.get("ident_key"), transferInfo.get("ident_id"));
-                            updateMessage.setStringProperty("transfer_id", transferInfo.get("transfer_id"));
-                            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage);
+                            updateMessage.setStringProperty("transfer_id", transferId);
+                            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
+
+                            synchronized (transferLock) {
+                                if(transferStreams.containsKey(transferId)) {
+                                    transferStreams.get(transferId).setBytesTransfered(transferStreams.get(transferId).getBytesTransfered() + read);
+                                    isActive = transferStreams.get(transferId).isActive();
+                                    //logger.error("streamFile object:" + transferStreams.get(transferId).toString());
+                                } else {
+                                    logger.error("streamFile transferId: " + transferId + " not found in transferStreams");
+                                }
+                            }
                         }
 
                         is.close();
@@ -319,6 +347,15 @@ public class ExecutorImpl implements Executor {
 
                     } catch(Exception ex) {
                         logger.error("streamFile error: " + ex.getMessage());
+                        synchronized (transferLock) {
+                            if(transferStreams.containsKey(transferId)) {
+                                transferStreams.get(transferId).setActive(false);
+                            }
+                        }
+                    } finally {
+                        //synchronized (transferLock) {
+                        //    transferStreams.remove(transferId);
+                        //}
                     }
                 }
             }.start();
@@ -329,7 +366,7 @@ public class ExecutorImpl implements Executor {
         }
 
     }
-    private MsgEvent streamFile(MsgEvent incoming) {
+    private void streamFile(MsgEvent incoming) {
 
         try {
 
@@ -346,6 +383,7 @@ public class ExecutorImpl implements Executor {
                     fileInfo.put("ident_id", incoming.getParam("ident_id"));
                     //transfer in new thread, send recept
                     streamFile(fileInfo);
+                    logger.error("transferid: " + incoming.getParam("transfer_id") + " START");
 
                     incoming.setParam("status","10");
                     incoming.setParam("status_desc","stream active");
@@ -363,7 +401,37 @@ public class ExecutorImpl implements Executor {
             incoming.setParam("status_desc","getFile error " + ex.getMessage());
             ex.printStackTrace();
         }
-        return incoming;
+        //return incoming;
+    }
+
+    private void streamFileCancel(MsgEvent incoming) {
+        logger.error("streamFileCancel STREAM FILE CANCEL");
+        try {
+            logger.error("transferid: " + incoming.getParam("transfer_id") + " END");
+
+            if(incoming.paramsContains("transfer_id")) {
+                String transferId = incoming.getParam("transfer_id");
+                synchronized (transferLock) {
+                    if(transferStreams.containsKey(transferId)) {
+                        transferStreams.get(transferId).setActive(false);
+                        logger.info("streamFileCancel transferId: " + transferId + " set canceled transfered " + transferStreams.get(transferId).getBytesTransfered() + " bytes." );
+                    } else {
+                        logger.error("streamFileCancel transferId: " + transferId + " not found in transferStreams!");
+                    }
+                }
+            } else {
+                logger.error("streamFileCancel transferId not found in MsgEvent!");
+            }
+
+
+
+
+        } catch(Exception ex) {
+            incoming.setParam("status","7");
+            incoming.setParam("status_desc","getFile error " + ex.getMessage());
+            ex.printStackTrace();
+        }
+
     }
 
 
