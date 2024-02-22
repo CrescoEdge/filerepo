@@ -304,8 +304,8 @@ public class ExecutorImpl implements Executor {
                     try {
 
                         boolean alerted = false;
-                        int BUFFER_SIZE = 1024 * 1024;
-                        //int BUFFER_SIZE = 1024 * 16; //this is too low
+                        //int BUFFER_SIZE = 1024 * 1024;
+                        int BUFFER_SIZE = 1024 * 8; //this is too low
                         long startByte = Long.parseLong(transferInfo.get("start_byte"));
                         long byteLength = Long.parseLong(transferInfo.get("byte_length"));
                         String filePath = transferInfo.get("file_path");
