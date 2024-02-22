@@ -74,11 +74,9 @@ public class ExecutorImpl implements Executor {
                 case "getfile":
                     return getFile(incoming);
                 case "streamfile":
-                    streamFile(incoming);
-                    break;
+                    return streamFile(incoming);
                 case "streamfilecancel":
-                    streamFileCancel(incoming);
-                    break;
+                    return streamFileCancel(incoming);
                 case "putjar":
                     return putPluginJar(incoming);
                 case "putfiles":
@@ -305,7 +303,9 @@ public class ExecutorImpl implements Executor {
                 public void run() {
                     try {
 
+                        boolean alerted = false;
                         int BUFFER_SIZE = 1024 * 1024;
+                        //int BUFFER_SIZE = 1024 * 16; //this is too low
                         long startByte = Long.parseLong(transferInfo.get("start_byte"));
                         long byteLength = Long.parseLong(transferInfo.get("byte_length"));
                         String filePath = transferInfo.get("file_path");
@@ -320,7 +320,7 @@ public class ExecutorImpl implements Executor {
                         InputStream is = ByteStreams.limit(rafIs, byteLength);
 
                         byte[] buffer = new byte[BUFFER_SIZE];
-                        int read = 0;
+                        int read;
                         boolean isActive = true;
                         while( (( read = is.read( buffer ) ) > 0 ) && isActive ){
                             BytesMessage updateMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
@@ -333,7 +333,15 @@ public class ExecutorImpl implements Executor {
                                 if(transferStreams.containsKey(transferId)) {
                                     transferStreams.get(transferId).setBytesTransfered(transferStreams.get(transferId).getBytesTransfered() + read);
                                     isActive = transferStreams.get(transferId).isActive();
-                                    //logger.error("streamFile object:" + transferStreams.get(transferId).toString());
+                                    /*
+                                    if(!alerted) {
+                                        if (transferStreams.get(transferId).getBytesTransfered() > (1024 * 1024 * 32)) {
+                                            logger.error("streamFile transferId: " + transferId + " bytesTransfered: " + transferStreams.get(transferId).getBytesTransfered());
+                                            alerted = true;
+                                        }
+                                    }
+
+                                     */
                                 } else {
                                     logger.error("streamFile transferId: " + transferId + " not found in transferStreams");
                                 }
@@ -366,7 +374,7 @@ public class ExecutorImpl implements Executor {
         }
 
     }
-    private void streamFile(MsgEvent incoming) {
+    private MsgEvent streamFile(MsgEvent incoming) {
 
         try {
 
@@ -401,12 +409,13 @@ public class ExecutorImpl implements Executor {
             incoming.setParam("status_desc","getFile error " + ex.getMessage());
             ex.printStackTrace();
         }
-        //return incoming;
+        return incoming;
     }
 
-    private void streamFileCancel(MsgEvent incoming) {
+    private MsgEvent streamFileCancel(MsgEvent incoming) {
         logger.error("streamFileCancel STREAM FILE CANCEL");
         try {
+            incoming.setParam("status_code","9");
             logger.error("transferid: " + incoming.getParam("transfer_id") + " END");
 
             if(incoming.paramsContains("transfer_id")) {
@@ -414,6 +423,7 @@ public class ExecutorImpl implements Executor {
                 synchronized (transferLock) {
                     if(transferStreams.containsKey(transferId)) {
                         transferStreams.get(transferId).setActive(false);
+                        incoming.setParam("status_code","10");
                         logger.info("streamFileCancel transferId: " + transferId + " set canceled transfered " + transferStreams.get(transferId).getBytesTransfered() + " bytes." );
                     } else {
                         logger.error("streamFileCancel transferId: " + transferId + " not found in transferStreams!");
@@ -423,15 +433,12 @@ public class ExecutorImpl implements Executor {
                 logger.error("streamFileCancel transferId not found in MsgEvent!");
             }
 
-
-
-
         } catch(Exception ex) {
             incoming.setParam("status","7");
             incoming.setParam("status_desc","getFile error " + ex.getMessage());
             ex.printStackTrace();
         }
-
+        return incoming;
     }
 
 
