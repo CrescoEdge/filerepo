@@ -295,7 +295,8 @@ public class ExecutorImpl implements Executor {
 
     private void streamFile(Map<String,String> transferInfo) {
         String transferId = transferInfo.get("transfer_id");
-        logger.info("transferid: " + transferId + " TRANSFERINFO: " + transferInfo);
+        int BUFFER_SIZE = Integer.parseInt(transferInfo.get("buffer_size"));
+        logger.info("transferid: " + transferId + " BUFFER_SIZE: " + BUFFER_SIZE + " TRANSFERINFO: " + transferInfo);
 
         try {
 
@@ -305,7 +306,7 @@ public class ExecutorImpl implements Executor {
 
                         boolean alerted = false;
                         //int BUFFER_SIZE = 1024 * 1024;
-                        int BUFFER_SIZE = 1024 * 8; //this is too low
+                        //int BUFFER_SIZE = 1024 * 8; //this is too low
                         long startByte = Long.parseLong(transferInfo.get("start_byte"));
                         long byteLength = Long.parseLong(transferInfo.get("byte_length"));
                         String filePath = transferInfo.get("file_path");
@@ -389,9 +390,17 @@ public class ExecutorImpl implements Executor {
                     fileInfo.put("byte_length", incoming.getParam("byte_length"));
                     fileInfo.put("ident_key", incoming.getParam("ident_key"));
                     fileInfo.put("ident_id", incoming.getParam("ident_id"));
+
+                    String bufferSizeStr = incoming.getParam("buffer_size");
+                    if(bufferSizeStr == null) {
+                        bufferSizeStr = String.valueOf(1024 * 32);
+
+                    }
+                    fileInfo.put("buffer_size", bufferSizeStr);
+
                     //transfer in new thread, send recept
                     streamFile(fileInfo);
-                    logger.error("transferid: " + incoming.getParam("transfer_id") + " START");
+                    //logger.error("transferid: " + incoming.getParam("transfer_id") + " START");
 
                     incoming.setParam("status","10");
                     incoming.setParam("status_desc","stream active");
