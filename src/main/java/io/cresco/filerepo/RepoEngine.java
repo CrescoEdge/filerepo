@@ -90,10 +90,10 @@ public class RepoEngine {
         long period =  plugin.getConfig().getLongParam("scan_period", 15000L);
 
         if((scanDirString != null) && (fileRepoName != null)) {
-            logger.info("Starting file scan : " + scanDirString + " filerepo: " + fileRepoName);
+            logger.debug("Starting file scan : " + scanDirString + " filerepo: " + fileRepoName);
             startScan(delay, period);
         } else if((scanDirString == null) && (fileRepoName != null)) {
-            logger.info("Start listening for filerepo: " + fileRepoName);
+            logger.debug("Start listening for filerepo: " + fileRepoName);
             createSubListener(fileRepoName);
         }
 
@@ -120,7 +120,7 @@ public class RepoEngine {
 
                             if (!inScan.get()) {
 
-                                logger.info("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
+                                logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
                                 inScan.set(true);
 
                                 //build file list
@@ -157,7 +157,7 @@ public class RepoEngine {
 
                     if(plugin.isActive()) {
 
-                        logger.info("\t\t ***BROADCASTING repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
+                        logger.debug("\t\t ***BROADCASTING repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
                         //let everyone know repo exists
                         repoBroadcast(fileRepoName,"discover", transferId);
 
@@ -173,11 +173,11 @@ public class RepoEngine {
 
         fileScanTimer = new Timer("Timer");
         fileScanTimer.scheduleAtFixedRate(fileScanTask, delay, period);
-        logger.info("filescantimer : set : " + period);
+        logger.debug("filescantimer : set : " + period);
 
         repoBroadcastTimer = new Timer("BroadCastTimer");
         repoBroadcastTimer.scheduleAtFixedRate(repoBroadcastTask, delay, period);
-        logger.info("broadcasttimer : set : " + period);
+        logger.debug("broadcasttimer : set : " + period);
     }
 
     public void shutdown() {
@@ -194,11 +194,11 @@ public class RepoEngine {
 
     public void stopScan() {
         if(fileScanTimer != null) {
-            logger.warn("Stopping existing scan");
+            logger.debug("Stopping existing scan");
             fileScanTimer.cancel();
             fileScanTimer = null;
         } else {
-            logger.warn("No scan currently active");
+            logger.debug("No scan currently active");
         }
     }
 

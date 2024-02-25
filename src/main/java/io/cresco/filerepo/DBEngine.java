@@ -59,7 +59,7 @@ public class DBEngine {
                         logger.debug("DB SOURCE EXIST: " + dbsource.getAbsolutePath() );
                     } else {
                         //dbsource.mkdir();
-                        logger.info("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
+                        logger.debug("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
                         initDB();
                     }
 

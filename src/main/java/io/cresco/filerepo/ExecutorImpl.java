@@ -334,15 +334,16 @@ public class ExecutorImpl implements Executor {
                                 if(transferStreams.containsKey(transferId)) {
                                     transferStreams.get(transferId).setBytesTransfered(transferStreams.get(transferId).getBytesTransfered() + read);
                                     isActive = transferStreams.get(transferId).isActive();
-                                    /*
+                                    //logger.error("streamFile transferId: " + transferId + " bytesTransfered: " + transferStreams.get(transferId).getBytesTransfered());
+
+
                                     if(!alerted) {
-                                        if (transferStreams.get(transferId).getBytesTransfered() > (1024 * 1024 * 32)) {
+                                        if (transferStreams.get(transferId).getBytesTransfered() > (1024)) {
                                             logger.error("streamFile transferId: " + transferId + " bytesTransfered: " + transferStreams.get(transferId).getBytesTransfered());
                                             alerted = true;
                                         }
                                     }
 
-                                     */
                                 } else {
                                     logger.error("streamFile transferId: " + transferId + " not found in transferStreams");
                                 }
@@ -371,6 +372,7 @@ public class ExecutorImpl implements Executor {
 
 
         } catch (Exception ex) {
+            logger.error("Error streamFile(Map<String,String> transferInfo) " + ex.getMessage());
             ex.printStackTrace();
         }
 
