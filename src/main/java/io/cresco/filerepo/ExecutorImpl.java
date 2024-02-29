@@ -116,6 +116,10 @@ public class ExecutorImpl implements Executor {
                if(scanDirString != null) {
                    msg.setParam("scan_dir", scanDirString);
                }
+               String repoInstanceId = plugin.getConfig().getStringParam("instance_id");
+               if(repoInstanceId != null) {
+                   msg.setParam("instance_id", repoInstanceId);
+               }
                msg.setCompressedParam("repofilelist", repoEngine.getFileRepoString(repo_name));
                msg.setParam("status","10");
                msg.setParam("status_desc","found list");
