@@ -7,7 +7,6 @@ import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
-import javax.jms.BytesMessage;
 import javax.jms.Message;
 import javax.jms.TextMessage;
 import java.io.File;
@@ -226,7 +225,7 @@ public class RepoEngine {
             fileDiffMap = new HashMap<>();
 
             File[] listOfFiles = null;
-            boolean scanRecursive = plugin.getConfig().getBooleanParam("scan_recursive",false);
+            boolean scanRecursive = plugin.getConfig().getBooleanParam("scan_recursive",true);
             if(scanRecursive) {
                 logger.debug("SCAN RECURSIVE");
                 List<File> tp = new ArrayList<>();

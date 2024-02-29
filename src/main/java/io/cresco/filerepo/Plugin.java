@@ -95,13 +95,14 @@ public class Plugin implements PluginService {
                     Thread.sleep(1000);
                 }
 
-                boolean enableScan = pluginBuilder.getConfig().getBooleanParam("enable_scan",Boolean.TRUE);
-                if(enableScan) {
-                    repoEngine.start();
+                boolean enableScan = false;
+                if((pluginBuilder.getConfig().getStringParam("scan_dir") != null) && (pluginBuilder.getConfig().getStringParam("enable_scan") != null)) {
+                    if(pluginBuilder.getConfig().getBooleanParam("enable_scan", false)) {
+                        repoEngine.start();
+                        //Log message to notify of plugin startup
+                        logger.info("repoEngine Started");
+                    }
                 }
-                //Log message to notify of plugin startup
-                logger.info("repoEngine Started");
-
 
             }
             return true;

@@ -73,6 +73,8 @@ public class ExecutorImpl implements Executor {
                     return getPluginJar(incoming);
                 case "getfile":
                     return getFile(incoming);
+                case "getscandir":
+                    return getScanDir(incoming);
                 case "streamfile":
                     return streamFile(incoming);
                 case "streamfilecancel":
@@ -110,6 +112,10 @@ public class ExecutorImpl implements Executor {
         try {
             if(msg.paramsContains("repo_name")) {
                String repo_name = msg.getParam("repo_name");
+               String scanDirString = plugin.getConfig().getStringParam("scan_dir");
+               if(scanDirString != null) {
+                   msg.setParam("scan_dir", scanDirString);
+               }
                msg.setCompressedParam("repofilelist", repoEngine.getFileRepoString(repo_name));
                msg.setParam("status","10");
                msg.setParam("status_desc","found list");
@@ -288,6 +294,29 @@ public class ExecutorImpl implements Executor {
         } catch(Exception ex) {
             incoming.setParam("status","7");
             incoming.setParam("status_desc","getFile error " + ex.getMessage());
+            ex.printStackTrace();
+        }
+        return incoming;
+    }
+
+    private MsgEvent getScanDir(MsgEvent incoming) {
+
+        try {
+
+            String scanDirString = plugin.getConfig().getStringParam("scan_dir");
+            if(scanDirString != null) {
+                incoming.setParam("scan_dir", scanDirString);
+                incoming.setParam("status","10");
+                incoming.setParam("status_desc","found scan_dir");
+            } else {
+                incoming.setParam("status","9");
+                incoming.setParam("status_desc","scan_dir == null");
+            }
+
+
+        } catch(Exception ex) {
+            incoming.setParam("status","7");
+            incoming.setParam("status_desc","getScanDir error " + ex.getMessage());
             ex.printStackTrace();
         }
         return incoming;
