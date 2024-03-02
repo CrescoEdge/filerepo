@@ -231,7 +231,7 @@ public class RepoEngine {
                 List<File> tp = new ArrayList<>();
                 List<File> fn = getFileNames(tp,Paths.get(scanDirString));
                 for(File f : fn) {
-                    logger.error("File: " + f.getAbsolutePath());
+                    logger.debug("File: " + f.getAbsolutePath());
                 }
 
 
