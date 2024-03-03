@@ -107,7 +107,7 @@ public class ExecutorImpl implements Executor {
 
     private MsgEvent getRepoFileList(MsgEvent msg) {
         long startTime = System.currentTimeMillis();
-        logger.error("return getrepofilelist start");
+        //logger.error("return getrepofilelist start");
 
         try {
             if(msg.paramsContains("repo_name")) {
@@ -133,7 +133,7 @@ public class ExecutorImpl implements Executor {
             msg.setParam("status","8");
             msg.setParam("status_desc",ex.getMessage());
         }
-        logger.error("return getrepofilelist end: time = " + (System.currentTimeMillis() - startTime));
+        //logger.error("return getrepofilelist end: time = " + (System.currentTimeMillis() - startTime));
         return msg;
 
     }
@@ -377,7 +377,7 @@ public class ExecutorImpl implements Executor {
                                         }
                                     }
 
-                                    
+
                                 } else {
                                     logger.error("streamFile transferId: " + transferId + " not found in transferStreams");
                                 }
