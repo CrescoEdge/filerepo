@@ -358,10 +358,11 @@ public class ExecutorImpl implements Executor {
                         boolean isActive = true;
                         while( (( read = is.read( buffer ) ) > 0 ) && isActive ){
                             BytesMessage updateMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
-                            updateMessage.writeBytes(buffer);
+                            updateMessage.writeBytes(buffer, 0, read);
                             updateMessage.setStringProperty(transferInfo.get("ident_key"), transferInfo.get("ident_id"));
                             updateMessage.setStringProperty("transfer_id", transferId);
                             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
+                            logger.error("WRITING " + read + " BYTES FOR " + transferId);
 
                             synchronized (transferLock) {
                                 if(transferStreams.containsKey(transferId)) {
