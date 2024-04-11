@@ -1,6 +1,5 @@
 package io.cresco.filerepo;
 
-import com.google.common.io.ByteStreams;
 import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
 import io.cresco.library.data.TopicType;
@@ -11,14 +10,9 @@ import io.cresco.library.utilities.CLogger;
 
 import javax.jms.BytesMessage;
 import javax.jms.DeliveryMode;
-import javax.jms.TextMessage;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.lang.reflect.Type;
-import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -350,15 +344,20 @@ public class ExecutorImpl implements Executor {
 
                         RandomAccessFile raf = new RandomAccessFile(filePath, "r");
                         raf.seek(startByte);
-                        InputStream rafIs = Channels.newInputStream(raf.getChannel());
-                        InputStream is = ByteStreams.limit(rafIs, byteLength);
+                        //InputStream rafIs = Channels.newInputStream(raf.getChannel());
+                        //InputStream is = ByteStreams.limit(rafIs, byteLength);
 
                         int seqNum = 0;
                         byte[] buffer = new byte[BUFFER_SIZE];
                         int read;
                         boolean isActive = true;
-                        while( (( read = is.read( buffer ) ) > 0 ) && isActive ){
+                        while((byteLength > 0) && (isActive)){
                             BytesMessage updateMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
+                            read = BUFFER_SIZE;
+                            if(byteLength < BUFFER_SIZE) {
+                                read = (int)byteLength;
+                            }
+                            raf.read(buffer);
                             updateMessage.writeBytes(buffer, 0, read);
                             updateMessage.setStringProperty(transferInfo.get("ident_key"), transferInfo.get("ident_id"));
                             updateMessage.setStringProperty("transfer_id", transferId);
@@ -366,6 +365,7 @@ public class ExecutorImpl implements Executor {
                             //logger.error("ADDING SEQ: " + seqNum + " transfer_id: " + transferId);
                             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
                             //logger.error("WRITING " + read + " BYTES FOR " + transferId);
+                            byteLength = byteLength - read;
                             seqNum += 1;
 
                             synchronized (transferLock) {
@@ -377,7 +377,7 @@ public class ExecutorImpl implements Executor {
 
                                     if(!alerted) {
                                         if (transferStreams.get(transferId).getBytesTransfered() > (1024)) {
-                                            logger.error("streamFile transferId: " + transferId + " bytesTransfered: " + transferStreams.get(transferId).getBytesTransfered());
+                                            logger.debug("streamFile transferId: " + transferId + " bytesTransfered: " + transferStreams.get(transferId).getBytesTransfered());
                                             alerted = true;
                                         }
                                     }
@@ -388,9 +388,9 @@ public class ExecutorImpl implements Executor {
                                 }
                             }
                         }
-
-                        is.close();
-                        rafIs.close();
+                        logger.error("Transfer thinks it is done!");
+                        //is.close();
+                        //rafIs.close();
                         raf.close();
 
 
@@ -420,42 +420,58 @@ public class ExecutorImpl implements Executor {
 
         try {
 
-            if(incoming.getParam("file_path") != null){
+            if(incoming.getParam("file_path") != null) {
                 String filePath = incoming.getParam("file_path");
 
-                Map<String,String> fileInfo = repoEngine.getFileInfo(filePath);
-                if(fileInfo != null) {
-                    fileInfo.put("transfer_id", incoming.getParam("transfer_id"));
-                    fileInfo.put("file_path", incoming.getParam("file_path"));
-                    fileInfo.put("start_byte", incoming.getParam("start_byte"));
-                    fileInfo.put("byte_length", incoming.getParam("byte_length"));
-                    fileInfo.put("ident_key", incoming.getParam("ident_key"));
-                    fileInfo.put("ident_id", incoming.getParam("ident_id"));
+                File file = new File(filePath);
+                if(file.exists()) {
+                    long startByte = Long.parseLong(incoming.getParam("start_byte"));
+                    long byteLength = Long.parseLong(incoming.getParam("byte_length"));
+                    long endByte = startByte + byteLength;
 
-                    String bufferSizeStr = incoming.getParam("buffer_size");
-                    if(bufferSizeStr == null) {
-                        bufferSizeStr = String.valueOf(1024 * 32);
+                    if(endByte <= file.length()) {
 
+                        Map<String, String> fileInfo = repoEngine.getFileInfo(filePath);
+                        if (fileInfo != null) {
+                            fileInfo.put("transfer_id", incoming.getParam("transfer_id"));
+                            fileInfo.put("file_path", incoming.getParam("file_path"));
+                            fileInfo.put("start_byte", incoming.getParam("start_byte"));
+                            fileInfo.put("byte_length", incoming.getParam("byte_length"));
+                            fileInfo.put("ident_key", incoming.getParam("ident_key"));
+                            fileInfo.put("ident_id", incoming.getParam("ident_id"));
+
+                            String bufferSizeStr = incoming.getParam("buffer_size");
+                            if (bufferSizeStr == null) {
+                                bufferSizeStr = String.valueOf(1024 * 32);
+
+                            }
+                            fileInfo.put("buffer_size", bufferSizeStr);
+
+                            //transfer in new thread, send recept
+                            streamFile(fileInfo);
+                            //logger.error("transferid: " + incoming.getParam("transfer_id") + " START");
+
+                            incoming.setParam("status", "10");
+                            incoming.setParam("status_desc", "endByte > file size");
+                        } else {
+                            incoming.setParam("status", "9");
+                            incoming.setParam("status_desc", "fileInfo == null");
+                        }
+                    } else {
+                        incoming.setParam("status", "8");
+                        incoming.setParam("status_desc", "fileInfo == null");
                     }
-                    fileInfo.put("buffer_size", bufferSizeStr);
-
-                    //transfer in new thread, send recept
-                    streamFile(fileInfo);
-                    //logger.error("transferid: " + incoming.getParam("transfer_id") + " START");
-
-                    incoming.setParam("status","10");
-                    incoming.setParam("status_desc","stream active");
                 } else {
-                    incoming.setParam("status","9");
-                    incoming.setParam("status_desc","fileInfo == null");
+                    incoming.setParam("status","7");
+                    incoming.setParam("status_desc","no filename parameter");
                 }
             } else {
-                incoming.setParam("status","8");
-                incoming.setParam("status_desc","no filename parameter");
+                incoming.setParam("status","6");
+                incoming.setParam("status_desc","file does not exists on OS");
             }
 
         } catch(Exception ex) {
-            incoming.setParam("status","7");
+            incoming.setParam("status","5");
             incoming.setParam("status_desc","getFile error " + ex.getMessage());
             ex.printStackTrace();
         }
