@@ -353,6 +353,7 @@ public class ExecutorImpl implements Executor {
                         InputStream rafIs = Channels.newInputStream(raf.getChannel());
                         InputStream is = ByteStreams.limit(rafIs, byteLength);
 
+                        int seqNum = 0;
                         byte[] buffer = new byte[BUFFER_SIZE];
                         int read;
                         boolean isActive = true;
@@ -361,8 +362,10 @@ public class ExecutorImpl implements Executor {
                             updateMessage.writeBytes(buffer, 0, read);
                             updateMessage.setStringProperty(transferInfo.get("ident_key"), transferInfo.get("ident_id"));
                             updateMessage.setStringProperty("transfer_id", transferId);
+                            updateMessage.setStringProperty("seq_num", String.valueOf(seqNum));
                             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
                             //logger.error("WRITING " + read + " BYTES FOR " + transferId);
+                            seqNum += 1;
 
                             synchronized (transferLock) {
                                 if(transferStreams.containsKey(transferId)) {
