@@ -388,7 +388,6 @@ public class ExecutorImpl implements Executor {
                                 }
                             }
                         }
-                        logger.error("Transfer thinks it is done!");
                         //is.close();
                         //rafIs.close();
                         raf.close();
