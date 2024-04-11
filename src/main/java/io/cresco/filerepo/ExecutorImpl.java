@@ -323,7 +323,7 @@ public class ExecutorImpl implements Executor {
     private void streamFile(Map<String,String> transferInfo) {
         String transferId = transferInfo.get("transfer_id");
         int BUFFER_SIZE = Integer.parseInt(transferInfo.get("buffer_size"));
-        logger.info("transferid: " + transferId + " BUFFER_SIZE: " + BUFFER_SIZE + " TRANSFERINFO: " + transferInfo);
+        //logger.info("transferid: " + transferId + " BUFFER_SIZE: " + BUFFER_SIZE + " TRANSFERINFO: " + transferInfo);
 
         try {
 
