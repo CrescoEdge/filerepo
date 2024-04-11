@@ -362,7 +362,7 @@ public class ExecutorImpl implements Executor {
                             updateMessage.setStringProperty(transferInfo.get("ident_key"), transferInfo.get("ident_id"));
                             updateMessage.setStringProperty("transfer_id", transferId);
                             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
-                            logger.error("WRITING " + read + " BYTES FOR " + transferId);
+                            //logger.error("WRITING " + read + " BYTES FOR " + transferId);
 
                             synchronized (transferLock) {
                                 if(transferStreams.containsKey(transferId)) {
