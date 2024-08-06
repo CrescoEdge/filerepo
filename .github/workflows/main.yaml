@@ -5,17 +5,23 @@ on: [push]
 jobs:
   build:
     runs-on: ubuntu-latest
-    environment: 'CRED'
+    environment: 'SONATYPE CRED'
 
     steps:
       - uses: actions/checkout@v2
-      - name: Set up JDK 8
+      - name: Set up JDK 21
         uses: actions/setup-java@v2
         with:
-          java-version: '8'
+          java-version: '21'
           distribution: 'adopt'
       - name: Build with Maven
         run: mvn package bundle:bundle
+      - name: Deploy to Maven
+        run: mvn deploy:deploy-file -Dfile=target/filerepo-1.2-SNAPSHOT.jar -Durl=https://oss.sonatype.org/content/repositories/snapshots -DrepositoryId=ossrh -DpomFile=pom.xml --settings ci-settings.xml -DskipTests=true -B
+        env:
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+
 
       - uses: dev-drprasad/delete-tag-and-release@v1.0 # PRERELEASE is v1.0 and can also be used to test and give us feedback
         with:
@@ -28,7 +34,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: '1.1-SNAPSHOT'
+          tag_name: '1.2-SNAPSHOT'
           release_name: 'Cresco Filerepo'
           draft: true
           prerelease: false
@@ -37,8 +43,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: target/filerepo-1.1-SNAPSHOT.jar
-          asset_name: filerepo-1.1-SNAPSHOT.jar
+          asset_path: target/filerepo-1.2-SNAPSHOT.jar
+          asset_name: filerepo-1.2-SNAPSHOT.jar
           asset_content_type: application/jar
 
       - uses: eregon/publish-release@v1
