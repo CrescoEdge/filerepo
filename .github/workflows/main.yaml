@@ -16,13 +16,7 @@ jobs:
           distribution: 'adopt'
       - name: Build with Maven
         run: mvn package bundle:bundle
-      - name: Deploy to Maven
-        run: mvn deploy:deploy-file -Dfile=target/filerepo-1.2-SNAPSHOT.jar -Durl=https://oss.sonatype.org/content/repositories/snapshots -DrepositoryId=ossrh -DpomFile=pom.xml --settings ci-settings.xml -DskipTests=true -B
-        env:
-          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
-          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
-
-
+      
       - uses: dev-drprasad/delete-tag-and-release@v1.0 # PRERELEASE is v1.0 and can also be used to test and give us feedback
         with:
           tag_name: '1.1-SNAPSHOT' # tag name to delete
