@@ -7,8 +7,9 @@ import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
-import javax.jms.Message;
-import javax.jms.TextMessage;
+import jakarta.jms.Message;
+import jakarta.jms.MessageListener;
+import jakarta.jms.TextMessage;
 import java.io.File;
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -672,7 +673,7 @@ public class RepoEngine {
     private void createSubListener(String filerepoName) {
 
 
-        javax.jms.MessageListener ml = new javax.jms.MessageListener() {
+        MessageListener ml = new MessageListener() {
             public void onMessage(Message msg) {
                 try {
 
@@ -776,7 +777,7 @@ public class RepoEngine {
 
     private void createRepoSubListener(String filerepoName) {
 
-        javax.jms.MessageListener ml = new javax.jms.MessageListener() {
+        MessageListener ml = new MessageListener() {
             public void onMessage(Message msg) {
                 try {
 

@@ -8,8 +8,9 @@ import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
 
-import javax.jms.BytesMessage;
-import javax.jms.DeliveryMode;
+import jakarta.jms.BytesMessage;
+import jakarta.jms.DeliveryMode;
+
 import java.io.File;
 import java.io.RandomAccessFile;
 import java.lang.reflect.Type;
