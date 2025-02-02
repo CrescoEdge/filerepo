@@ -9,7 +9,6 @@ import java.util.List;
 public class Activator implements BundleActivator
 {
 
-
     /**
      * Implements BundleActivator.start(). Prints
      * a message and adds itself to the bundle context as a service
