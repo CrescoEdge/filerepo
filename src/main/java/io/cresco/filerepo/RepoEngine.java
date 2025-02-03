@@ -182,6 +182,10 @@ public class RepoEngine {
 
     public void shutdown() {
 
+        if(repoBroadcastTimer != null) {
+            repoBroadcastTimer.cancel();
+            repoBroadcastTimer = null;
+        }
         stopScan();
         //if(fileRepoName != null) {
         //    repoBroadcast(fileRepoName,"shutdown");
