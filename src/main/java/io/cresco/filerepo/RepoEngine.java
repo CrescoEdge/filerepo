@@ -59,6 +59,7 @@ public class RepoEngine {
 
     private List<String> listenerList;
     private String fileRepoName;
+    private String repoDir;
 
     public RepoEngine(PluginBuilder pluginBuilder, DBEngine dbEngine) {
 
@@ -81,7 +82,7 @@ public class RepoEngine {
 
         scanDirString =  plugin.getConfig().getStringParam("scan_dir");
         fileRepoName =  plugin.getConfig().getStringParam("filerepo_name");
-
+        repoDir =  plugin.getConfig().getStringParam("repo_dir");
     }
 
     public void start() {
@@ -92,7 +93,7 @@ public class RepoEngine {
         if((scanDirString != null) && (fileRepoName != null)) {
             logger.info("Starting file scan : " + scanDirString + " filerepo: " + fileRepoName);
             startScan(delay, period);
-        } else if((scanDirString == null) && (fileRepoName != null)) {
+        } else if((scanDirString == null) && (fileRepoName != null) && (repoDir != null)) {
             logger.info("Start listening for filerepo: " + fileRepoName);
             createSubListener(fileRepoName);
         }

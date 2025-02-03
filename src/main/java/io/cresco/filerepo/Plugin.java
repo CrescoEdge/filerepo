@@ -95,13 +95,33 @@ public class Plugin implements PluginService {
                     Thread.sleep(1000);
                 }
 
+                /*
+                if((scanDirString != null) && (fileRepoName != null)) {
+            logger.info("Starting file scan : " + scanDirString + " filerepo: " + fileRepoName);
+            startScan(delay, period);
+        } else if((scanDirString == null) && (fileRepoName != null)) {
+            logger.info("Start listening for filerepo: " + fileRepoName);
+            createSubListener(fileRepoName);
+        }
+
+        scanDirString =  plugin.getConfig().getStringParam("scan_dir");
+        fileRepoName =  plugin.getConfig().getStringParam("filerepo_name");
+        repo_dir
+                 */
+
                 boolean enableScan = false;
-                if((pluginBuilder.getConfig().getStringParam("scan_dir") != null) && (pluginBuilder.getConfig().getStringParam("enable_scan") != null)) {
+                if((pluginBuilder.getConfig().getStringParam("scan_dir") != null) &&
+                        (pluginBuilder.getConfig().getStringParam("enable_scan") != null) &&
+                        (pluginBuilder.getConfig().getStringParam("filerepo_name") != null)) {
+
                     if(pluginBuilder.getConfig().getBooleanParam("enable_scan", false)) {
                         repoEngine.start();
                         //Log message to notify of plugin startup
                         logger.info("repoEngine Started");
                     }
+                } else if((pluginBuilder.getConfig().getStringParam("repo_dir") != null) &&
+                        (pluginBuilder.getConfig().getStringParam("filerepo_name") != null)) {
+                            repoEngine.start();
                 }
             }
             return true;
