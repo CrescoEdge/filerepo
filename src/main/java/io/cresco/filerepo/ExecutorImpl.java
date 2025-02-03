@@ -364,7 +364,7 @@ public class ExecutorImpl implements Executor {
                             updateMessage.setStringProperty("transfer_id", transferId);
                             updateMessage.setStringProperty("seq_num", String.valueOf(seqNum));
                             //logger.error("ADDING SEQ: " + seqNum + " transfer_id: " + transferId);
-                            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
+                            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
                             //logger.error("WRITING " + read + " BYTES FOR " + transferId);
                             byteLength = byteLength - read;
                             seqNum += 1;

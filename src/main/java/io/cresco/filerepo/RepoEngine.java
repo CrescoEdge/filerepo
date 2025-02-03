@@ -90,10 +90,10 @@ public class RepoEngine {
         long period =  plugin.getConfig().getLongParam("scan_period", 15000L);
 
         if((scanDirString != null) && (fileRepoName != null)) {
-            logger.debug("Starting file scan : " + scanDirString + " filerepo: " + fileRepoName);
+            logger.info("Starting file scan : " + scanDirString + " filerepo: " + fileRepoName);
             startScan(delay, period);
         } else if((scanDirString == null) && (fileRepoName != null)) {
-            logger.debug("Start listening for filerepo: " + fileRepoName);
+            logger.info("Start listening for filerepo: " + fileRepoName);
             createSubListener(fileRepoName);
         }
 
@@ -712,7 +712,7 @@ public class RepoEngine {
         };
 
         String queryString = "filerepo_name='" + filerepoName + "' AND broadcast";
-        String node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
+        String node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL,ml,queryString);
 
         listenerList.add(node_from_listner_id);
 
@@ -736,7 +736,7 @@ public class RepoEngine {
             updateMessage.setStringProperty("agent_id",agentId);
             updateMessage.setStringProperty("plugin_id",pluginId);
 
-            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage);
+            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL,updateMessage);
 
 
         } catch (Exception ex) {
@@ -765,7 +765,7 @@ public class RepoEngine {
             updateMessage.setStringProperty("filerepo_name",filerepoName);
             updateMessage.setBooleanProperty("broadcast",Boolean.TRUE);
 
-            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.AGENT,updateMessage);
+            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL,updateMessage);
             logger.debug("SENDING MESSAGE: " + update);
 
         } catch (Exception ex) {
@@ -818,7 +818,7 @@ public class RepoEngine {
         };
 
         String queryString = "filerepo_name='" + filerepoName + "' AND region_id='" + plugin.getRegion() + "' AND agent_id='" + plugin.getAgent() + "' AND plugin_id='" + plugin.getPluginID() + "'";
-        String node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.AGENT,ml,queryString);
+        String node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL,ml,queryString);
 
         listenerList.add(node_from_listner_id);
 
