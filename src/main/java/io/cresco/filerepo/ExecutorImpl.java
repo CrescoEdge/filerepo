@@ -20,6 +20,81 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import io.cresco.library.capability.*;
+
+@CrescoCapabilities(namespace = "filerepo", target = "plugin",
+    routingParams = {"region", "agent", "pluginid"},
+    summary = "Distributed file/artifact repository: scans a directory, tracks files in an embedded " +
+              "catalog, and moves files/jars across the mesh via inline transfer, byte-range dataplane " +
+              "streaming, watched-directory sync, and push-to-remote-repo.")
+@CrescoActions({
+    @CrescoAction(name = "repolist", type = "EXEC",
+        summary = "List the plugin/jar inventory of this repo.", why = "Discover available artifacts.",
+        returns = @CrescoReturn(name = "repolist", type = "object", compressed = true, description = "JSON inventory")),
+    @CrescoAction(name = "getrepofilelist", type = "EXEC",
+        summary = "List files (path/md5/size/mtime) in a named repo.", why = "Enumerate a repo (e.g. find a model adapter).",
+        params = @CrescoParam(name = "repo_name", required = true, description = "repo name"),
+        returns = @CrescoReturn(name = "repofilelist", type = "object", compressed = true, description = "JSON file list")),
+    @CrescoAction(name = "getfile", type = "EXEC",
+        summary = "Return a whole file inline (bytes in the reply).", why = "Fetch a small file in one message.",
+        params = @CrescoParam(name = "file_path", required = true, description = "absolute path on the source agent"),
+        returns = @CrescoReturn(name = "file_data", type = "bytes", description = "the file bytes")),
+    @CrescoAction(name = "getjar", type = "EXEC",
+        summary = "Return a plugin jar inline, matched by name+md5.", why = "Pull a plugin bundle to an agent.",
+        params = {@CrescoParam(name = "action_pluginname", required = true, description = "plugin name"),
+                  @CrescoParam(name = "action_pluginmd5", required = true, description = "plugin md5")},
+        returns = @CrescoReturn(name = "jardata", type = "bytes", description = "the jar bytes")),
+    @CrescoAction(name = "putjar", type = "EXEC",
+        summary = "Write a plugin jar (inline bytes) into this repo, md5-verified.", why = "Publish a plugin bundle.",
+        params = {@CrescoParam(name = "pluginname", required = true), @CrescoParam(name = "md5", required = true),
+                  @CrescoParam(name = "jarfile", required = true), @CrescoParam(name = "version", required = true),
+                  @CrescoParam(name = "jardata", required = true, type = "bytes", description = "jar bytes")},
+        returns = @CrescoReturn(name = "uploaded", description = "plugin name on success")),
+    @CrescoAction(name = "putfiles", type = "EXEC",
+        summary = "Land pushed files (MsgEvent attachments) into a repo.", why = "Receiving side of a file push.",
+        params = {@CrescoParam(name = "repo_name", required = true), @CrescoParam(name = "overwrite", type = "boolean")}),
+    @CrescoAction(name = "putfilesremote", type = "EXEC",
+        summary = "Push a set of files from this repo to another agent's repo.", why = "Distribute files across the mesh.",
+        params = {@CrescoParam(name = "file_list", required = true, compressed = true, type = "object", description = "JSON list of paths"),
+                  @CrescoParam(name = "dst_region", required = true), @CrescoParam(name = "dst_agent", required = true),
+                  @CrescoParam(name = "dst_plugin", required = true), @CrescoParam(name = "repo_name", required = true)},
+        returns = @CrescoReturn(name = "status", description = "10 request sent")),
+    @CrescoAction(name = "streamfile", type = "EXEC",
+        summary = "Stream a byte-range of a file over the dataplane in chunks.", why = "Move large artifacts efficiently.",
+        params = {@CrescoParam(name = "file_path", required = true), @CrescoParam(name = "start_byte", required = true, type = "long"),
+                  @CrescoParam(name = "byte_length", required = true, type = "long"), @CrescoParam(name = "transfer_id", required = true),
+                  @CrescoParam(name = "ident_key", required = true), @CrescoParam(name = "ident_id", required = true),
+                  @CrescoParam(name = "buffer_size", type = "int", description = "chunk size, default 32768")},
+        returns = @CrescoReturn(name = "status", description = "10 accepted")),
+    @CrescoAction(name = "streamfilecancel", type = "EXEC",
+        summary = "Cancel an in-progress streamfile transfer.", why = "Stop a large transfer.",
+        params = @CrescoParam(name = "transfer_id", required = true),
+        returns = @CrescoReturn(name = "status_code", description = "10 cancelled")),
+    @CrescoAction(name = "getscandir", type = "EXEC",
+        summary = "Return this repo's configured scan directory.", why = "Discover where the repo watches.",
+        returns = @CrescoReturn(name = "scan_dir", description = "the scan directory")),
+    @CrescoAction(name = "removefile", type = "EXEC",
+        summary = "Remove a file from a repo (file + catalog row).", why = "Delete an artifact.",
+        params = {@CrescoParam(name = "repo_name", required = true), @CrescoParam(name = "file_name", required = true)},
+        returns = @CrescoReturn(name = "status", description = "10 removed")),
+    @CrescoAction(name = "clearrepo", type = "EXEC",
+        summary = "Delete all files in a repo.", why = "Wipe a repo.",
+        params = @CrescoParam(name = "repo_name", required = true),
+        returns = @CrescoReturn(name = "status", description = "10 cleared")),
+    @CrescoAction(name = "repolistin", type = "EXEC",
+        summary = "Receive a producer's file-diff and pull changed files (sync consumer side).",
+        why = "Directory-sync receiving half.",
+        params = {@CrescoParam(name = "repolistin", required = true, compressed = true, type = "object", description = "JSON diff"),
+                  @CrescoParam(name = "transfer_id", required = true)},
+        returns = @CrescoReturn(name = "status_code", description = "10 accepted")),
+    @CrescoAction(name = "repoconfirm", type = "EXEC",
+        summary = "Acknowledge a peer received a transfer generation.", why = "Sync handshake.",
+        params = @CrescoParam(name = "transfer_id", required = true)),
+    @CrescoAction(name = "getcapabilities", type = "EXEC",
+        summary = "Return this plugin's self-describing capability document (its message actions as LLM tool specs).",
+        why = "Discovery: lets a client/LLM learn what this plugin can do and how to call it.",
+        returns = @CrescoReturn(name = "capabilities", type = "object", description = "CapabilityDocument JSON"))
+})
 public class ExecutorImpl implements Executor {
 
     private PluginBuilder plugin;
@@ -87,6 +162,8 @@ public class ExecutorImpl implements Executor {
                 case "repoconfirm":
                     confirmTransfer(incoming);
                     break;
+                case "getcapabilities":
+                    return CapabilityResponder.respond(incoming, this);
 
             }
         }
