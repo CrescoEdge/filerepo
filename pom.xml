@@ -42,7 +42,7 @@
 
     <properties>
         <!-- jdk, encoding, plugin & OSGi API / gson versions inherited from cresco-parent -->
-        <derby.version>10.14.2.0</derby.version>
+        <derby.version>10.17.1.0</derby.version>
     </properties>
 
     <dependencies>
@@ -99,6 +99,18 @@
         <dependency>
             <groupId>org.apache.derby</groupId>
             <artifactId>derby</artifactId>
+            <version>${derby.version}</version>
+        </dependency>
+        <!-- derby 10.15+ split the engine: embedded driver requires derbyshared +
+             derbytools (org.apache.derby.jdbc.EmbeddedDriver) alongside derby.jar. -->
+        <dependency>
+            <groupId>org.apache.derby</groupId>
+            <artifactId>derbyshared</artifactId>
+            <version>${derby.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.derby</groupId>
+            <artifactId>derbytools</artifactId>
             <version>${derby.version}</version>
         </dependency>
 
