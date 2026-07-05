@@ -18,6 +18,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.cresco.library.capability.*;
@@ -107,6 +111,13 @@ public class ExecutorImpl implements Executor {
 
     private Map<String,StreamObject> transferStreams;
 
+    // Bounded, named, daemon pool for byte-range streamers (replaces unbounded `new Thread()` per
+    // transfer). Safeguards: inline reads (getfile/getjar) are capped to keep them off the heap for
+    // large artifacts; anything bigger must use streamfile. Buffer size is tunable.
+    private final ExecutorService transferPool;
+    private final long maxInlineBytes;
+    private final int defaultStreamBuffer;
+
     public ExecutorImpl(PluginBuilder pluginBuilder, RepoEngine repoEngine) {
         this.plugin = pluginBuilder;
         logger = plugin.getLogger(ExecutorImpl.class.getName(), CLogger.Level.Info);
@@ -114,6 +125,22 @@ public class ExecutorImpl implements Executor {
         this.repoEngine = repoEngine;
         listType = new TypeToken<ArrayList<String>>(){}.getType();
         transferStreams = Collections.synchronizedMap(new HashMap<>());
+
+        int maxThreads = (int) Math.max(2L, plugin.getConfig().getLongParam("transfer_threads", 8L));
+        this.transferPool = new ThreadPoolExecutor(1, maxThreads, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                r -> { Thread t = new Thread(r, "filerepo-transfer"); t.setDaemon(true); return t; });
+        this.maxInlineBytes = plugin.getConfig().getLongParam("max_inline_bytes", 104857600L); // 100 MB
+        this.defaultStreamBuffer = (int)(long) plugin.getConfig().getLongParam("stream_buffer_size", 262144L); // 256 KB
+    }
+
+    /** Shut the transfer pool down; called from Plugin.isStopped(). */
+    public void cleanup() {
+        try {
+            transferPool.shutdownNow();
+        } catch (Exception ex) {
+            logger.error("transferPool shutdown error", ex);
+        }
     }
 
     @Override
@@ -192,7 +219,12 @@ public class ExecutorImpl implements Executor {
                if(repoInstanceId != null) {
                    msg.setParam("instance_id", repoInstanceId);
                }
-               msg.setCompressedParam("repofilelist", repoEngine.getFileRepoString(repo_name));
+               // optional pagination for very large catalogs (limit<=0 -> whole list, back-compat)
+               int limit = 0, offset = 0;
+               try { if (msg.getParam("limit") != null) limit = Integer.parseInt(msg.getParam("limit")); } catch (Exception ignore) {}
+               try { if (msg.getParam("offset") != null) offset = Integer.parseInt(msg.getParam("offset")); } catch (Exception ignore) {}
+               msg.setCompressedParam("repofilelist", repoEngine.getFileRepoString(repo_name, limit, offset));
+               msg.setParam("repo_total", String.valueOf(repoEngine.getRepoCount()));
                msg.setParam("status","10");
                msg.setParam("status_desc","found list");
             } else {
@@ -244,7 +276,7 @@ public class ExecutorImpl implements Executor {
             repoMap.put("pluginid",plugin.getPluginID());
             repoInfo.add(repoMap);
         } catch(Exception ex) {
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
         return repoInfo;
     }
@@ -263,7 +295,7 @@ public class ExecutorImpl implements Executor {
             }
 
         } catch(Exception ex) {
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
         return repoDir;
     }
@@ -279,21 +311,26 @@ public class ExecutorImpl implements Executor {
 
             if((pluginName != null) && (pluginMD5 != null) && (pluginJarFile != null) && (pluginVersion != null)) {
 
-                String jarFileSavePath = getRepoDir().getAbsolutePath() + "/" + pluginJarFile;
-                Path path = Paths.get(jarFileSavePath);
-                Files.write(path, incoming.getDataParam("jardata"));
-                File jarFileSaved = new File(jarFileSavePath);
-                if (jarFileSaved.isFile()) {
-                    String md5 = plugin.getMD5(jarFileSavePath);
-                    if (pluginMD5.equals(md5)) {
-                        incoming.setParam("uploaded", pluginName);
-
+                File jarFileSaved = safeRepoFile(getRepoDir(), pluginJarFile);
+                if (jarFileSaved != null) {
+                    Files.write(jarFileSaved.toPath(), incoming.getDataParam("jardata"));
+                    if (jarFileSaved.isFile()) {
+                        String md5 = plugin.getMD5(jarFileSaved.getAbsolutePath());
+                        if (pluginMD5.equals(md5)) {
+                            incoming.setParam("uploaded", pluginName);
+                        } else {
+                            // integrity check failed: drop the bad/partial file rather than serve it
+                            jarFileSaved.delete();
+                            incoming.setParam("status_desc","md5 mismatch, upload rejected");
+                        }
                     }
+                } else {
+                    incoming.setParam("status_desc","invalid jarfile name");
                 }
             }
 
         } catch(Exception ex){
-            ex.printStackTrace();
+            logger.error("putPluginJar error", ex);
         }
 
         if(incoming.getParams().containsKey("jardata")) {
@@ -313,7 +350,7 @@ public class ExecutorImpl implements Executor {
                 File repoDir = getRepoDir();
                 if (repoDir != null) {
 
-                    List<Map<String, String>> pluginInventory = plugin.getPluginInventory(getRepoDir().getAbsolutePath());
+                    List<Map<String, String>> pluginInventory = plugin.getPluginInventory(repoDir.getAbsolutePath());
                     for (Map<String, String> repoMap : pluginInventory) {
 
                         if (repoMap.containsKey("pluginname") && repoMap.containsKey("md5") && repoMap.containsKey("jarfile")) {
@@ -323,8 +360,13 @@ public class ExecutorImpl implements Executor {
 
                             if (pluginName.equals(requestPluginName) && pluginMD5.equals(requestPluginMD5)) {
 
-                                Path jarPath = Paths.get(repoDir + "/" + pluginJarFile);
-                                incoming.setDataParam("jardata", Files.readAllBytes(jarPath));
+                                File jarFile = safeRepoFile(repoDir, pluginJarFile);
+                                if (jarFile != null && jarFile.isFile() && jarFile.length() <= maxInlineBytes) {
+                                    incoming.setDataParam("jardata", Files.readAllBytes(jarFile.toPath()));
+                                } else if (jarFile != null && jarFile.length() > maxInlineBytes) {
+                                    incoming.setParam("status_desc","jar " + jarFile.length()
+                                            + " bytes exceeds max_inline_bytes; use streamfile");
+                                }
 
                             }
                         }
@@ -334,9 +376,28 @@ public class ExecutorImpl implements Executor {
                 }
             }
         } catch(Exception ex) {
-            ex.printStackTrace();
+            logger.error("getPluginJar error", ex);
         }
         return incoming;
+    }
+
+    /**
+     * Resolve a child name against repoDir and guarantee the result stays inside repoDir
+     * (path-traversal guard for names like "../../etc/x"). Returns null if it escapes.
+     */
+    private File safeRepoFile(File repoDir, String childName) {
+        try {
+            if (childName == null) return null;
+            Path base = repoDir.getCanonicalFile().toPath();
+            File candidate = new File(repoDir, childName).getCanonicalFile();
+            if (candidate.toPath().startsWith(base)) {
+                return candidate;
+            }
+            logger.error("path traversal blocked: '" + childName + "' escapes repo dir " + base);
+        } catch (Exception ex) {
+            logger.error("safeRepoFile error for " + childName, ex);
+        }
+        return null;
     }
 
     private MsgEvent getFile(MsgEvent incoming) {
@@ -354,10 +415,21 @@ public class ExecutorImpl implements Executor {
                 Map<String,String> fileInfo = repoEngine.getFileInfo(filePath);
 
                 if(fileInfo != null) {
-                    incoming.setCompressedParam("file_metadata",gson.toJson(fileInfo));
-                    incoming.setDataParam("file_data", Files.readAllBytes(Paths.get(filePath)));
-                    incoming.setParam("status","10");
-                    incoming.setParam("status_desc","found list");
+                    File f = new File(filePath);
+                    if (!f.isFile()) {
+                        incoming.setParam("status","6");
+                        incoming.setParam("status_desc","file missing on disk");
+                    } else if (f.length() > maxInlineBytes) {
+                        // Memory safeguard: never slurp a huge file onto the heap for an inline reply.
+                        incoming.setParam("status","5");
+                        incoming.setParam("status_desc","file " + f.length() + " bytes exceeds max_inline_bytes "
+                                + maxInlineBytes + "; use streamfile");
+                    } else {
+                        incoming.setCompressedParam("file_metadata",gson.toJson(fileInfo));
+                        incoming.setDataParam("file_data", Files.readAllBytes(f.toPath()));
+                        incoming.setParam("status","10");
+                        incoming.setParam("status_desc","found list");
+                    }
                 } else {
                     incoming.setParam("status","9");
                     incoming.setParam("status_desc","fileInfo == null");
@@ -370,7 +442,7 @@ public class ExecutorImpl implements Executor {
         } catch(Exception ex) {
             incoming.setParam("status","7");
             incoming.setParam("status_desc","getFile error " + ex.getMessage());
-            ex.printStackTrace();
+            logger.error("getFile error", ex);
         }
         return incoming;
     }
@@ -393,7 +465,7 @@ public class ExecutorImpl implements Executor {
         } catch(Exception ex) {
             incoming.setParam("status","7");
             incoming.setParam("status_desc","getScanDir error " + ex.getMessage());
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
         return incoming;
     }
@@ -405,25 +477,22 @@ public class ExecutorImpl implements Executor {
 
         try {
 
-            new Thread() {
-                public void run() {
-                    try {
+            transferPool.submit(() -> {
+                try {
 
-                        boolean alerted = false;
-                        //int BUFFER_SIZE = 1024 * 1024;
-                        //int BUFFER_SIZE = 1024 * 8; //this is too low
-                        long startByte = Long.parseLong(transferInfo.get("start_byte"));
-                        long byteLength = Long.parseLong(transferInfo.get("byte_length"));
-                        String filePath = transferInfo.get("file_path");
-                        StreamObject streamObject = new StreamObject(transferId, filePath, startByte, byteLength);
-                        synchronized (transferLock) {
-                            transferStreams.put(transferId, streamObject);
-                        }
+                    boolean alerted = false;
+                    long startByte = Long.parseLong(transferInfo.get("start_byte"));
+                    long byteLength = Long.parseLong(transferInfo.get("byte_length"));
+                    String filePath = transferInfo.get("file_path");
+                    StreamObject streamObject = new StreamObject(transferId, filePath, startByte, byteLength);
+                    synchronized (transferLock) {
+                        transferStreams.put(transferId, streamObject);
+                    }
 
-                        RandomAccessFile raf = new RandomAccessFile(filePath, "r");
+                    // try-with-resources: the RAF is closed even if the loop throws (previously it
+                    // leaked the descriptor on any exception mid-transfer).
+                    try (RandomAccessFile raf = new RandomAccessFile(filePath, "r")) {
                         raf.seek(startByte);
-                        //InputStream rafIs = Channels.newInputStream(raf.getChannel());
-                        //InputStream is = ByteStreams.limit(rafIs, byteLength);
 
                         int seqNum = 0;
                         byte[] buffer = new byte[BUFFER_SIZE];
@@ -433,15 +502,13 @@ public class ExecutorImpl implements Executor {
                             BytesMessage updateMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
                             read = (int) Math.min((long) BUFFER_SIZE, byteLength);
                             // Honor the ACTUAL bytes read: RandomAccessFile.read() may return a short
-                            // read (< requested), and writing the requested `read` length regardless
-                            // shipped stale buffer bytes -> corrupted transfers. Use `got` downstream.
+                            // read (< requested); writing the requested length shipped stale bytes.
                             int got = raf.read(buffer, 0, read);
                             if (got <= 0) { break; }
                             updateMessage.writeBytes(buffer, 0, got);
                             updateMessage.setStringProperty(transferInfo.get("ident_key"), transferInfo.get("ident_id"));
                             updateMessage.setStringProperty("transfer_id", transferId);
                             updateMessage.setStringProperty("seq_num", String.valueOf(seqNum));
-                            //logger.error("ADDING SEQ: " + seqNum + " transfer_id: " + transferId);
                             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
                             byteLength = byteLength - got;
                             seqNum += 1;
@@ -450,48 +517,38 @@ public class ExecutorImpl implements Executor {
                                 if(transferStreams.containsKey(transferId)) {
                                     transferStreams.get(transferId).setBytesTransfered(transferStreams.get(transferId).getBytesTransfered() + got);
                                     isActive = transferStreams.get(transferId).isActive();
-                                    //logger.error("streamFile transferId: " + transferId + " bytesTransfered: " + transferStreams.get(transferId).getBytesTransfered());
-
-
                                     if(!alerted) {
                                         if (transferStreams.get(transferId).getBytesTransfered() > (1024)) {
                                             logger.debug("streamFile transferId: " + transferId + " bytesTransfered: " + transferStreams.get(transferId).getBytesTransfered());
                                             alerted = true;
                                         }
                                     }
-
-
                                 } else {
                                     logger.error("streamFile transferId: " + transferId + " not found in transferStreams");
                                 }
                             }
                         }
-                        //is.close();
-                        //rafIs.close();
-                        raf.close();
+                    }
 
-
-                    } catch(Exception ex) {
-                        logger.error("streamFile error: " + ex.getMessage());
-                        synchronized (transferLock) {
-                            if(transferStreams.containsKey(transferId)) {
-                                transferStreams.get(transferId).setActive(false);
-                            }
-                        }
-                    } finally {
-                        // Remove the finished/failed transfer so the map doesn't grow unbounded
-                        // (this cleanup was previously commented out -> a memory leak per transfer).
-                        synchronized (transferLock) {
-                            transferStreams.remove(transferId);
+                } catch(Exception ex) {
+                    logger.error("streamFile error: " + ex.getMessage());
+                    synchronized (transferLock) {
+                        if(transferStreams.containsKey(transferId)) {
+                            transferStreams.get(transferId).setActive(false);
                         }
                     }
+                } finally {
+                    // Remove the finished/failed transfer so the map doesn't grow unbounded
+                    // (this cleanup was previously commented out -> a memory leak per transfer).
+                    synchronized (transferLock) {
+                        transferStreams.remove(transferId);
+                    }
                 }
-            }.start();
+            });
 
 
         } catch (Exception ex) {
-            logger.error("Error streamFile(Map<String,String> transferInfo) " + ex.getMessage());
-            ex.printStackTrace();
+            logger.error("Error streamFile(Map<String,String> transferInfo)", ex);
         }
 
     }
@@ -521,8 +578,7 @@ public class ExecutorImpl implements Executor {
 
                             String bufferSizeStr = incoming.getParam("buffer_size");
                             if (bufferSizeStr == null) {
-                                bufferSizeStr = String.valueOf(1024 * 32);
-
+                                bufferSizeStr = String.valueOf(defaultStreamBuffer);
                             }
                             fileInfo.put("buffer_size", bufferSizeStr);
 
@@ -552,7 +608,7 @@ public class ExecutorImpl implements Executor {
         } catch(Exception ex) {
             incoming.setParam("status","5");
             incoming.setParam("status_desc","getFile error " + ex.getMessage());
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
         return incoming;
     }
@@ -580,7 +636,7 @@ public class ExecutorImpl implements Executor {
         } catch(Exception ex) {
             incoming.setParam("status","7");
             incoming.setParam("status_desc","getFile error " + ex.getMessage());
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
         return incoming;
     }
@@ -623,7 +679,7 @@ public class ExecutorImpl implements Executor {
 
         } catch(Exception ex){
             logger.error("putFileRemote: " + ex.getMessage());
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
 
         if(incoming.getParams().containsKey("filedata")) {
@@ -721,7 +777,7 @@ public class ExecutorImpl implements Executor {
                         overwrite = Boolean.parseBoolean(incoming.getParam("overwrite"));
                     }
                 } catch(Exception ex){
-                    ex.printStackTrace();
+                    logger.error("filerepo error", ex);
                 }
 
                 if((incoming.getSrcAgent().equals(incoming.getDstAgent())) && (incoming.getSrcRegion().equals(incoming.getDstRegion()))) {
@@ -743,7 +799,7 @@ public class ExecutorImpl implements Executor {
             }
 
         } catch(Exception ex){
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
 
         if(incoming.getParams().containsKey("filedata")) {
@@ -782,7 +838,7 @@ public class ExecutorImpl implements Executor {
         } catch(Exception ex){
             incoming.setParam("status_code","9");
             incoming.setParam("status_desc","repoListIn exception " + ex.getMessage());
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
         if(incoming.paramsContains("repolistin")) {
             incoming.removeParam("repolistin");

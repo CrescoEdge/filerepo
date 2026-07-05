@@ -146,6 +146,10 @@ public class Plugin implements PluginService {
                 dbEngine = null;
             }
 
+            if(executor instanceof ExecutorImpl) {
+                ((ExecutorImpl) executor).cleanup();
+            }
+
             pluginBuilder.setExecutor(null);
             pluginBuilder.setIsActive(false);
         }

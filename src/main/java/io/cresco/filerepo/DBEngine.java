@@ -151,6 +151,44 @@ public class DBEngine {
         return repoFileList;
     }
 
+    /** Paginated catalog read (Derby OFFSET/FETCH). limit <= 0 returns the full list. */
+    public List<Map<String,String>> getRepoList(int limit, int offset) {
+        if (limit <= 0) return getRepoList();
+        List<Map<String,String>> repoFileList = new ArrayList<>();
+        String sql = "SELECT filepath, md5, lastmodified, filesize FROM filelist ORDER BY filepath " +
+                "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY";
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, Math.max(0, offset));
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    Map<String,String> fileMap = new HashMap<>();
+                    fileMap.put("filepath",rs.getString("filepath"));
+                    fileMap.put("md5",rs.getString("md5"));
+                    fileMap.put("lastmodified",rs.getString("lastmodified"));
+                    fileMap.put("filesize",rs.getString("filesize"));
+                    repoFileList.add(fileMap);
+                }
+            }
+        } catch(Exception ex) {
+            logger.error("getRepoList(limit,offset) error", ex);
+        }
+        return repoFileList;
+    }
+
+    public long getRepoCount() {
+        long count = 0;
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM filelist")) {
+            if (rs.next()) count = rs.getLong(1);
+        } catch(Exception ex) {
+            logger.error("getRepoCount error", ex);
+        }
+        return count;
+    }
+
     public Map<String,String> getFileInfo(String filePath) {
         Map<String,String> fileInfo = null;
         String sql = "SELECT filepath, md5, lastmodified, filesize FROM filelist WHERE filepath = ?";

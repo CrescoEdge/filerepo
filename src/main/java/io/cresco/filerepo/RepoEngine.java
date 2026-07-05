@@ -19,6 +19,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class RepoEngine {
@@ -60,6 +64,11 @@ public class RepoEngine {
     private List<String> listenerList;
     private String fileRepoName;
     private String repoDir;
+
+    // Bounded, named, daemon pool for peer-sync downloader threads (replaces unbounded new Thread()).
+    private final ExecutorService syncPool = new ThreadPoolExecutor(1, 8, 60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(),
+            r -> { Thread t = new Thread(r, "filerepo-sync"); t.setDaemon(true); return t; });
 
     public RepoEngine(PluginBuilder pluginBuilder, DBEngine dbEngine) {
 
@@ -135,18 +144,18 @@ public class RepoEngine {
                                 inScan.set(false);
 
                             } else {
-                                logger.error("\t\t ***ALREADY IN SCAN");
+                                logger.debug("already in scan");
                             }
                         } else {
-                            logger.error("\t\t ***FILE LOCATION " + scanDirString + " NO LONGER EXISTS");
+                            logger.warn("scan dir no longer exists: " + scanDirString);
                         }
 
                     } else {
-                        logger.error("NO ACTIVE");
+                        logger.debug("scan skipped: plugin not active");
                     }
 
                 } catch (Exception ex) {
-                    ex.printStackTrace();
+                    logger.error("filerepo error", ex);
                 }
             }
         };
@@ -163,11 +172,11 @@ public class RepoEngine {
                         repoBroadcast(fileRepoName,"discover", transferId);
 
                     } else {
-                        logger.error("NOT ACTIVE");
+                        logger.debug("broadcast skipped: plugin not active");
                     }
 
                 } catch (Exception ex) {
-                    ex.printStackTrace();
+                    logger.error("filerepo error", ex);
                 }
             }
         };
@@ -194,6 +203,7 @@ public class RepoEngine {
         for(String listenerid : listenerList) {
             plugin.getAgentService().getDataPlaneService().removeMessageListener(listenerid);
         }
+        try { syncPool.shutdownNow(); } catch (Exception ex) { logger.error("syncPool shutdown error", ex); }
 
     }
 
@@ -217,7 +227,7 @@ public class RepoEngine {
                 }
             }
         } catch(Exception e) {
-            e.printStackTrace();
+            logger.error("filerepo error", e);
         }
         return fileNames;
     }
@@ -229,6 +239,14 @@ public class RepoEngine {
         try {
 
             fileDiffMap = new HashMap<>();
+
+            // Load the catalog once (path -> lastmodified) so the per-file freshness check below is
+            // an in-memory lookup instead of a DB round-trip per file on every scan cycle.
+            Map<String,Long> catalogMtime = new HashMap<>();
+            for (Map<String,String> row : dbEngine.getRepoList()) {
+                try { catalogMtime.put(row.get("filepath"), Long.parseLong(row.get("lastmodified"))); }
+                catch (Exception ignore) { /* skip malformed row */ }
+            }
 
             File[] listOfFiles = null;
             boolean scanRecursive = plugin.getConfig().getBooleanParam("scan_recursive",true);
@@ -262,8 +280,8 @@ public class RepoEngine {
                         boolean add = false;
                         boolean update = false;
 
-                        //see if file is in the database
-                        long lastModifiedDb = dbEngine.getLastModified(filePath);
+                        //see if file is in the database (in-memory lookup from the pre-loaded catalog)
+                        long lastModifiedDb = catalogMtime.getOrDefault(filePath, -1L);
                         logger.trace("found file: " + filePath + " lastmodified: " + lastModified + " dblastmodified: " + lastModifiedDb);
                         if (lastModifiedDb == -1) {
                             add = true;
@@ -307,7 +325,7 @@ public class RepoEngine {
 
         }catch (Exception ex) {
             logger.error(ex.getMessage());
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
         return fileDiffMap;
     }
@@ -380,7 +398,7 @@ public class RepoEngine {
             }
 
         }catch (Exception ex) {
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
     }
 
@@ -395,7 +413,7 @@ public class RepoEngine {
 
         } catch (Exception ex) {
             logger.error(ex.getMessage());
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
 
     }
@@ -434,32 +452,31 @@ public class RepoEngine {
 
             if(startUpdater) {
                 logger.debug("starting new updater thread for repoId: " + repoId + " transfer id: " + transferId );
-                new Thread() {
-                    public void run() {
+                syncPool.submit(() -> {
                         try {
 
                             boolean workExist = true;
                             while(workExist && plugin.isActive()) {
 
-                                Map<String, String> update = null;
+                                Map<String, String> pendingUpdate = null;
 
                                 synchronized (lockPeerUpdateQueueMap) {
-                                    update = peerUpdateQueueMap.get(repoId).poll();
+                                    pendingUpdate = peerUpdateQueueMap.get(repoId).poll();
                                 }
 
-                                if(update == null) {
+                                if(pendingUpdate == null) {
 
                                     workExist = false;
 
                                 } else {
 
                                     //get the update
-                                    Map.Entry<String, String> entry = update.entrySet().iterator().next();
+                                    Map.Entry<String, String> entry = pendingUpdate.entrySet().iterator().next();
                                     String currentTransferId = entry.getKey();
-                                    String repoDiffString = entry.getValue();
+                                    String diffJson = entry.getValue();
 
                                     //extract file objects
-                                    Map<String,FileObject> remoteRepoFiles = gson.fromJson(repoDiffString, repoListType);
+                                    Map<String,FileObject> remoteRepoFiles = gson.fromJson(diffJson, repoListType);
 
                                     logger.debug("UPDATING " + repoId + " transferid: " + currentTransferId);
 
@@ -503,10 +520,9 @@ public class RepoEngine {
                             }
 
                         } catch (Exception v) {
-                            logger.error(v.getMessage());
+                            logger.error("filerepo sync updater error", v);
                         }
-                    }
-                }.start();
+                });
             }
 
 
@@ -524,17 +540,23 @@ public class RepoEngine {
     }
 
     public String getFileRepoString(String repoName) {
+        return getFileRepoString(repoName, 0, 0);
+    }
+
+    /** limit <= 0 returns the whole catalog; otherwise a page (Derby OFFSET/FETCH). */
+    public String getFileRepoString(String repoName, int limit, int offset) {
         String repoString = null;
         try {
-
-            List<Map<String,String>> repoFileList = dbEngine.getRepoList();
+            List<Map<String,String>> repoFileList = dbEngine.getRepoList(limit, offset);
             repoString = gson.toJson(repoFileList);
-            logger.debug("repoList: " + repoString);
-
         } catch (Exception ex) {
             logger.error("getFileRepoString: " + ex.getMessage());
         }
         return repoString;
+    }
+
+    public long getRepoCount() {
+        return dbEngine.getRepoCount();
     }
 
     public Boolean clearRepo() {
@@ -576,7 +598,13 @@ public class RepoEngine {
         boolean isRemoved = false;
         try {
 
-            File checkFile = Paths.get(getRepoDir().getAbsolutePath() + "/" + fileName).toFile();
+            File repoRoot = getRepoDir();
+            File checkFile = new File(repoRoot, fileName).getCanonicalFile();
+            // path-traversal guard: the resolved target must stay inside the repo directory
+            if (!checkFile.toPath().startsWith(repoRoot.getCanonicalFile().toPath())) {
+                logger.error("path traversal blocked in removeFile: " + fileName);
+                return false;
+            }
             if(checkFile.exists()) {
                 int deleteStatus = dbEngine.deleteFile(checkFile.getAbsolutePath());
                 logger.debug("delete status: " + deleteStatus);
@@ -647,7 +675,7 @@ public class RepoEngine {
 
 
         } catch(Exception ex){
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
 
         return isUploaded;
@@ -711,7 +739,7 @@ public class RepoEngine {
                     }
                 } catch(Exception ex) {
 
-                    ex.printStackTrace();
+                    logger.error("filerepo error", ex);
                 }
             }
         };
@@ -817,7 +845,7 @@ public class RepoEngine {
                     }
                 } catch(Exception ex) {
 
-                    ex.printStackTrace();
+                    logger.error("filerepo error", ex);
                 }
             }
         };
@@ -923,7 +951,7 @@ public class RepoEngine {
             }
 
         } catch(Exception ex) {
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
         return repoDir;
     }
@@ -945,7 +973,7 @@ public class RepoEngine {
             }
 
         } catch(Exception ex) {
-            ex.printStackTrace();
+            logger.error("filerepo error", ex);
         }
         return repoDir;
     }
