@@ -431,24 +431,24 @@ public class ExecutorImpl implements Executor {
                         boolean isActive = true;
                         while((byteLength > 0) && (isActive)){
                             BytesMessage updateMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
-                            read = BUFFER_SIZE;
-                            if(byteLength < BUFFER_SIZE) {
-                                read = (int)byteLength;
-                            }
-                            raf.read(buffer);
-                            updateMessage.writeBytes(buffer, 0, read);
+                            read = (int) Math.min((long) BUFFER_SIZE, byteLength);
+                            // Honor the ACTUAL bytes read: RandomAccessFile.read() may return a short
+                            // read (< requested), and writing the requested `read` length regardless
+                            // shipped stale buffer bytes -> corrupted transfers. Use `got` downstream.
+                            int got = raf.read(buffer, 0, read);
+                            if (got <= 0) { break; }
+                            updateMessage.writeBytes(buffer, 0, got);
                             updateMessage.setStringProperty(transferInfo.get("ident_key"), transferInfo.get("ident_id"));
                             updateMessage.setStringProperty("transfer_id", transferId);
                             updateMessage.setStringProperty("seq_num", String.valueOf(seqNum));
                             //logger.error("ADDING SEQ: " + seqNum + " transfer_id: " + transferId);
                             plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
-                            //logger.error("WRITING " + read + " BYTES FOR " + transferId);
-                            byteLength = byteLength - read;
+                            byteLength = byteLength - got;
                             seqNum += 1;
 
                             synchronized (transferLock) {
                                 if(transferStreams.containsKey(transferId)) {
-                                    transferStreams.get(transferId).setBytesTransfered(transferStreams.get(transferId).getBytesTransfered() + read);
+                                    transferStreams.get(transferId).setBytesTransfered(transferStreams.get(transferId).getBytesTransfered() + got);
                                     isActive = transferStreams.get(transferId).isActive();
                                     //logger.error("streamFile transferId: " + transferId + " bytesTransfered: " + transferStreams.get(transferId).getBytesTransfered());
 
@@ -479,9 +479,11 @@ public class ExecutorImpl implements Executor {
                             }
                         }
                     } finally {
-                        //synchronized (transferLock) {
-                        //    transferStreams.remove(transferId);
-                        //}
+                        // Remove the finished/failed transfer so the map doesn't grow unbounded
+                        // (this cleanup was previously commented out -> a memory leak per transfer).
+                        synchronized (transferLock) {
+                            transferStreams.remove(transferId);
+                        }
                     }
                 }
             }.start();
@@ -556,10 +558,9 @@ public class ExecutorImpl implements Executor {
     }
 
     private MsgEvent streamFileCancel(MsgEvent incoming) {
-        logger.error("streamFileCancel STREAM FILE CANCEL");
         try {
             incoming.setParam("status_code","9");
-            logger.error("transferid: " + incoming.getParam("transfer_id") + " END");
+            logger.debug("streamFileCancel transferid: " + incoming.getParam("transfer_id"));
 
             if(incoming.paramsContains("transfer_id")) {
                 String transferId = incoming.getParam("transfer_id");

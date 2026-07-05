@@ -579,7 +579,7 @@ public class RepoEngine {
             File checkFile = Paths.get(getRepoDir().getAbsolutePath() + "/" + fileName).toFile();
             if(checkFile.exists()) {
                 int deleteStatus = dbEngine.deleteFile(checkFile.getAbsolutePath());
-                logger.error("delete status: " + deleteStatus);
+                logger.debug("delete status: " + deleteStatus);
                 isRemoved = checkFile.delete();
             }
 

@@ -8,8 +8,6 @@ import org.apache.commons.pool2.impl.GenericObjectPool;
 
 import javax.sql.DataSource;
 import java.io.File;
-import java.io.PrintWriter;
-import java.io.StringWriter;
 import java.nio.file.Paths;
 import java.sql.*;
 import java.util.ArrayList;
@@ -48,83 +46,50 @@ public class DBEngine {
 
             String dbDriver = plugin.getConfig().getStringParam("db_driver", "org.apache.derby.jdbc.EmbeddedDriver");
             String dbConnectionString = plugin.getConfig().getStringParam("db_jdbc", "jdbc:derby:" + dbsource.getAbsolutePath()  + ";create=true");
-            //String dbConnectionString = plugin.getConfig().getStringParam("db_jdbc", "jdbc:hsqldb:" + dbsource2.getAbsolutePath() + ";ifexists=false");
 
             Class.forName(dbDriver);
-            //Class.forName("org.hsqldb.jdbc.JDBCDriver");
 
             ds = setupDataSource(dbConnectionString);
 
-                    if (dbsource.exists()) {
-                        logger.debug("DB SOURCE EXIST: " + dbsource.getAbsolutePath() );
-                    } else {
-                        //dbsource.mkdir();
-                        logger.debug("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
-                        initDB();
-                    }
-
+            if (dbsource.exists()) {
+                logger.debug("DB SOURCE EXIST: " + dbsource.getAbsolutePath() );
+            } else {
+                logger.debug("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
+                initDB();
+            }
 
         } catch (Exception ex) {
-            ex.printStackTrace();
+            logger.error("DBEngine init failed", ex);
         }
     }
 
     public boolean shutdown() {
         boolean isShutdown = false;
         try {
-
-            //shutdown database, catch acception
             try {
-                //shutdown the database
-                //String shutdownString =  "jdbc:derby:" + dbPath + ";shutdown=true";
                 if(dbsource.exists()) {
                     String shutdownString = "jdbc:derby:" + dbsource.getAbsolutePath() + ";shutdown=true";
-                    //String shutdownString = "jdbc:derby:;shutdown=true";
                     DriverManager.getConnection(shutdownString);
 
-                    //shutdown connections
                     dataSource.close();
                     connectionPool.close();
-
                 }
             } catch (SQLException e) {
-                if (e.getErrorCode() == 50000) {
-                /*
-                XJ015 (with SQLCODE 50000) is the expected (successful)
-                SQLSTATE for complete system shutdown. 08006 (with SQLCODE 45000), on the other hand, is the expected SQLSTATE for shutdown of only an individual database.
-                 */
+                // XJ015 (SQLCODE 50000) = full system shutdown; 08006 (45000) = single db shutdown. Both expected.
+                if (e.getErrorCode() == 50000 || e.getErrorCode() == 45000) {
                     isShutdown = true;
-
-                } else if (e.getErrorCode() == 45000) {
-                    isShutdown = true;
-
                 } else {
-                    e.printStackTrace();
+                    logger.error("DBEngine shutdown error", e);
                 }
             }
-            //unload drivers
-            //DriverManager.getConnection("jdbc:derby:;shutdown=true");
-            //Driver d= new org.apache.derby.jdbc.EmbeddedDriver();
-            //Driver d= new org.hsqldb.jdbc.JDBCDriver();
-            //DriverManager.deregisterDriver(d);
-
-            //Driver da= new org.apache.derby.jdbc.AutoloadedDriver();
-            //DriverManager.deregisterDriver(da);
-
         }
         catch (Exception ex) {
-            ex.printStackTrace();
+            logger.error("DBEngine shutdown error", ex);
         }
         return isShutdown;
     }
 
-
     public void initDB() {
-
-//ControllerState.Mode currentMode, String currentDesc, String globalRegion, String globalAgent, String regionalRegion, String regionalAgent, String localRegion, String localAgent
-
-        String largeFieldType = "clob";
-
 
         String createFileList = "CREATE TABLE filelist" +
                 "(" +
@@ -135,344 +100,185 @@ public class DBEngine {
                 "   filesize varchar(255)" +
                 ")";
 
-
-        try {
-            try(Connection conn = ds.getConnection()) {
-                try (Statement stmt = conn.createStatement()) {
-                    stmt.executeUpdate(createFileList);
-                    stmt.close();
-                }
-                conn.close();
-            }
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate(createFileList);
         } catch(Exception ex) {
-            ex.printStackTrace();
+            logger.error("initDB error", ex);
         }
     }
 
+    // All mutating/lookup statements are parameterized (PreparedStatement): file paths and MD5s
+    // are external input and were previously concatenated into SQL — a correctness bug (any path
+    // containing a quote broke the query) and an injection vector. Parameter binding also lets
+    // Derby cache the query plan across the per-file scan loop.
+
     public void addFile(String filepath, String md5, long lastmodified, long filesize) {
-
-        try {
-
-            //Timestamp timestamp = new Timestamp(lastmodified);
-            try (Connection conn = ds.getConnection()) {
-                conn.setAutoCommit(false);
-
-                try (Statement stmt = conn.createStatement()) {
-
-                    String insertFilePathString = "insert into filelist (filepath, md5, insync, lastmodified, filesize) " +
-                            "values ('" + filepath + "','" + md5 + "'," + 0 + ",'" + String.valueOf(lastmodified) + "','" + String.valueOf(filesize) +"')";
-
-                    stmt.executeUpdate(insertFilePathString);
-                    conn.commit();
-                    stmt.close();
-                }
-                conn.close();
-
+        String sql = "insert into filelist (filepath, md5, insync, lastmodified, filesize) values (?,?,?,?,?)";
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, filepath);
+                ps.setString(2, md5);
+                ps.setInt(3, 0);
+                ps.setString(4, String.valueOf(lastmodified));
+                ps.setString(5, String.valueOf(filesize));
+                ps.executeUpdate();
+                conn.commit();
             }
-
         } catch(Exception ex) {
-            ex.printStackTrace();
+            logger.error("addFile error for " + filepath, ex);
         }
-
     }
 
     public List<Map<String,String>> getRepoList() {
-        List<Map<String,String>> repoFileList = null;
-        try {
-
-            repoFileList = new ArrayList<>();
-
-            String queryString = "SELECT filepath, md5, lastmodified, filesize FROM filelist";
-
-            //logger.error("QUERY: " + queryString);
-
-            try (Connection conn = ds.getConnection()) {
-                try (Statement stmt = conn.createStatement()) {
-
-                    try(ResultSet rs = stmt.executeQuery(queryString)) {
-
-                        while (rs.next()) {
-                            Map<String,String> fileMap = new HashMap<>();
-                            fileMap.put("filepath",rs.getString("filepath"));
-                            fileMap.put("md5",rs.getString("md5"));
-                            fileMap.put("lastmodified",rs.getString("lastmodified"));
-                            fileMap.put("filesize",rs.getString("filesize"));
-                            repoFileList.add(fileMap);
-                        }
-
-                        rs.close();
-                    }
-
-                    stmt.close();
-                }
-
-                conn.close();
+        List<Map<String,String>> repoFileList = new ArrayList<>();
+        String sql = "SELECT filepath, md5, lastmodified, filesize FROM filelist";
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                Map<String,String> fileMap = new HashMap<>();
+                fileMap.put("filepath",rs.getString("filepath"));
+                fileMap.put("md5",rs.getString("md5"));
+                fileMap.put("lastmodified",rs.getString("lastmodified"));
+                fileMap.put("filesize",rs.getString("filesize"));
+                repoFileList.add(fileMap);
             }
-
         } catch(Exception ex) {
-            ex.printStackTrace();
-            System.out.println(ex.getMessage());
-            StringWriter errors = new StringWriter();
-            ex.printStackTrace(new PrintWriter(errors));
-            System.out.println(errors.toString());
+            logger.error("getRepoList error", ex);
         }
-
         return repoFileList;
     }
 
     public Map<String,String> getFileInfo(String filePath) {
         Map<String,String> fileInfo = null;
-        try {
-
-            String queryString = "SELECT filepath, md5, lastmodified, filesize FROM filelist WHERE filepath = '" + filePath + "'";
-
-            try (Connection conn = ds.getConnection()) {
-                try (Statement stmt = conn.createStatement()) {
-
-                    try(ResultSet rs = stmt.executeQuery(queryString)) {
-
-                        if(rs.next()) {
-                            fileInfo = new HashMap<>();
-                            fileInfo.put("filepath", rs.getString("filepath"));
-                            fileInfo.put("md5", rs.getString("md5"));
-                            fileInfo.put("lastmodified", rs.getString("lastmodified"));
-                            fileInfo.put("filesize", rs.getString("filesize"));
-                        }
-
-                        rs.close();
-                    }
-
-                    stmt.close();
+        String sql = "SELECT filepath, md5, lastmodified, filesize FROM filelist WHERE filepath = ?";
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, filePath);
+            try (ResultSet rs = ps.executeQuery()) {
+                if(rs.next()) {
+                    fileInfo = new HashMap<>();
+                    fileInfo.put("filepath", rs.getString("filepath"));
+                    fileInfo.put("md5", rs.getString("md5"));
+                    fileInfo.put("lastmodified", rs.getString("lastmodified"));
+                    fileInfo.put("filesize", rs.getString("filesize"));
                 }
-
-                conn.close();
             }
-
         } catch(Exception ex) {
-            ex.printStackTrace();
-            System.out.println(ex.getMessage());
-            StringWriter errors = new StringWriter();
-            ex.printStackTrace(new PrintWriter(errors));
-            System.out.println(errors.toString());
+            logger.error("getFileInfo error for " + filePath, ex);
         }
-
         return fileInfo;
     }
 
-
     public long getLastModified(String filepath) {
         long lastModified = -1;
-        try {
-
-            String queryString = "SELECT lastmodified FROM filelist WHERE filepath = '" + filepath +"'";
-
-            //logger.error("QUERY: " + queryString);
-
-            try (Connection conn = ds.getConnection()) {
-                try (Statement stmt = conn.createStatement()) {
-
-                    try(ResultSet rs = stmt.executeQuery(queryString)) {
-
-                        if (rs.next()) {
-                            lastModified = rs.getLong(1);
-                        }
-
-                        rs.close();
-                    }
-                    stmt.close();
+        String sql = "SELECT lastmodified FROM filelist WHERE filepath = ?";
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, filepath);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    lastModified = rs.getLong(1);
                 }
-                conn.close();
             }
-
         } catch(Exception ex) {
-            ex.printStackTrace();
-            System.out.println(ex.getMessage());
-            StringWriter errors = new StringWriter();
-            ex.printStackTrace(new PrintWriter(errors));
-            System.out.println(errors.toString());
+            logger.error("getLastModified error for " + filepath, ex);
         }
-
         return lastModified;
     }
 
     public long getFileSize(String filepath) {
         long filesize = -1;
-        try {
-
-            String queryString = "SELECT filesize FROM filelist WHERE filepath = '" + filepath +"'";
-
-            //logger.error("QUERY: " + queryString);
-
-            try (Connection conn = ds.getConnection()) {
-                try (Statement stmt = conn.createStatement()) {
-
-                    try(ResultSet rs = stmt.executeQuery(queryString)) {
-
-                        if (rs.next()) {
-                            filesize = rs.getLong(1);
-                        }
-
-                        rs.close();
-                    }
-
-                    stmt.close();
+        String sql = "SELECT filesize FROM filelist WHERE filepath = ?";
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, filepath);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    filesize = rs.getLong(1);
                 }
-
-                conn.close();
             }
-
         } catch(Exception ex) {
-            ex.printStackTrace();
-            System.out.println(ex.getMessage());
-            StringWriter errors = new StringWriter();
-            ex.printStackTrace(new PrintWriter(errors));
-            System.out.println(errors.toString());
+            logger.error("getFileSize error for " + filepath, ex);
         }
-
         return filesize;
     }
 
     public String getMD5(String filepath) {
         String md5 = null;
-        try {
-
-            String queryString = "SELECT md5 FROM filelist WHERE filepath = '" + filepath +"'";
-
-            //logger.error("QUERY: " + queryString);
-
-            try (Connection conn = ds.getConnection()) {
-                try (Statement stmt = conn.createStatement()) {
-
-                    try(ResultSet rs = stmt.executeQuery(queryString)) {
-
-                        if (rs.next()) {
-                            md5 = rs.getString(1);
-                        }
-
-                        rs.close();
-                    }
-
-                    stmt.close();
+        String sql = "SELECT md5 FROM filelist WHERE filepath = ?";
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, filepath);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    md5 = rs.getString(1);
                 }
-                
-                conn.close();
             }
-
         } catch(Exception ex) {
-            ex.printStackTrace();
-            System.out.println(ex.getMessage());
-            StringWriter errors = new StringWriter();
-            ex.printStackTrace(new PrintWriter(errors));
-            System.out.println(errors.toString());
+            logger.error("getMD5 error for " + filepath, ex);
         }
-
         return md5;
     }
 
     public int updateFile(String filepath, String md5, int insync, long lastmodified, long filesize) {
         int queryReturn = -1;
-        try {
-
-            String queryString = null;
-            queryString = "UPDATE filelist SET filepath='" + filepath + "', md5='" + md5 + "', insync=" + insync + ", filesize='" + String.valueOf(filesize) + "', lastmodified='" + String.valueOf(lastmodified) + "'"
-                    + " WHERE filepath='" + filepath + "'";
-
-            try (Connection conn = ds.getConnection()) {
-                try (Statement stmt = conn.createStatement()) {
-
-                    queryReturn = stmt.executeUpdate(queryString);
-
-                    stmt.close();
-                }
-                conn.close();
-            }
-
-
+        String sql = "UPDATE filelist SET md5=?, insync=?, filesize=?, lastmodified=? WHERE filepath=?";
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, md5);
+            ps.setInt(2, insync);
+            ps.setString(3, String.valueOf(filesize));
+            ps.setString(4, String.valueOf(lastmodified));
+            ps.setString(5, filepath);
+            queryReturn = ps.executeUpdate();
         } catch(Exception ex) {
-            ex.printStackTrace();
+            logger.error("updateFile error for " + filepath, ex);
         }
         return queryReturn;
     }
 
     public int deleteFile(String filepath) {
         int queryReturn = -1;
-        try {
-
-            String queryString = null;
-            queryString = "DELETE FROM filelist WHERE filepath='" + filepath + "'";
-
-            try (Connection conn = ds.getConnection()) {
-                try (Statement stmt = conn.createStatement()) {
-                    queryReturn = stmt.executeUpdate(queryString);
-                    stmt.close();
-                }
-                conn.close();
-            }
-
+        String sql = "DELETE FROM filelist WHERE filepath=?";
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, filepath);
+            queryReturn = ps.executeUpdate();
         } catch(Exception ex) {
-            ex.printStackTrace();
+            logger.error("deleteFile error for " + filepath, ex);
         }
         return queryReturn;
     }
 
     ///
 
-
     public DataSource setupDataSource(String connectURI) {
         return setupDataSource(connectURI,null,null);
     }
 
     public DataSource setupDataSource(String connectURI, String login, String password) {
-        //
-        // First, we'll create a ConnectionFactory that the
-        // pool will use to create Connections.
-        // We'll use the DriverManagerConnectionFactory,
-        // using the connect string passed in the command line
-        // arguments.
-        //
-        ConnectionFactory connectionFactory = null;
+        ConnectionFactory connectionFactory;
         if((login == null) && (password == null)) {
             connectionFactory = new DriverManagerConnectionFactory(connectURI, null);
         } else {
-            connectionFactory = new DriverManagerConnectionFactory(connectURI,
-                    login, password);
+            connectionFactory = new DriverManagerConnectionFactory(connectURI, login, password);
         }
 
-
-        //
-        // Next we'll create the PoolableConnectionFactory, which wraps
-        // the "real" Connections created by the ConnectionFactory with
-        // the classes that implement the pooling functionality.
-        //
         poolableConnectionFactory =
                 new PoolableConnectionFactory(connectionFactory, null);
 
-
-
-        //
-        // Now we'll need a ObjectPool that serves as the
-        // actual pool of connections.
-        //
-        // We'll use a GenericObjectPool instance, although
-        // any ObjectPool implementation will suffice.
-        //
         connectionPool =
                 new GenericObjectPool<>(poolableConnectionFactory);
 
-        // Set the factory's pool property to the owning pool
         poolableConnectionFactory.setPool(connectionPool);
 
-
-
-        //
-        // Finally, we create the PoolingDriver itself,
-        // passing in the object pool we created.
-        //
         dataSource =
                 new PoolingDataSource<>(connectionPool);
 
         return dataSource;
     }
-
 
 }
