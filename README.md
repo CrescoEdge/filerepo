@@ -117,7 +117,24 @@ are base64 in the reply.
 | `clearrepo` | `repo_name` | `status` | Delete all files in a repo (disk + catalog). |
 | `repolistin` | `repolistin` (json diff), `transfer_id` | `status_code` | Sync consumer side — receive a producer's diff and pull changed files. |
 | `repoconfirm` | `transfer_id` | — | Sync handshake ack. |
+| `getmetrics` | — | `metrics` (json) | Central metrics — `MeasurementEngine` gauges (`filerepo.files.count`, `filerepo.active.transfers`). Folded into the controller's `getmetricinventory`. |
 | `getcapabilities` | — | `capabilities` (json) | Self-describing capability document (LLM tool specs). |
+
+## Central health & metrics
+
+filerepo is wired into Cresco's two central observability systems — the **same mechanisms every
+other plugin uses** (sysinfo is the reference), so metrics and health are consistent fabric-wide:
+
+- **Metrics** — a unified `MeasurementEngine` exposes `filerepo.files.count` (catalog size) and
+  `filerepo.active.transfers` (in-flight `streamfile` count) as gauges. The `getmetrics` action
+  returns the standard `getAllMetrics()` JSON, which the controller's `getmetricinventory` fan-out
+  aggregates across the mesh. Query one node with `getmetrics`, or the whole fabric with
+  `getmetricinventory` (`action_scope=node|region|global`).
+- **Health** — a `FileRepoHealthCheck` (`org.apache.felix.hc.api.HealthCheck`, tag `local`) is
+  registered as an OSGi service and auto-discovered by the controller's `CrescoHealthExecutor`. It
+  reports `OK` with the catalog size and verifies the repo directory is writable (`WARN` if not),
+  self-guarding to `TEMPORARILY_UNAVAILABLE` while starting. It shows up in the health summary and
+  in the controller's `gethealthinventory` action (the queryable parallel of `getmetricinventory`).
 
 ## Configuration
 

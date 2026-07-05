@@ -4,6 +4,8 @@ import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
 import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
+import io.cresco.library.metrics.CMetric;
+import io.cresco.library.metrics.MeasurementEngine;
 import io.cresco.library.plugin.Executor;
 import io.cresco.library.plugin.PluginBuilder;
 import io.cresco.library.utilities.CLogger;
@@ -94,6 +96,10 @@ import io.cresco.library.capability.*;
     @CrescoAction(name = "repoconfirm", type = "EXEC",
         summary = "Acknowledge a peer received a transfer generation.", why = "Sync handshake.",
         params = @CrescoParam(name = "transfer_id", required = true)),
+    @CrescoAction(name = "getmetrics", type = "EXEC",
+        summary = "Return filerepo metrics (cataloged file count, in-flight transfers) as MeasurementEngine gauges JSON.",
+        why = "Standard cross-bundle metrics contract; folded into the controller's getmetricinventory.",
+        returns = @CrescoReturn(name = "metrics", type = "object", description = "getAllMetrics() JSON")),
     @CrescoAction(name = "getcapabilities", type = "EXEC",
         summary = "Return this plugin's self-describing capability document (its message actions as LLM tool specs).",
         why = "Discovery: lets a client/LLM learn what this plugin can do and how to call it.",
@@ -110,6 +116,10 @@ public class ExecutorImpl implements Executor {
     private final AtomicBoolean transferLock = new AtomicBoolean();
 
     private Map<String,StreamObject> transferStreams;
+
+    // B-2 unified metrics: filerepo catalog size / in-flight transfers as MeasurementEngine gauges,
+    // exposed via the standard getmetrics EXEC so they fold into the controller's metric inventory.
+    private MeasurementEngine metricEngine;
 
     // Bounded, named, daemon pool for byte-range streamers (replaces unbounded `new Thread()` per
     // transfer). Safeguards: inline reads (getfile/getjar) are capped to keep them off the heap for
@@ -147,6 +157,32 @@ public class ExecutorImpl implements Executor {
             transferPool.shutdownNow();
         } catch (Exception ex) {
             logger.error("transferPool shutdown error", ex);
+        }
+        try {
+            if (metricEngine != null) metricEngine.shutdown();
+        } catch (Exception ex) {
+            logger.error("metricEngine shutdown error", ex);
+        }
+    }
+
+    /** Unified metrics payload — standard getAllMetrics() shape the metric inventory expects. */
+    private synchronized String getMetricsJson() {
+        try {
+            if (metricEngine == null) {
+                metricEngine = new MeasurementEngine(plugin);
+                metricEngine.setGauge("filerepo.files.count", "files tracked in the local repo catalog", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.active.transfers", "in-flight streamfile transfers", "filerepo", CMetric.MeasureClass.GAUGE_INT);
+            }
+            long fileCount = 0L;
+            try { fileCount = repoEngine.getRepoCount(); } catch (Exception ignore) {}
+            int active;
+            synchronized (transferLock) { active = transferStreams.size(); }
+            metricEngine.updateLongGauge("filerepo.files.count", fileCount);
+            metricEngine.updateIntGauge("filerepo.active.transfers", active);
+            return gson.toJson(metricEngine.getAllMetrics());
+        } catch (Exception ex) {
+            logger.error("getMetricsJson() " + ex.getMessage(), ex);
+            return "{}";
         }
     }
 
@@ -196,6 +232,11 @@ public class ExecutorImpl implements Executor {
                 case "repoconfirm":
                     confirmTransfer(incoming);
                     break;
+                case "getmetrics":
+                    // B-2 unified metrics: filerepo catalog / transfer gauges
+                    incoming.setParam("metrics", getMetricsJson());
+                    incoming.setParam("status", "10");
+                    return incoming;
                 case "getcapabilities":
                     return CapabilityResponder.respond(incoming, this);
 
