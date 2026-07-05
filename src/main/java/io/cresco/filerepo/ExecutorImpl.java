@@ -117,6 +117,8 @@ public class ExecutorImpl implements Executor {
     private final ExecutorService transferPool;
     private final long maxInlineBytes;
     private final int defaultStreamBuffer;
+    // Hard ceiling on a streamfile chunk: it + its framing header must fit one dataplane frame.
+    private static final int MAX_STREAM_BUFFER = 786432; // 768 KB
 
     public ExecutorImpl(PluginBuilder pluginBuilder, RepoEngine repoEngine) {
         this.plugin = pluginBuilder;
@@ -130,7 +132,12 @@ public class ExecutorImpl implements Executor {
         this.transferPool = new ThreadPoolExecutor(1, maxThreads, 60L, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(),
                 r -> { Thread t = new Thread(r, "filerepo-transfer"); t.setDaemon(true); return t; });
-        this.maxInlineBytes = plugin.getConfig().getLongParam("max_inline_bytes", 104857600L); // 100 MB
+        // Inline getfile returns the whole file in ONE control-plane RPC message, which the wss
+        // frame caps at ~1MB (base64-inflated). Default the cap BELOW that so getfile can never
+        // produce an oversized frame; anything larger returns status 5 -> use streamfile (which
+        // has no size limit — it byte-ranges over the dataplane in chunks). Raise this only if the
+        // wsapi frame limit is also raised.
+        this.maxInlineBytes = plugin.getConfig().getLongParam("max_inline_bytes", 524288L); // 512 KB
         this.defaultStreamBuffer = (int)(long) plugin.getConfig().getLongParam("stream_buffer_size", 262144L); // 256 KB
     }
 
@@ -576,11 +583,16 @@ public class ExecutorImpl implements Executor {
                             fileInfo.put("ident_key", incoming.getParam("ident_key"));
                             fileInfo.put("ident_id", incoming.getParam("ident_id"));
 
-                            String bufferSizeStr = incoming.getParam("buffer_size");
-                            if (bufferSizeStr == null) {
-                                bufferSizeStr = String.valueOf(defaultStreamBuffer);
-                            }
-                            fileInfo.put("buffer_size", bufferSizeStr);
+                            // Clamp the chunk size: each chunk carries a small framing header and must
+                            // stay under the dataplane frame limit, else chunks are silently dropped.
+                            // A caller passing an oversized buffer_size must not be able to break the
+                            // transfer — cap it (and floor it) to a safe range.
+                            int reqBuf = defaultStreamBuffer;
+                            try { if (incoming.getParam("buffer_size") != null) reqBuf = Integer.parseInt(incoming.getParam("buffer_size")); }
+                            catch (Exception ignore) { }
+                            if (reqBuf > MAX_STREAM_BUFFER) reqBuf = MAX_STREAM_BUFFER;
+                            if (reqBuf < 4096) reqBuf = 4096;
+                            fileInfo.put("buffer_size", String.valueOf(reqBuf));
 
                             //transfer in new thread, send recept
                             streamFile(fileInfo);

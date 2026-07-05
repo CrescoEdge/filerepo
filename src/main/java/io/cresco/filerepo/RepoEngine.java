@@ -298,6 +298,13 @@ public class RepoEngine {
                         String MD5hash = null;
                         if (add || update) {
                             MD5hash = plugin.getMD5(filePath);
+                            // Skip files we can't safely catalog: a null md5 means the file vanished
+                            // mid-scan (getMD5 failed); a path longer than the catalog column would
+                            // fail the insert. Skipping keeps one bad file from wedging the scan.
+                            if (MD5hash == null || filePath.length() > 1000) {
+                                logger.warn("skipping uncatalogable file (null md5 or path>1000): " + filePath);
+                                continue;
+                            }
                             logger.trace("generate MD5 for fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
                             FileObject fileObject = new FileObject(fileName, MD5hash, filePath, lastModified, filesize);
                             fileDiffMap.put(filePath, fileObject);
