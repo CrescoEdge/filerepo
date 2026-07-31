@@ -272,7 +272,16 @@ public class RepoEngine {
             if(listOfFiles != null) {
                 for (int i = 0; i < listOfFiles.length; i++) {
                     if (listOfFiles[i].isFile()) {
-                        String fileName = listOfFiles[i].getName();
+                        // In recursive mode use the path RELATIVE to scan_dir so nested directory
+                        // structure is preserved on the consumer (the consumer creates parent dirs);
+                        // getName() alone would flatten every subdir file to its basename and collide.
+                        String fileName;
+                        if (scanRecursive) {
+                            fileName = Paths.get(scanDirString).toAbsolutePath()
+                                    .relativize(listOfFiles[i].toPath().toAbsolutePath()).toString();
+                        } else {
+                            fileName = listOfFiles[i].getName();
+                        }
                         String filePath = listOfFiles[i].getAbsolutePath();
                         long lastModified = listOfFiles[i].lastModified();
                         long filesize = listOfFiles[i].length();
@@ -506,8 +515,23 @@ public class RepoEngine {
                                         }
 
                                         if(downloadFile) {
+                                            // create parent dirs so nested (recursive) repo layouts sync,
+                                            // not just flat top-level files.
+                                            try {
+                                                Path parent = localPath.toAbsolutePath().getParent();
+                                                if (parent != null) Files.createDirectories(parent);
+                                            } catch (Exception mkdirEx) {
+                                                logger.warn("could not create parent dir for " + localPath + ": " + mkdirEx.getMessage());
+                                            }
                                             Path tmpFile = plugin.getAgentService().getDataPlaneService().downloadRemoteFile(region, agent, fileObject.filePath, localPath.toFile().getAbsolutePath());
-                                            logger.debug("Synced " + tmpFile.toFile().getAbsolutePath());
+                                            // A null return means this one file's transfer failed. Skip it and keep
+                                            // going: one bad/slow file must not NPE-abort the whole batch (which would
+                                            // wedge sync forever). Missing files stay in the diff and retry next cycle.
+                                            if (tmpFile == null) {
+                                                logger.warn("filerepo download returned null, will retry next cycle: " + fileObject.filePath);
+                                            } else {
+                                                logger.debug("Synced " + tmpFile.toFile().getAbsolutePath());
+                                            }
                                         }
 
                                     }
