@@ -151,6 +151,27 @@ public class DBEngine {
         return repoFileList;
     }
 
+    /** Catalog rows never confirmed downloaded by a subscriber (insync=0); drives re-offer. */
+    public List<Map<String,String>> getFilesNotInSync() {
+        List<Map<String,String>> repoFileList = new ArrayList<>();
+        String sql = "SELECT filepath, md5, lastmodified, filesize FROM filelist WHERE insync = 0";
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                Map<String,String> fileMap = new HashMap<>();
+                fileMap.put("filepath",rs.getString("filepath"));
+                fileMap.put("md5",rs.getString("md5"));
+                fileMap.put("lastmodified",rs.getString("lastmodified"));
+                fileMap.put("filesize",rs.getString("filesize"));
+                repoFileList.add(fileMap);
+            }
+        } catch(Exception ex) {
+            logger.error("getFilesNotInSync error", ex);
+        }
+        return repoFileList;
+    }
+
     /** Paginated catalog read (Derby OFFSET/FETCH). limit <= 0 returns the full list. */
     public List<Map<String,String>> getRepoList(int limit, int offset) {
         if (limit <= 0) return getRepoList();

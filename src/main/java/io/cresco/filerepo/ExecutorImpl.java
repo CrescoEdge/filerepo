@@ -696,7 +696,7 @@ public class ExecutorImpl implements Executor {
 
 
     private void confirmTransfer(MsgEvent incoming) {
-        repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
+        repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getCompressedParam("failedfiles"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
     }
 
     private MsgEvent putFileRemote(MsgEvent incoming) {

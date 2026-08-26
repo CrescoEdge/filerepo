@@ -40,6 +40,14 @@ public class RepoEngine {
 
     private AtomicBoolean lockPeerVersionMap = new AtomicBoolean();
     private Map<String, String> peerVersionMap;
+    // transferId -> the files offered in that transfer; consumed by confirmTransfer() so insync=1
+    // is only recorded once a subscriber confirms verified downloads (bounded: oldest evicted)
+    private final Map<String, Map<String, FileObject>> pendingTransferMap =
+            Collections.synchronizedMap(new LinkedHashMap<String, Map<String, FileObject>>() {
+                protected boolean removeEldestEntry(Map.Entry<String, Map<String, FileObject>> eldest) {
+                    return size() > 64;
+                }
+            });
 
     private AtomicBoolean lockPeerUpdateStateMap = new AtomicBoolean();
     private Map<String, Boolean> peerUpdateStateMap;
@@ -339,6 +347,34 @@ public class RepoEngine {
                 }
             }
 
+            // Re-offer catalog rows no subscriber has confirmed (insync=0): the FS-vs-DB diff
+            // above only sees NEW or MODIFIED files, so a failed download would otherwise become
+            // a permanent silent gap (receivers md5-skip files they already hold, so this is cheap).
+            boolean reofferRecursive = plugin.getConfig().getBooleanParam("scan_recursive",true);
+            for (Map<String,String> row : dbEngine.getFilesNotInSync()) {
+                String filePath = row.get("filepath");
+                if (fileDiffMap.containsKey(filePath)) {
+                    continue;
+                }
+                File unsyncedFile = new File(filePath);
+                if (!unsyncedFile.isFile()) {
+                    continue;
+                }
+                String reofferName;
+                if (reofferRecursive) {
+                    reofferName = Paths.get(scanDirString).toAbsolutePath()
+                            .relativize(unsyncedFile.toPath().toAbsolutePath()).toString();
+                } else {
+                    reofferName = unsyncedFile.getName();
+                }
+                try {
+                    fileDiffMap.put(filePath, new FileObject(reofferName, row.get("md5"), filePath,
+                            Long.parseLong(row.get("lastmodified")), Long.parseLong(row.get("filesize"))));
+                } catch (Exception rex) {
+                    logger.error("re-offer skipped for malformed catalog row: " + filePath, rex);
+                }
+            }
+
         }catch (Exception ex) {
             logger.error(ex.getMessage());
             logger.error("filerepo error", ex);
@@ -364,6 +400,10 @@ public class RepoEngine {
             }
 
             if(subscriberCount > 0) {
+
+                //remember what this transfer offered; insync flips only on subscriber confirm
+                pendingTransferMap.put(String.valueOf(transferId), new HashMap<>(fileDiffMap));
+
                 for (Map<String, String> subscriberMap : currentSubscriberList) {
 
                     //This is another filerepo in my region, I need to send it data
@@ -394,12 +434,10 @@ public class RepoEngine {
                             if (status_code != 10) {
                                 logger.error("Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " filerepo update failed status_code: " + status_code + " status_desc:" + status_desc);
                             } else {
-                                for (Map.Entry<String, FileObject> entry : fileDiffMap.entrySet()) {
-                                    //String key = entry.getKey();
-                                    FileObject fileObject = entry.getValue();
-                                    dbEngine.updateFile(fileObject.filePath, fileObject.MD5, 1, fileObject.lastModified, fileObject.filesize);
-                                }
-                                logger.info("Transfered " + fileDiffMap.size() + " files to " + pluginID);
+                                // do NOT mark insync here: status 10 only means the peer accepted
+                                // the list; rows flip to insync=1 in confirmTransfer() after the
+                                // peer reports verified downloads (failed files stay 0 -> re-offer)
+                                logger.info("Offered " + fileDiffMap.size() + " files to " + pluginID);
                             }
                         }
 
@@ -419,12 +457,39 @@ public class RepoEngine {
     }
 
     //data transfer
-    public void confirmTransfer(String incomingTransferId, String region, String agent, String pluginId) {
+    public void confirmTransfer(String incomingTransferId, String failedFilesJson, String region, String agent, String pluginId) {
         try{
 
             String repoId = region + "-" + agent + "-" + pluginId;
             synchronized (lockPeerVersionMap) {
                 peerVersionMap.put(repoId,incomingTransferId);
+            }
+
+            Set<String> failedFiles = new HashSet<>();
+            if (failedFilesJson != null) {
+                try {
+                    List<String> failedList = gson.fromJson(failedFilesJson,
+                            new com.google.gson.reflect.TypeToken<List<String>>(){}.getType());
+                    if (failedList != null) failedFiles.addAll(failedList);
+                } catch (Exception pe) {
+                    logger.error("confirmTransfer: unparseable failedfiles from " + repoId, pe);
+                }
+            }
+
+            Map<String, FileObject> offered = pendingTransferMap.get(incomingTransferId);
+            if (offered != null) {
+                int confirmed = 0;
+                for (FileObject fileObject : offered.values()) {
+                    if (!failedFiles.contains(fileObject.filePath)) {
+                        dbEngine.updateFile(fileObject.filePath, fileObject.MD5, 1, fileObject.lastModified, fileObject.filesize);
+                        confirmed++;
+                    }
+                }
+                logger.info("Transfer " + incomingTransferId + " confirmed by " + repoId + ": "
+                        + confirmed + " in sync, " + failedFiles.size() + " failed"
+                        + (failedFiles.isEmpty() ? "" : " (will re-offer)"));
+            } else {
+                logger.debug("confirmTransfer: unknown/expired transfer_id " + incomingTransferId + " from " + repoId);
             }
 
         } catch (Exception ex) {
@@ -456,7 +521,9 @@ public class RepoEngine {
             synchronized (lockPeerUpdateStateMap) {
 
                 if(!peerUpdateStateMap.containsKey(repoId)) {
-                    peerUpdateStateMap.put(repoId,false);
+                    // true: an updater IS being started; false here spawned a duplicate updater
+                    // for every diff that arrived while the first was still draining
+                    peerUpdateStateMap.put(repoId,true);
                     startUpdater = true;
                 } else {
                     if(!peerUpdateStateMap.get(repoId)) {
@@ -482,7 +549,16 @@ public class RepoEngine {
 
                                 if(pendingUpdate == null) {
 
-                                    workExist = false;
+                                    // only go idle if nothing raced in between poll() and here;
+                                    // otherwise that update would sit unserviced until the next diff
+                                    synchronized (lockPeerUpdateStateMap) {
+                                        synchronized (lockPeerUpdateQueueMap) {
+                                            if (peerUpdateQueueMap.get(repoId).isEmpty()) {
+                                                peerUpdateStateMap.put(repoId, false);
+                                                workExist = false;
+                                            }
+                                        }
+                                    }
 
                                 } else {
 
@@ -496,13 +572,24 @@ public class RepoEngine {
 
                                     logger.debug("UPDATING " + repoId + " transferid: " + currentTransferId);
 
+                                    List<String> failedFiles = new ArrayList<>();
+
                                     for (Map.Entry<String, FileObject> diffEntry : remoteRepoFiles .entrySet()) {
                                         FileObject fileObject = diffEntry.getValue();
 
                                         //public Path downloadRemoteFile(String remoteRegion, String remoteAgent, String remoteFilePath, String localFilePath) {
                                         File localDir = getRepoDir();
                                         logger.debug("localDir: " + localDir.getAbsolutePath());
-                                        Path localPath = Paths.get(localDir.getAbsolutePath() + "/" + fileObject.fileName);
+                                        // CONTAINMENT: fileName comes from the peer's listing and may carry
+                                        // subdirs (recursive repos), but must never escape the repo dir via
+                                        // ".." or an absolute path (resolve() returns an absolute arg as-is)
+                                        Path repoBase = localDir.toPath().toAbsolutePath().normalize();
+                                        Path localPath = repoBase.resolve(fileObject.fileName).normalize();
+                                        if (!localPath.startsWith(repoBase)) {
+                                            logger.error("rejecting peer file name escaping repo dir: [" + fileObject.fileName + "]");
+                                            failedFiles.add(fileObject.filePath);
+                                            continue;
+                                        }
                                         logger.debug("localFilePath: " + localPath.toFile().getAbsolutePath());
                                         //check that file exists
                                         boolean downloadFile = true;
@@ -526,9 +613,17 @@ public class RepoEngine {
                                             Path tmpFile = plugin.getAgentService().getDataPlaneService().downloadRemoteFile(region, agent, fileObject.filePath, localPath.toFile().getAbsolutePath());
                                             // A null return means this one file's transfer failed. Skip it and keep
                                             // going: one bad/slow file must not NPE-abort the whole batch (which would
-                                            // wedge sync forever). Missing files stay in the diff and retry next cycle.
+                                            // wedge sync forever). Failed files are reported in the confirm so the
+                                            // sender keeps them insync=0 and re-offers them next cycle.
                                             if (tmpFile == null) {
                                                 logger.warn("filerepo download returned null, will retry next cycle: " + fileObject.filePath);
+                                                failedFiles.add(fileObject.filePath);
+                                            } else if (!fileObject.MD5.equals(plugin.getMD5(tmpFile.toFile().getAbsolutePath()))) {
+                                                // verify what actually landed; keep a corrupt file and it would
+                                                // wrongly count as synced forever
+                                                logger.warn("filerepo download md5 mismatch, deleting + retry next cycle: " + fileObject.filePath);
+                                                tmpFile.toFile().delete();
+                                                failedFiles.add(fileObject.filePath);
                                             } else {
                                                 logger.debug("Synced " + tmpFile.toFile().getAbsolutePath());
                                             }
@@ -541,17 +636,20 @@ public class RepoEngine {
                                     MsgEvent filesConfirm = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginId);
                                     filesConfirm.setParam("action", "repoconfirm");
                                     filesConfirm.setParam("transfer_id", currentTransferId);
+                                    if (!failedFiles.isEmpty()) {
+                                        filesConfirm.setCompressedParam("failedfiles", gson.toJson(failedFiles));
+                                    }
                                     plugin.msgOut(filesConfirm);
 
                                 }
                             }
 
+                        } catch (Exception v) {
+                            logger.error("filerepo sync updater error", v);
+                            // never leave the state stuck 'active' after a crash or it wedges forever
                             synchronized (lockPeerUpdateStateMap) {
                                 peerUpdateStateMap.put(repoId,false);
                             }
-
-                        } catch (Exception v) {
-                            logger.error("filerepo sync updater error", v);
                         }
                 });
             }
