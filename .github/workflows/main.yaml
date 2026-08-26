@@ -1,10 +1,11 @@
-name: Java CI Cresco Filerepo
+name: Java CI Cresco FileRepo
 
 on: [push]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     environment: 'SONATYPE CRED'
 
     steps:
@@ -17,15 +18,15 @@ jobs:
       - name: Build with Maven
         run: mvn package bundle:bundle
       - name: Deploy to Maven
-        run: mvn deploy:deploy-file -Dfile=target/filerepo-1.2-SNAPSHOT.jar -Durl=https://oss.sonatype.org/content/repositories/snapshots -DrepositoryId=ossrh -DpomFile=pom.xml --settings ci-settings.xml -DskipTests=true -B
+        run: mvn deploy:deploy-file -Dfile=target/filerepo-1.3-SNAPSHOT.jar -Durl=https://central.sonatype.com/repository/maven-snapshots/ -DrepositoryId=central-portal-snapshots -DpomFile=pom.xml --settings ci-settings.xml -DskipTests=true -B
+
         env:
           SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
           SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
 
-
       - uses: dev-drprasad/delete-tag-and-release@v1.0 # PRERELEASE is v1.0 and can also be used to test and give us feedback
         with:
-          tag_name: '1.2-SNAPSHOT' # tag name to delete
+          tag_name: '1.3-SNAPSHOT' # tag name to delete
           github_token: ${{ secrets.GITHUB_TOKEN }} # (required) a GitHub token with write access to the repo that needs to be modified
 
       - name: Create Draft Release
@@ -34,8 +35,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: '1.2-SNAPSHOT'
-          release_name: 'Cresco Filerepo'
+          tag_name: '1.3-SNAPSHOT'
+          release_name: 'Cresco FileRepo'
           draft: true
           prerelease: false
       - uses: actions/upload-release-asset@v1.0.1
@@ -43,8 +44,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: target/filerepo-1.2-SNAPSHOT.jar
-          asset_name: filerepo-1.2-SNAPSHOT.jar
+          asset_path: target/filerepo-1.3-SNAPSHOT.jar
+          asset_name: filerepo-1.3-SNAPSHOT.jar
           asset_content_type: application/jar
 
       - uses: eregon/publish-release@v1
