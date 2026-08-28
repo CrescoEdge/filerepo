@@ -158,6 +158,12 @@ public class Plugin implements PluginService {
     @Override
     public boolean isStopped() {
 
+        // deactivate FIRST: an in-flight health check racing this teardown would otherwise see
+        // isActive()==true with a closed catalog and emit a spurious CRITICAL during a normal stop
+        if (pluginBuilder != null) {
+            pluginBuilder.setIsActive(false);
+        }
+
         try {
             if (healthReg != null) { healthReg.unregister(); healthReg = null; }
         } catch (Exception ignore) { }

@@ -120,6 +120,8 @@ public class ExecutorImpl implements Executor {
     // B-2 unified metrics: filerepo catalog size / in-flight transfers as MeasurementEngine gauges,
     // exposed via the standard getmetrics EXEC so they fold into the controller's metric inventory.
     private MeasurementEngine metricEngine;
+    // set under `this` monitor in cleanup(); blocks a racing getmetrics from recreating the engine
+    private boolean closed = false;
 
     // Bounded, named, daemon pool for byte-range streamers (replaces unbounded `new Thread()` per
     // transfer). Safeguards: inline reads (getfile/getjar) are capped to keep them off the heap for
@@ -139,9 +141,14 @@ public class ExecutorImpl implements Executor {
         transferStreams = Collections.synchronizedMap(new HashMap<>());
 
         int maxThreads = (int) Math.max(2L, plugin.getConfig().getLongParam("transfer_threads", 8L));
-        this.transferPool = new ThreadPoolExecutor(1, maxThreads, 60L, TimeUnit.SECONDS,
+        // core==max so up to maxThreads transfers run concurrently. With core<max and an unbounded
+        // queue, ThreadPoolExecutor never starts more than core threads, so transfer_threads was
+        // dead config and every streamfile serialized behind the one running transfer.
+        ThreadPoolExecutor tp = new ThreadPoolExecutor(maxThreads, maxThreads, 60L, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(),
                 r -> { Thread t = new Thread(r, "filerepo-transfer"); t.setDaemon(true); return t; });
+        tp.allowCoreThreadTimeOut(true);
+        this.transferPool = tp;
         // Inline getfile returns the whole file in ONE control-plane RPC message, which the wss
         // frame caps at ~1MB (base64-inflated). Default the cap BELOW that so getfile can never
         // produce an oversized frame; anything larger returns status 5 -> use streamfile (which
@@ -158,16 +165,22 @@ public class ExecutorImpl implements Executor {
         } catch (Exception ex) {
             logger.error("transferPool shutdown error", ex);
         }
-        try {
-            if (metricEngine != null) metricEngine.shutdown();
-        } catch (Exception ex) {
-            logger.error("metricEngine shutdown error", ex);
+        // same monitor getMetricsJson() uses: a getmetrics racing plugin stop can otherwise create
+        // a fresh MeasurementEngine after this ran and leak its gauge registrations across a reload
+        synchronized (this) {
+            closed = true;
+            try {
+                if (metricEngine != null) { metricEngine.shutdown(); metricEngine = null; }
+            } catch (Exception ex) {
+                logger.error("metricEngine shutdown error", ex);
+            }
         }
     }
 
     /** Unified metrics payload — standard getAllMetrics() shape the metric inventory expects. */
     private synchronized String getMetricsJson() {
         try {
+            if (closed) return "{}";
             if (metricEngine == null) {
                 metricEngine = new MeasurementEngine(plugin);
                 metricEngine.setGauge("filerepo.files.count", "files tracked in the local repo catalog", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
@@ -198,7 +211,9 @@ public class ExecutorImpl implements Executor {
     @Override
     public MsgEvent executeEXEC(MsgEvent incoming) {
 
-        logger.debug("Processing Exec message : " + incoming.getParams());
+        // log the action + param KEYS only: the value map can carry base64 jardata/file_data,
+        // dumping whole file/jar contents into the log (disclosure + unbounded log growth)
+        logger.debug("Processing Exec action: " + incoming.getParam("action") + " params=" + incoming.getParams().keySet());
 
         if(incoming.getParams().containsKey("action")) {
             switch (incoming.getParam("action")) {
@@ -350,35 +365,53 @@ public class ExecutorImpl implements Executor {
 
     private MsgEvent putPluginJar(MsgEvent incoming) {
 
+        File jarFileSaved = null;
         try {
 
             String pluginName = incoming.getParam("pluginname");
             String pluginMD5 = incoming.getParam("md5");
             String pluginJarFile = incoming.getParam("jarfile");
             String pluginVersion = incoming.getParam("version");
+            byte[] jarData = incoming.getDataParam("jardata");
+            // copy the (large, base64) payload out and drop it from the message early
+            if(incoming.getParams().containsKey("jardata")) incoming.removeParam("jardata");
 
-            if((pluginName != null) && (pluginMD5 != null) && (pluginJarFile != null) && (pluginVersion != null)) {
+            if((pluginName != null) && (pluginMD5 != null) && (pluginJarFile != null) && (pluginVersion != null) && (jarData != null)) {
 
-                File jarFileSaved = safeRepoFile(getRepoDir(), pluginJarFile);
+                jarFileSaved = safeRepoFile(getRepoDir(), pluginJarFile);
                 if (jarFileSaved != null) {
-                    Files.write(jarFileSaved.toPath(), incoming.getDataParam("jardata"));
+                    Files.write(jarFileSaved.toPath(), jarData);
                     if (jarFileSaved.isFile()) {
                         String md5 = plugin.getMD5(jarFileSaved.getAbsolutePath());
                         if (pluginMD5.equals(md5)) {
                             incoming.setParam("uploaded", pluginName);
+                            incoming.setParam("status","10");
+                            incoming.setParam("status_desc","uploaded");
                         } else {
                             // integrity check failed: drop the bad/partial file rather than serve it
                             jarFileSaved.delete();
+                            incoming.setParam("status","9");
                             incoming.setParam("status_desc","md5 mismatch, upload rejected");
                         }
+                    } else {
+                        incoming.setParam("status","9");
+                        incoming.setParam("status_desc","write did not produce a file");
                     }
                 } else {
+                    incoming.setParam("status","8");
                     incoming.setParam("status_desc","invalid jarfile name");
                 }
+            } else {
+                incoming.setParam("status","7");
+                incoming.setParam("status_desc","missing required putjar params");
             }
 
         } catch(Exception ex){
             logger.error("putPluginJar error", ex);
+            // a partial/truncated jar must not be left where the inventory would advertise+serve it
+            try { if (jarFileSaved != null) jarFileSaved.delete(); } catch (Exception ignore) {}
+            incoming.setParam("status","6");
+            incoming.setParam("status_desc","putjar error: " + ex.getMessage());
         }
 
         if(incoming.getParams().containsKey("jardata")) {
@@ -415,6 +448,8 @@ public class ExecutorImpl implements Executor {
                                     incoming.setParam("status_desc","jar " + jarFile.length()
                                             + " bytes exceeds max_inline_bytes; use streamfile");
                                 }
+                                // requested jar found+handled: stop scanning the rest of the inventory
+                                break;
 
                             }
                         }
@@ -611,9 +646,12 @@ public class ExecutorImpl implements Executor {
                 if(file.exists()) {
                     long startByte = Long.parseLong(incoming.getParam("start_byte"));
                     long byteLength = Long.parseLong(incoming.getParam("byte_length"));
-                    long endByte = startByte + byteLength;
 
-                    if(endByte <= file.length()) {
+                    // overflow-safe range validation: reject a bad range up-front instead of replying
+                    // "10 accepted" and then failing silently on the async streamer (start+len could
+                    // also overflow to a negative endByte that slips past a <= file.length() check)
+                    if(startByte >= 0 && byteLength > 0 && startByte <= file.length()
+                            && byteLength <= file.length() - startByte) {
 
                         Map<String, String> fileInfo = repoEngine.getFileInfo(filePath);
                         if (fileInfo != null) {
@@ -640,14 +678,14 @@ public class ExecutorImpl implements Executor {
                             //logger.error("transferid: " + incoming.getParam("transfer_id") + " START");
 
                             incoming.setParam("status", "10");
-                            incoming.setParam("status_desc", "endByte > file size");
+                            incoming.setParam("status_desc", "transfer accepted");
                         } else {
                             incoming.setParam("status", "9");
-                            incoming.setParam("status_desc", "fileInfo == null");
+                            incoming.setParam("status_desc", "file not in catalog");
                         }
                     } else {
                         incoming.setParam("status", "8");
-                        incoming.setParam("status_desc", "fileInfo == null");
+                        incoming.setParam("status_desc", "invalid byte range");
                     }
                 } else {
                     incoming.setParam("status","7");
@@ -696,7 +734,7 @@ public class ExecutorImpl implements Executor {
 
 
     private void confirmTransfer(MsgEvent incoming) {
-        repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
+        repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getCompressedParam("failedfiles"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
     }
 
     private MsgEvent putFileRemote(MsgEvent incoming) {
@@ -842,24 +880,34 @@ public class ExecutorImpl implements Executor {
                     filesConfirm.setParam("action", "repoconfirm");
                     filesConfirm.setParam("transfer_id", incoming.getParam("transfer_id"));
                     plugin.msgOut(filesConfirm);
-                    logger.info("SEND CONFIRMATION MESSAGE!");
+                    logger.debug("putfiles stored, confirmation sent");
+                    incoming.setParam("status","10");
+                    incoming.setParam("status_desc","putfiles stored");
                 } else {
-                    logger.error("PUTFILES FAILED!!");
+                    logger.error("putfiles failed for repo " + repoName);
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","putfiles failed");
                 }
 
             } else {
                 logger.error("No repo name found");
+                incoming.setParam("status","8");
+                incoming.setParam("status_desc","no repo_name or file list");
             }
 
         } catch(Exception ex){
             logger.error("filerepo error", ex);
+            incoming.setParam("status","7");
+            incoming.setParam("status_desc","putfiles error: " + ex.getMessage());
         }
 
         if(incoming.getParams().containsKey("filedata")) {
             incoming.removeParam("filedata");
         }
 
-        return null;
+        // return a real reply (was null) so an RPC caller learns the outcome instead of blocking
+        // until its timeout; a fire-and-forget (msgOut) caller simply ignores the reply
+        return incoming;
     }
 
     private MsgEvent repoListIn(MsgEvent incoming) {
