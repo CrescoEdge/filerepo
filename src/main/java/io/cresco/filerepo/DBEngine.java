@@ -55,8 +55,11 @@ public class DBEngine {
                 logger.debug("DB SOURCE EXIST: " + dbsource.getAbsolutePath() );
             } else {
                 logger.debug("CREATING DB DBSOURCE: " + dbsource.getAbsolutePath());
-                initDB();
             }
+            // Verify the SCHEMA, not just the directory. A crash/disk-full during first boot can
+            // leave a booted DB dir with no FILELIST table; the old dir-exists check then skipped
+            // initDB forever, wedging the catalog silently. ensureSchema() is idempotent.
+            ensureSchema();
 
         } catch (Exception ex) {
             logger.error("DBEngine init failed", ex);
@@ -65,28 +68,64 @@ public class DBEngine {
 
     public boolean shutdown() {
         boolean isShutdown = false;
-        try {
-            try {
-                if(dbsource.exists()) {
-                    String shutdownString = "jdbc:derby:" + dbsource.getAbsolutePath() + ";shutdown=true";
-                    DriverManager.getConnection(shutdownString);
 
-                    dataSource.close();
-                    connectionPool.close();
-                }
-            } catch (SQLException e) {
-                // XJ015 (SQLCODE 50000) = full system shutdown; 08006 (45000) = single db shutdown. Both expected.
-                if (e.getErrorCode() == 50000 || e.getErrorCode() == 45000) {
-                    isShutdown = true;
-                } else {
-                    logger.error("DBEngine shutdown error", e);
-                }
+        // Close the DBCP pool FIRST. The Derby ";shutdown=true" connection below ALWAYS throws on
+        // success, so the previous ordering (close after getConnection) made these closes dead code
+        // and the pool + its connections leaked on every OSGi reload.
+        try {
+            if (dataSource != null) dataSource.close();
+        } catch (Exception ex) { logger.error("DBEngine dataSource close error", ex); }
+        try {
+            if (connectionPool != null) connectionPool.close();
+        } catch (Exception ex) { logger.error("DBEngine connectionPool close error", ex); }
+
+        try {
+            if(dbsource != null && dbsource.exists()) {
+                String shutdownString = "jdbc:derby:" + dbsource.getAbsolutePath() + ";shutdown=true";
+                DriverManager.getConnection(shutdownString);
             }
-        }
-        catch (Exception ex) {
+        } catch (SQLException e) {
+            // XJ015 (SQLCODE 50000) = full system shutdown; 08006 (45000) = single db shutdown. Both expected.
+            if (e.getErrorCode() == 50000 || e.getErrorCode() == 45000) {
+                isShutdown = true;
+            } else {
+                logger.error("DBEngine shutdown error", e);
+            }
+        } catch (Exception ex) {
             logger.error("DBEngine shutdown error", ex);
         }
         return isShutdown;
+    }
+
+    /** Create the FILELIST table if it is absent. Idempotent; safe to run on every boot. */
+    public void ensureSchema() {
+        try (Connection conn = ds.getConnection()) {
+            boolean exists;
+            // Derby folds unquoted identifiers to upper case
+            try (ResultSet rs = conn.getMetaData().getTables(null, null, "FILELIST", null)) {
+                exists = rs.next();
+            }
+            if (!exists) {
+                logger.info("FILELIST table absent; creating catalog schema");
+                initDB();
+            }
+        } catch (Exception ex) {
+            logger.error("ensureSchema error", ex);
+        }
+    }
+
+    /**
+     * True only if the catalog is actually queryable. Unlike getRepoCount() (which swallows and
+     * returns 0), this lets the health check tell a dead DB apart from an empty one.
+     */
+    public boolean isCatalogHealthy() {
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM filelist")) {
+            return rs.next();
+        } catch (Exception ex) {
+            return false;
+        }
     }
 
     public void initDB() {

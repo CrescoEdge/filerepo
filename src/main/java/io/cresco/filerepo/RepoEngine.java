@@ -57,7 +57,8 @@ public class RepoEngine {
 
     private Type mapType;
 
-    private Timer fileScanTimer;
+    // volatile: read by putFiles() on dispatch threads to decide inline-catalog vs scanner-owned
+    private volatile Timer fileScanTimer;
     private Timer repoBroadcastTimer;
 
     private String scanDirString;
@@ -74,7 +75,9 @@ public class RepoEngine {
     private String repoDir;
 
     // Bounded, named, daemon pool for peer-sync downloader threads (replaces unbounded new Thread()).
-    private final ExecutorService syncPool = new ThreadPoolExecutor(1, 8, 60L, TimeUnit.SECONDS,
+    // core==max so up to N peer syncs run concurrently: with core<max and an unbounded queue,
+    // ThreadPoolExecutor never starts more than core threads, so this used to pin at 1.
+    private final ThreadPoolExecutor syncPool = new ThreadPoolExecutor(8, 8, 60L, TimeUnit.SECONDS,
             new LinkedBlockingQueue<>(),
             r -> { Thread t = new Thread(r, "filerepo-sync"); t.setDaemon(true); return t; });
 
@@ -100,6 +103,9 @@ public class RepoEngine {
         scanDirString =  plugin.getConfig().getStringParam("scan_dir");
         fileRepoName =  plugin.getConfig().getStringParam("filerepo_name");
         repoDir =  plugin.getConfig().getStringParam("repo_dir");
+
+        // let idle sync threads retire (core==max would otherwise keep 8 daemons alive forever)
+        syncPool.allowCoreThreadTimeOut(true);
     }
 
     public void start() {
@@ -136,20 +142,22 @@ public class RepoEngine {
                         //check file location
                         if(Paths.get(scanDirString).toFile().exists()) {
 
-                            if (!inScan.get()) {
+                            // claim the gate atomically (get-then-set raced clearRepo/removeFile);
+                            // the finally guarantees release even if the scan/sync throws
+                            if (inScan.compareAndSet(false, true)) {
+                                try {
+                                    logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
 
-                                logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
-                                inScan.set(true);
+                                    //build file list
+                                    Map<String, FileObject> diffList = getFileRepoDiff();
+                                    if (diffList.size() > 0) {
 
-                                //build file list
-                                Map<String, FileObject> diffList = getFileRepoDiff();
-                                if (diffList.size() > 0) {
-
-                                    logger.debug("SYNC Files");
-                                    syncRegionFiles(diffList);
+                                        logger.debug("SYNC Files");
+                                        syncRegionFiles(diffList);
+                                    }
+                                } finally {
+                                    inScan.set(false);
                                 }
-
-                                inScan.set(false);
 
                             } else {
                                 logger.debug("already in scan");
@@ -404,6 +412,9 @@ public class RepoEngine {
                 //remember what this transfer offered; insync flips only on subscriber confirm
                 pendingTransferMap.put(String.valueOf(transferId), new HashMap<>(fileDiffMap));
 
+                // the diff is identical for every subscriber: serialize it once, not once per peer
+                String repoListStringIn = gson.toJson(fileDiffMap);
+
                 for (Map<String, String> subscriberMap : currentSubscriberList) {
 
                     //This is another filerepo in my region, I need to send it data
@@ -415,8 +426,6 @@ public class RepoEngine {
 
                     MsgEvent fileRepoRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginID);
                     fileRepoRequest.setParam("action", "repolistin");
-                    //String repoListStringIn = getFileRepoList(scanRepo);
-                    String repoListStringIn = gson.toJson(fileDiffMap);
                     fileRepoRequest.setCompressedParam("repolistin", repoListStringIn);
                     fileRepoRequest.setParam("transfer_id", String.valueOf(transferId));
 
@@ -577,6 +586,17 @@ public class RepoEngine {
                                     for (Map.Entry<String, FileObject> diffEntry : remoteRepoFiles .entrySet()) {
                                         FileObject fileObject = diffEntry.getValue();
 
+                                        // reject malformed peer entries (null fields) rather than let an
+                                        // NPE abort the whole batch and drop every good file in this diff
+                                        if (fileObject == null || fileObject.fileName == null
+                                                || fileObject.MD5 == null || fileObject.filePath == null) {
+                                            logger.warn("skipping malformed peer diff entry: " + diffEntry.getKey());
+                                            if (fileObject != null && fileObject.filePath != null) {
+                                                failedFiles.add(fileObject.filePath);
+                                            }
+                                            continue;
+                                        }
+
                                         //public Path downloadRemoteFile(String remoteRegion, String remoteAgent, String remoteFilePath, String localFilePath) {
                                         File localDir = getRepoDir();
                                         logger.debug("localDir: " + localDir.getAbsolutePath());
@@ -688,16 +708,28 @@ public class RepoEngine {
         return dbEngine.getRepoCount();
     }
 
+    /** True if the Derby catalog is queryable (distinguishes a dead DB from an empty one). */
+    public boolean isCatalogHealthy() {
+        return dbEngine.isCatalogHealthy();
+    }
+
     public Boolean clearRepo() {
         boolean isRemoved = false;
+        boolean acquired = false;
         try {
 
-            while (inScan.get()) {
-                Thread.sleep(1000);
+            // claim the scan gate atomically, with a bounded wait: the old get-then-set + unbounded
+            // sleep-loop could spin a dispatch thread forever if inScan was stuck latched
+            long deadline = System.currentTimeMillis() + 30000L;
+            while (!inScan.compareAndSet(false, true)) {
+                if (System.currentTimeMillis() > deadline) {
+                    logger.warn("clearRepo: timed out waiting for scan to stop");
+                    return false;
+                }
+                Thread.sleep(200);
                 logger.info("Waiting for file scan to stop");
             }
-            //Stop scanning so we can clear out files
-            inScan.set(true);
+            acquired = true;
 
             //List all files recorded in repo and remove them
             List<Map<String,String>> repoFileList = dbEngine.getRepoList();
@@ -706,19 +738,20 @@ public class RepoEngine {
                 dbEngine.deleteFile(removeFile.getAbsolutePath());
                 removeFile.delete();
             }
-            //delete any files or directories not recorded in repo dir
-            Files.walk(Paths.get(getRepoDir().getAbsolutePath()))
-                    .filter(Files::isRegularFile)
-                    .map(Path::toFile)
-                    .forEach(File::delete);
+            //delete any files or directories not recorded in repo dir (close the walk stream)
+            try (java.util.stream.Stream<Path> walk = Files.walk(Paths.get(getRepoDir().getAbsolutePath()))) {
+                walk.filter(Files::isRegularFile).map(Path::toFile).forEach(File::delete);
+            }
 
-            //release scan
-            inScan.set(false);
             isRemoved = true;
 
         } catch (Exception ex) {
-            logger.error("removeFile: " + ex.getMessage());
+            logger.error("clearRepo: " + ex.getMessage());
             isRemoved = false;
+        } finally {
+            // ALWAYS release the gate, even on exception, or the scanner stalls forever and every
+            // later clearrepo spins waiting for a flag that never clears
+            if (acquired) inScan.set(false);
         }
         return isRemoved;
     }
@@ -781,7 +814,10 @@ public class RepoEngine {
 
                     if (fileSaved.isFile()) {
 
-                        if(!plugin.getConfig().getBooleanParam("enable_scan",Boolean.TRUE)) {
+                        // Catalog the landed file when no scanner will pick it up. Keying on
+                        // enable_scan (default true) meant landing-only repos (which never schedule
+                        // the scan timer) never indexed received files -> getfile returned empty.
+                        if(fileScanTimer == null) {
                             String filePath = fileSaved.getAbsolutePath();
                             String MD5hash = plugin.getMD5(fileSavePath);
                             long lastModified = fileSaved.lastModified();

@@ -29,15 +29,23 @@ public class FileRepoHealthCheck implements HealthCheck {
             if (plugin == null || !plugin.isActive() || repoEngine == null) {
                 return new Result(Result.Status.TEMPORARILY_UNAVAILABLE, "filerepo not active");
             }
-            long files = repoEngine.getRepoCount();
+            // A dead catalog (XSDB6 double-boot, missing FILELIST table, corrupted Derby) used to
+            // read as "0 file(s) cataloged, OK" because getRepoCount() swallows errors and returns 0.
+            if (!repoEngine.isCatalogHealthy()) {
+                return new Result(Result.Status.CRITICAL, "filerepo CRITICAL: catalog not queryable");
+            }
             File repoDir = repoEngine.getRepoDir();
-            if (repoDir != null && repoDir.isDirectory() && !repoDir.canWrite()) {
+            // An absent/uncreatable repo dir must be CRITICAL, not skipped into an OK result.
+            if (repoDir == null || !repoDir.isDirectory()) {
+                return new Result(Result.Status.CRITICAL, "filerepo CRITICAL: repo dir missing/uncreatable");
+            }
+            if (!repoDir.canWrite()) {
                 return new Result(Result.Status.WARN,
                         "filerepo WARN: repo dir not writable: " + repoDir.getAbsolutePath());
             }
-            String where = (repoDir != null) ? repoDir.getName() : "unset";
+            long files = repoEngine.getRepoCount();
             return new Result(Result.Status.OK,
-                    "filerepo OK: " + files + " file(s) cataloged, repo dir=" + where);
+                    "filerepo OK: " + files + " file(s) cataloged, repo dir=" + repoDir.getName());
         } catch (Exception ex) {
             return new Result(Result.Status.WARN, "filerepo health error: " + ex.getMessage());
         }
