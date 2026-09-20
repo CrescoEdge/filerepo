@@ -83,6 +83,11 @@ import io.cresco.library.capability.*;
         summary = "Remove a file from a repo (file + catalog row).", why = "Delete an artifact.",
         params = {@CrescoParam(name = "repo_name", required = true), @CrescoParam(name = "file_name", required = true)},
         returns = @CrescoReturn(name = "status", description = "10 removed")),
+    @CrescoAction(name = "repostate", type = "EXEC",
+        summary = "Report whether this repo is a recreatable cache or the only copy of its contents.",
+        why = "Losing a materialised cache costs a re-materialisation; losing uncommitted work costs the work.",
+        returns = {@CrescoReturn(name = "state"), @CrescoReturn(name = "materialised_from"),
+                   @CrescoReturn(name = "dirty_count"), @CrescoReturn(name = "recreatable")}),
     @CrescoAction(name = "clearrepo", type = "EXEC",
         summary = "Delete all files in a repo.", why = "Wipe a repo.",
         params = @CrescoParam(name = "repo_name", required = true),
@@ -222,6 +227,8 @@ public class ExecutorImpl implements Executor {
                     return repoList(incoming);
                 case "getrepofilelist":
                     return getRepoFileList(incoming);
+                case "repostate":
+                    return repoState(incoming);
                 case "clearrepo":
                     return clearRepo(incoming);
                 case "getjar":
@@ -780,6 +787,28 @@ public class ExecutorImpl implements Executor {
         return incoming;
     }
 
+    /**
+     * Is this repository a cache or the only copy? The distinction the whole materialisation model
+     * turns on, answered by comparison rather than by a flag.
+     */
+    private MsgEvent repoState(MsgEvent incoming) {
+        try {
+            String from = repoEngine.materialisedFrom();
+            java.util.List<String> dirty = repoEngine.dirtyFiles();
+            incoming.setParam("materialised_from", from == null ? "" : from);
+            incoming.setParam("dirty_count", String.valueOf(dirty.size()));
+            incoming.setParam("recreatable", String.valueOf(from != null));
+            // "cache" only if losing it costs a re-materialisation rather than the work itself
+            incoming.setParam("state", from != null && dirty.isEmpty() ? "CACHE"
+                    : from != null ? "CACHE_WITH_UNCOMMITTED" : "ONLY_COPY");
+            incoming.setParam("status", "10");
+        } catch (Exception ex) {
+            incoming.setParam("status", "9");
+            incoming.setParam("status_desc", ex.getMessage());
+        }
+        return incoming;
+    }
+
     private MsgEvent clearRepo(MsgEvent incoming) {
 
         try {
@@ -788,13 +817,17 @@ public class ExecutorImpl implements Executor {
 
                 String repoName = incoming.getParam("repo_name");
 
-                boolean isCleared = repoEngine.clearRepo();
+                // The dirty check is on by default. A repo materialised from a version may always
+                // be cleared, because re-materialising restores it exactly; a repo holding work
+                // that no version accounts for is the only copy, and wiping it is unrecoverable.
+                boolean force = "true".equalsIgnoreCase(incoming.getParam("force"));
+                boolean isCleared = repoEngine.clearRepo(force);
                 if(isCleared) {
                     incoming.setParam("status","10");
                     incoming.setParam("status_desc","repo cleared");
                 } else {
                     incoming.setParam("status","9");
-                    incoming.setParam("status_desc","repo cleared");
+                    incoming.setParam("status_desc","refused: uncommitted work with no upstream version; commit it or pass force=true");
                 }
 
             } else {

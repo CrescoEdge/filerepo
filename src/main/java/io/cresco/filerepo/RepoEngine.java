@@ -713,6 +713,86 @@ public class RepoEngine {
         return dbEngine.isCatalogHealthy();
     }
 
+    /**
+     * The provenance of this repository: the dataset version it was materialised from, if any.
+     *
+     * <p>This is what makes the difference between a cache and the only copy. A repo materialised
+     * from version V is exactly recreatable, so losing it costs a re-materialisation. A repo whose
+     * contents have no upstream version is the only copy in existence, and nothing else in the
+     * system will notice if it is destroyed.
+     */
+    private static final String PROVENANCE = ".gfs-materialised-from";
+
+    /** The version this repo was materialised from, or null if it is unversioned working state. */
+    public String materialisedFrom() {
+        try {
+            Path f = Paths.get(getRepoDir().getAbsolutePath()).resolve(PROVENANCE);
+            return Files.isRegularFile(f) ? new String(Files.readAllBytes(f), "UTF-8").trim() : null;
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    public void setMaterialisedFrom(String versionId) throws Exception {
+        Path f = Paths.get(getRepoDir().getAbsolutePath()).resolve(PROVENANCE);
+        if (versionId == null) Files.deleteIfExists(f);
+        else Files.write(f, versionId.getBytes("UTF-8"));
+    }
+
+    /**
+     * Files present here that the upstream version does not account for — an agent's uncommitted
+     * work. Computed against the recorded manifest rather than by trusting a flag, because a flag
+     * decays and a comparison does not.
+     */
+    public List<String> dirtyFiles() {
+        List<String> dirty = new ArrayList<>();
+        try {
+            Path root = Paths.get(getRepoDir().getAbsolutePath());
+            Path man = root.resolve(".gfs-manifest");
+            java.util.Set<String> known = new java.util.HashSet<>();
+            if (Files.isRegularFile(man)) {
+                for (String line : new String(Files.readAllBytes(man), "UTF-8").split("\n")) {
+                    if (!line.isEmpty()) known.add(line.trim());
+                }
+            }
+            try (java.util.stream.Stream<Path> w = Files.walk(root)) {
+                for (Path f : (Iterable<Path>) w::iterator) {
+                    if (!Files.isRegularFile(f)) continue;
+                    String rel = root.relativize(f).toString();
+                    if (rel.startsWith(".gfs-")) continue;
+                    if (!known.contains(rel)) dirty.add(rel);
+                }
+            }
+        } catch (Exception ex) {
+            logger.error("dirtyFiles: " + ex.getMessage());
+        }
+        return dirty;
+    }
+
+    /**
+     * Wipe the repository.
+     *
+     * <p>Correct for a mirror: the contents are refilled from the producer on the next broadcast,
+     * so this is idempotent and cheap. It is <em>unrecoverable</em> for anything that is not
+     * refillable, which is why it now refuses when the repository holds uncommitted work. A repo
+     * materialised from a version may always be cleared — re-materialising restores it exactly.
+     *
+     * @param force bypass the dirty check. Reserved for an operator who has decided the work is
+     *              disposable; it is never set by the scanner or by a peer.
+     */
+    public Boolean clearRepo(boolean force) {
+        if (!force) {
+            List<String> dirty = dirtyFiles();
+            if (!dirty.isEmpty() && materialisedFrom() == null) {
+                logger.error("clearrepo refused: " + dirty.size() + " file(s) are not accounted for by"
+                        + " any version and this repo has no upstream to re-materialise from. Commit"
+                        + " them or pass force. First: " + dirty.subList(0, Math.min(3, dirty.size())));
+                return false;
+            }
+        }
+        return clearRepo();
+    }
+
     public Boolean clearRepo() {
         boolean isRemoved = false;
         boolean acquired = false;
