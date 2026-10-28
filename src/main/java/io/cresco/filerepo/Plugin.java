@@ -33,6 +33,8 @@ public class Plugin implements PluginService {
     private DBEngine dbEngine;
 
     private RepoEngine repoEngine;
+    // client of a live-tier provider service on this agent, if one is ever registered; closed on stop
+    private LiveTierClient liveTier;
     // Felix HealthCheck registration (central health); best-effort, unregistered on stop
     private ServiceRegistration<HealthCheck> healthReg;
 
@@ -92,8 +94,16 @@ public class Plugin implements PluginService {
                 //Starting the RepoEngine Threads
                 repoEngine = new RepoEngine(pluginBuilder, dbEngine);
 
+                // Track a live-tier provider service through this bundle's own context (the provider admits callers by
+                // bundle). Without one filerepo works exactly as before; every call to one is bounded.
+                liveTier = new LiveTierClient(context,
+                        pluginBuilder.getLogger(LiveTierClient.class.getName(), CLogger.Level.Info),
+                        pluginBuilder.getConfig().getLongParam("live_timeout_ms", 5000L),
+                        pluginBuilder.getConfig().getLongParam("live_core_timeout_ms", 25000L),
+                        (int) (long) pluginBuilder.getConfig().getLongParam("live_max_calls", 4L));
+
                 //Starting custom message handler
-                this.executor = new ExecutorImpl(pluginBuilder, repoEngine);
+                this.executor = new ExecutorImpl(pluginBuilder, repoEngine, liveTier);
                 pluginBuilder.setExecutor(executor);
 
                 while (!pluginBuilder.getAgentService().getAgentState().isActive()) {
@@ -147,7 +157,7 @@ public class Plugin implements PluginService {
             props.put(HealthCheck.NAME, "filerepo");
             props.put(HealthCheck.TAGS, new String[]{"local"});
             healthReg = context.registerService(HealthCheck.class,
-                    new FileRepoHealthCheck(pluginBuilder, repoEngine), props);
+                    new FileRepoHealthCheck(pluginBuilder, repoEngine, liveTier), props);
             logger.info("Registered filerepo HealthCheck (Felix HC)");
         } catch (Throwable t) {
             // health is best-effort: a missing hc.api bundle must never break filerepo
@@ -182,6 +192,11 @@ public class Plugin implements PluginService {
 
             if(executor instanceof ExecutorImpl) {
                 ((ExecutorImpl) executor).cleanup();
+            }
+
+            if(liveTier != null) {
+                liveTier.close();
+                liveTier = null;
             }
 
             pluginBuilder.setExecutor(null);

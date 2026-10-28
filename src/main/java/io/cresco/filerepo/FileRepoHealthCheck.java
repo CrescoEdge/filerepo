@@ -17,10 +17,12 @@ public class FileRepoHealthCheck implements HealthCheck {
 
     private final PluginBuilder plugin;
     private final RepoEngine repoEngine;
+    private final LiveTierClient liveTier;
 
-    public FileRepoHealthCheck(PluginBuilder plugin, RepoEngine repoEngine) {
+    public FileRepoHealthCheck(PluginBuilder plugin, RepoEngine repoEngine, LiveTierClient liveTier) {
         this.plugin = plugin;
         this.repoEngine = repoEngine;
+        this.liveTier = liveTier;
     }
 
     @Override
@@ -33,6 +35,16 @@ public class FileRepoHealthCheck implements HealthCheck {
             // read as "0 file(s) cataloged, OK" because getRepoCount() swallows errors and returns 0.
             if (!repoEngine.isCatalogHealthy()) {
                 return new Result(Result.Status.CRITICAL, "filerepo CRITICAL: catalog not queryable");
+            }
+            if (repoEngine.isLiveBacked()) {
+                // no repo dir of its own to check: its files are the live row's, read only through the filesystem.
+                // No provider call here: whether one is tracked is enough, and costs nothing.
+                if (liveTier == null || !liveTier.present()) {
+                    return new Result(Result.Status.WARN, "filerepo WARN: live-backed repository (row "
+                            + repoEngine.getLiveRow() + "): no live-tier provider admits this bundle");
+                }
+                return new Result(Result.Status.OK, "filerepo OK: live-backed repository (row "
+                        + repoEngine.getLiveRow() + "), live-tier provider present");
             }
             File repoDir = repoEngine.getRepoDir();
             // An absent/uncreatable repo dir must be CRITICAL, not skipped into an OK result.

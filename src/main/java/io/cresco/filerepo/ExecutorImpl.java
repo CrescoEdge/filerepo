@@ -84,9 +84,33 @@ import io.cresco.library.capability.*;
         params = {@CrescoParam(name = "repo_name", required = true), @CrescoParam(name = "file_name", required = true)},
         returns = @CrescoReturn(name = "status", description = "10 removed")),
     @CrescoAction(name = "clearrepo", type = "EXEC",
-        summary = "Delete all files in a repo.", why = "Wipe a repo.",
-        params = @CrescoParam(name = "repo_name", required = true),
-        returns = @CrescoReturn(name = "status", description = "10 cleared")),
+        summary = "Delete all files in a repo. An only copy (repostate ONLY_COPY) is refused unless force=true.",
+        why = "Wipe a repo.",
+        params = {@CrescoParam(name = "repo_name", required = true),
+                  @CrescoParam(name = "force", type = "boolean", description = "clear an only copy anyway")},
+        returns = @CrescoReturn(name = "status", description = "10 cleared; 9 refused (see refusal) or not cleared")),
+    @CrescoAction(name = "repostate", type = "EXEC",
+        summary = "Report what this repo is: LIVE, WORKSPACE_CLEAN, WORKSPACE_DIRTY, MIRROR or ONLY_COPY.",
+        why = "Know what would be lost with a repo before clearing, releasing or relying on it.",
+        returns = {@CrescoReturn(name = "state", description = "LIVE | WORKSPACE_CLEAN | WORKSPACE_DIRTY | MIRROR | ONLY_COPY"),
+                   @CrescoReturn(name = "backing", description = "live (a live-tier row) or local"),
+                   @CrescoReturn(name = "status", description = "10 answered; 9 the live row is not held here; 11 the live-tier provider did not answer")}),
+    @CrescoAction(name = "liverelay", type = "EXEC",
+        summary = "Relay a request signed by its end user, unchanged, through this agent's live-tier provider.",
+        why = "Act on live-tier copies and workspaces with the end user's own authority.",
+        params = @CrescoParam(name = "request", required = true, compressed = true, type = "object",
+                description = "the signed request: a JSON object of strings"),
+        returns = {@CrescoReturn(name = "reply", type = "object", compressed = true, description = "the reply, as it came"),
+                   @CrescoReturn(name = "reply_status", description = "the reply's own status"),
+                   @CrescoReturn(name = "status", description = "10 answered (see reply_status); 8 no request; 11 the live-tier provider did not answer")}),
+    @CrescoAction(name = "liverealise", type = "EXEC",
+        summary = "Keep a live-backed repo's copy live: realise it again at this node as the node itself (copies only).",
+        why = "Extend a live copy's lease without a person's credentials.",
+        params = {@CrescoParam(name = "lease_ms", type = "long", description = "requested lease"),
+                  @CrescoParam(name = "request_id", description = "idempotency key: 1-64 letters, digits, - or _")},
+        returns = {@CrescoReturn(name = "job_id", description = "the realise job"),
+                   @CrescoReturn(name = "reply_status", description = "the realise reply's own status"),
+                   @CrescoReturn(name = "status", description = "10 realise accepted; 8 bad params; 9 refused (see refusal); 11 the live-tier provider did not answer")}),
     @CrescoAction(name = "repolistin", type = "EXEC",
         summary = "Receive a producer's file-diff and pull changed files (sync consumer side).",
         why = "Directory-sync receiving half.",
@@ -107,11 +131,20 @@ import io.cresco.library.capability.*;
 })
 public class ExecutorImpl implements Executor {
 
+    // Verbs a live-backed repository still answers. Every other verb, including any added later, is refused: the
+    // repository is a live-tier copy or workspace, read only through the filesystem at this node, and filerepo never
+    // serves, writes, deletes, syncs or lists it.
+    static final Set<String> LIVE_BACKED_VERBS = Set.of("repostate", "liverelay", "liverealise",
+            "getscandir", "getmetrics", "getcapabilities");
+
     private PluginBuilder plugin;
     private CLogger logger;
     private Gson gson;
     private RepoEngine repoEngine;
     private Type listType;
+    private final Type stringMapType = new com.google.gson.reflect.TypeToken<Map<String, String>>(){}.getType();
+    // the live-tier client; may be null (no provider, ever)
+    private final LiveTierClient liveTier;
 
     private final AtomicBoolean transferLock = new AtomicBoolean();
 
@@ -132,11 +165,12 @@ public class ExecutorImpl implements Executor {
     // Hard ceiling on a streamfile chunk: it + its framing header must fit one dataplane frame.
     private static final int MAX_STREAM_BUFFER = 786432; // 768 KB
 
-    public ExecutorImpl(PluginBuilder pluginBuilder, RepoEngine repoEngine) {
+    public ExecutorImpl(PluginBuilder pluginBuilder, RepoEngine repoEngine, LiveTierClient liveTier) {
         this.plugin = pluginBuilder;
         logger = plugin.getLogger(ExecutorImpl.class.getName(), CLogger.Level.Info);
         gson = new Gson();
         this.repoEngine = repoEngine;
+        this.liveTier = liveTier;
         listType = new TypeToken<ArrayList<String>>(){}.getType();
         transferStreams = Collections.synchronizedMap(new HashMap<>());
 
@@ -216,12 +250,24 @@ public class ExecutorImpl implements Executor {
         logger.debug("Processing Exec action: " + incoming.getParam("action") + " params=" + incoming.getParams().keySet());
 
         if(incoming.getParams().containsKey("action")) {
-            switch (incoming.getParam("action")) {
+            String action = incoming.getParam("action");
+            // the backing is fixed by configuration, so this refusal needs no gate and no provider: it holds even when
+            // the live-tier provider cannot be reached
+            if (repoEngine.isLiveBacked() && (action == null || !LIVE_BACKED_VERBS.contains(action))) {
+                return refuseLiveBacked(incoming);
+            }
+            switch (action) {
 
                 case "repolist":
                     return repoList(incoming);
                 case "getrepofilelist":
                     return getRepoFileList(incoming);
+                case "repostate":
+                    return repoState(incoming);
+                case "liverelay":
+                    return liveRelay(incoming);
+                case "liverealise":
+                    return liveRealise(incoming);
                 case "clearrepo":
                     return clearRepo(incoming);
                 case "getjar":
@@ -380,22 +426,34 @@ public class ExecutorImpl implements Executor {
 
                 jarFileSaved = safeRepoFile(getRepoDir(), pluginJarFile);
                 if (jarFileSaved != null) {
-                    Files.write(jarFileSaved.toPath(), jarData);
-                    if (jarFileSaved.isFile()) {
-                        String md5 = plugin.getMD5(jarFileSaved.getAbsolutePath());
-                        if (pluginMD5.equals(md5)) {
-                            incoming.setParam("uploaded", pluginName);
-                            incoming.setParam("status","10");
-                            incoming.setParam("status_desc","uploaded");
-                        } else {
-                            // integrity check failed: drop the bad/partial file rather than serve it
-                            jarFileSaved.delete();
-                            incoming.setParam("status","9");
-                            incoming.setParam("status_desc","md5 mismatch, upload rejected");
-                        }
-                    } else {
+                    // the shared side of the repository gate, as for putfiles: a jar never lands mid-clear
+                    if (!repoEngine.enterGate()) {
+                        jarFileSaved = null;
                         incoming.setParam("status","9");
-                        incoming.setParam("status_desc","write did not produce a file");
+                        incoming.setParam("status_desc","repository busy: a clear holds it");
+                    } else {
+                        try {
+                            repoEngine.markLanded();
+                            Files.write(jarFileSaved.toPath(), jarData);
+                            if (jarFileSaved.isFile()) {
+                                String md5 = plugin.getMD5(jarFileSaved.getAbsolutePath());
+                                if (pluginMD5.equals(md5)) {
+                                    incoming.setParam("uploaded", pluginName);
+                                    incoming.setParam("status","10");
+                                    incoming.setParam("status_desc","uploaded");
+                                } else {
+                                    // integrity check failed: drop the bad/partial file rather than serve it
+                                    jarFileSaved.delete();
+                                    incoming.setParam("status","9");
+                                    incoming.setParam("status_desc","md5 mismatch, upload rejected");
+                                }
+                            } else {
+                                incoming.setParam("status","9");
+                                incoming.setParam("status_desc","write did not produce a file");
+                            }
+                        } finally {
+                            repoEngine.exitGate();
+                        }
                     }
                 } else {
                     incoming.setParam("status","8");
@@ -788,13 +846,28 @@ public class ExecutorImpl implements Executor {
 
                 String repoName = incoming.getParam("repo_name");
 
-                boolean isCleared = repoEngine.clearRepo();
-                if(isCleared) {
-                    incoming.setParam("status","10");
-                    incoming.setParam("status_desc","repo cleared");
-                } else {
-                    incoming.setParam("status","9");
-                    incoming.setParam("status_desc","repo cleared");
+                // force=true clears an only copy too: whoever sends it has decided the contents are disposable.
+                // The check runs inside clearRepo, under the repository gate, never before it.
+                boolean force = "true".equalsIgnoreCase(incoming.getParam("force"));
+                RepoEngine.Clear cleared = repoEngine.clearRepo(force);
+                if (cleared.state != null && cleared.state.state != null) {
+                    incoming.setParam("state", cleared.state.state);
+                }
+                switch (cleared.outcome) {
+                    case RepoEngine.Clear.CLEARED:
+                        incoming.setParam("status","10");
+                        incoming.setParam("status_desc", cleared.remaining == 0 ? "repo cleared" : "repo cleared; " + cleared.why);
+                        break;
+                    case RepoEngine.Clear.ONLY_COPY:
+                        incoming.setParam("status","9");
+                        incoming.setParam("status_desc","refused: this repository is the only copy of what it holds ("
+                                + cleared.why + "); pass force=true to clear it anyway");
+                        incoming.setParam("refusal","only-copy");
+                        break;
+                    default:
+                        incoming.setParam("status","9");
+                        incoming.setParam("status_desc","repo not cleared: " + cleared.why);
+                        break;
                 }
 
             } else {
@@ -809,6 +882,175 @@ public class ExecutorImpl implements Executor {
             incoming.setParam("status_desc","clear repo error: " + ex.getMessage());
         }
 
+        return incoming;
+    }
+
+    /** A live-backed repository's answer to every verb outside LIVE_BACKED_VERBS. */
+    private MsgEvent refuseLiveBacked(MsgEvent incoming) {
+        // drop any payload the refused verb carried, as the verbs themselves do
+        for (String payload : new String[]{"jardata", "filedata", "file_data", "repolistin"}) {
+            if (incoming.getParams().containsKey(payload)) incoming.removeParam(payload);
+        }
+        incoming.setParam("status","9");
+        // the sync verbs report through status_code
+        incoming.setParam("status_code","9");
+        incoming.setParam("status_desc","refused: this repository is backed by live-tier row " + repoEngine.getLiveRow()
+                + ", read only through the filesystem at this node; filerepo does not serve, write, delete, sync or list it");
+        incoming.setParam("refusal","live-backed");
+        return incoming;
+    }
+
+    /**
+     * repostate: what this repository is (LIVE, WORKSPACE_CLEAN, WORKSPACE_DIRTY, MIRROR or ONLY_COPY), from the
+     * live-tier provider's cached answers or from filerepo's own catalog; never a walk of the tree.
+     */
+    private MsgEvent repoState(MsgEvent incoming) {
+        try {
+            RepoState state = repoEngine.isLiveBacked()
+                    ? RepoState.live(repoEngine.getLiveRow(), liveTier)
+                    : repoEngine.localState();
+            state.into(incoming);
+        } catch (Exception ex) {
+            logger.error("repostate error", ex);
+            incoming.setParam("status","8");
+            incoming.setParam("status_desc","repostate error: " + ex.getMessage());
+        }
+        return incoming;
+    }
+
+    /**
+     * liverelay: forward a request already signed by its end user, unchanged, through the live-tier provider, and
+     * return its reply as it came. Whoever signed the request is the one authorised and audited; filerepo adds nothing
+     * and signs nothing.
+     */
+    private MsgEvent liveRelay(MsgEvent incoming) {
+        try {
+            String requestJson = incoming.getCompressedParam("request");
+            Map<String, String> request = null;
+            try {
+                if (requestJson != null) request = gson.fromJson(requestJson, stringMapType);
+            } catch (Exception unparseable) {
+                request = null;
+            }
+            if (incoming.getParams().containsKey("request")) incoming.removeParam("request");
+            if (request == null || request.isEmpty()) {
+                incoming.setParam("status","8");
+                incoming.setParam("status_desc","liverelay takes request: the signed request, as a compressed JSON object of strings");
+                return incoming;
+            }
+            LiveTierClient.Answer answer = liveTier == null ? null : liveTier.relay(request);
+            if (answer == null || !answer.answered()) {
+                incoming.setParam("status","11");
+                incoming.setParam("status_desc","not relayed: " + (answer == null ? "no live-tier provider admits this bundle" : answer.desc()));
+                return incoming;
+            }
+            // 10 says the provider answered; the answer itself (the core's reply, or the provider's refusal to relay)
+            // is in reply, with its own status
+            incoming.setCompressedParam("reply", gson.toJson(answer.reply));
+            incoming.setParam("reply_status", answer.status());
+            incoming.setParam("status","10");
+            incoming.setParam("status_desc","answered (reply_status " + answer.status() + ")");
+        } catch (Exception ex) {
+            logger.error("liverelay error", ex);
+            incoming.setParam("status","8");
+            incoming.setParam("status_desc","liverelay error: " + ex.getMessage());
+        }
+        return incoming;
+    }
+
+    /**
+     * liverealise: realise this live-backed repository's own copy again, as the node itself: copies only, at this node
+     * only. A copy still held is a hit, which raises its lease; so an operator keeps a dataset live without a person's
+     * credentials. What is realised comes from the provider's own row, in this JVM: no collection, version or path is
+     * taken from the request or put on the reply.
+     */
+    private MsgEvent liveRealise(MsgEvent incoming) {
+        try {
+            if (!repoEngine.isLiveBacked()) {
+                incoming.setParam("status","9");
+                incoming.setParam("status_desc","refused: this repository is not live-backed (live_row is not configured)");
+                incoming.setParam("refusal","not-live-backed");
+                return incoming;
+            }
+            String leaseMs = incoming.getParam("lease_ms");
+            if (leaseMs != null && !leaseMs.matches("[0-9]{1,18}")) {
+                incoming.setParam("status","8");
+                incoming.setParam("status_desc","lease_ms is a whole number of milliseconds");
+                return incoming;
+            }
+            String requestId = incoming.getParam("request_id");
+            if (requestId == null) {
+                requestId = "filerepo-" + UUID.randomUUID().toString().replace("-", "");
+            } else if (!requestId.matches("[A-Za-z0-9_-]{1,64}")) {
+                incoming.setParam("status","8");
+                incoming.setParam("status_desc","request_id is 1-64 letters, digits, - or _");
+                return incoming;
+            }
+            if (liveTier == null) {
+                incoming.setParam("status","11");
+                incoming.setParam("status_desc","not sent: no live-tier provider admits this bundle");
+                return incoming;
+            }
+            LiveTierClient.Answer list = liveTier.list();
+            if (!list.ok()) {
+                incoming.setParam("status","11");
+                incoming.setParam("status_desc","not sent: the live-tier provider did not list its rows ("
+                        + (list.answered() ? "status " + list.status() : list.desc()) + ")");
+                return incoming;
+            }
+            Map<String, Object> row = LiveTierClient.row(list, repoEngine.getLiveRow());
+            if (row == null) {
+                incoming.setParam("status","9");
+                incoming.setParam("status_desc","refused: live row " + repoEngine.getLiveRow() + " is not held at this node;"
+                        + " a new realise makes a new row, which this repository can then be configured with");
+                incoming.setParam("refusal","not-held");
+                return incoming;
+            }
+            if (!"copy".equals(String.valueOf(row.get("mode")))) {
+                incoming.setParam("status","9");
+                incoming.setParam("status_desc","refused: the node realises copies only; a workspace is kept by its holders");
+                incoming.setParam("refusal","workspace");
+                return incoming;
+            }
+            if (row.get("collection") == null || row.get("vid") == null) {
+                incoming.setParam("status","9");
+                incoming.setParam("status_desc","refused: the provider's row does not name what it holds");
+                incoming.setParam("refusal","unnamed");
+                return incoming;
+            }
+            Map<String, String> params = new LinkedHashMap<>();
+            params.put("collection", String.valueOf(row.get("collection")));
+            params.put("vid", String.valueOf(row.get("vid")));
+            Object prefix = row.get("prefix");
+            if (prefix != null && !String.valueOf(prefix).isEmpty()) params.put("prefix", String.valueOf(prefix));
+            if (leaseMs != null) params.put("lease_ms", leaseMs);
+            params.put("request_id", requestId);
+
+            LiveTierClient.Answer answer = liveTier.realise(params);
+            if (!answer.answered()) {
+                incoming.setParam("status", LiveTierClient.REFUSED.equals(answer.failure) ? "9" : "11");
+                incoming.setParam("status_desc","not sent: " + answer.desc());
+                return incoming;
+            }
+            // the reply was sealed between the provider and the core: only its status and job id cross the fabric,
+            // never its description, which may name what was realised
+            incoming.setParam("reply_status", answer.status());
+            Object job = answer.reply.get("job_id");
+            if (job != null) incoming.setParam("job_id", String.valueOf(job));
+            incoming.setParam("request_id", requestId);
+            if (answer.ok()) {
+                incoming.setParam("status","10");
+                incoming.setParam("status_desc","realise sent");
+            } else {
+                incoming.setParam("status","9");
+                incoming.setParam("status_desc","realise refused (status " + answer.status() + ")");
+                incoming.setParam("refusal","realise");
+            }
+        } catch (Exception ex) {
+            logger.error("liverealise error", ex);
+            incoming.setParam("status","8");
+            incoming.setParam("status_desc","liverealise error: " + ex.getClass().getSimpleName());
+        }
         return incoming;
     }
 

@@ -24,6 +24,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class RepoEngine {
 
@@ -33,7 +34,29 @@ public class RepoEngine {
 
     private Type repoListType;
 
+    // one scan at a time (the scan timer's own re-entry guard)
     private AtomicBoolean inScan = new AtomicBoolean(false);
+
+    // The repository gate. clearrepo holds it exclusively from its only-copy check through its delete; a scan and every
+    // landing (putfiles, putjar) hold it shared, so nothing filerepo lands can slip in between a clear's check and its
+    // delete, while scans and landings still run side by side as they always have. Fair, so a waiting clear is not
+    // starved by a stream of landings. Every claim is bounded and released in a finally.
+    private final ReentrantReadWriteLock gate = new ReentrantReadWriteLock(true);
+    // bounded wait for the gate (clear and landings); tests shorten it
+    volatile long gateWaitMs = 30000L;
+    // test hook: runs inside clearRepo between its check and its delete, with the gate held
+    volatile Runnable afterClearCheck;
+
+    // Live-tier backing (config live_row): the repository is a live copy or a workspace held at this node, read only
+    // through the filesystem. Read once, here; no verb can change it. A live-backed repository runs no scanner and no
+    // sync, and ExecutorImpl refuses every verb that would serve, write, delete or sync it.
+    private final String liveRow;
+    // a subscriber mirror (filerepo_name and repo_dir, no scan_dir): the one role whose contents are held elsewhere
+    private final boolean subscriber;
+    // has filerepo landed files here directly (putfiles, putjar)? kept in the catalog; null until read
+    static final String META_LANDED = "landed";
+    private volatile Boolean landed;
+    private final Object landedLock = new Object();
 
     private AtomicBoolean lockFileMap = new AtomicBoolean();
     private Map<String, Map<String,FileObject>> fileMap;
@@ -104,11 +127,32 @@ public class RepoEngine {
         fileRepoName =  plugin.getConfig().getStringParam("filerepo_name");
         repoDir =  plugin.getConfig().getStringParam("repo_dir");
 
+        String row = plugin.getConfig().getStringParam("live_row");
+        liveRow = (row == null || row.trim().isEmpty()) ? null : row.trim();
+        // the same test start() applies to choose the subscriber mode
+        subscriber = (liveRow == null) && (scanDirString == null) && (fileRepoName != null) && (repoDir != null);
+
         // let idle sync threads retire (core==max would otherwise keep 8 daemons alive forever)
         syncPool.allowCoreThreadTimeOut(true);
     }
 
+    /** True when the repository is backed by a live-tier row (config live_row). */
+    public boolean isLiveBacked() {
+        return liveRow != null;
+    }
+
+    /** The live-tier row this repository is backed by, or null. */
+    public String getLiveRow() {
+        return liveRow;
+    }
+
     public void start() {
+
+        if (liveRow != null) {
+            // read-only and recreatable: nothing here is scanned, broadcast, offered or subscribed to
+            logger.info("live-backed repository (row " + liveRow + "): no scan, no sync");
+            return;
+        }
 
         long delay =  plugin.getConfig().getLongParam("scan_delay", 5000L);
         long period =  plugin.getConfig().getLongParam("scan_period", 15000L);
@@ -124,6 +168,11 @@ public class RepoEngine {
     }
 
     public void startScan(long delay, long period) {
+
+        if (liveRow != null) {
+            logger.error("startScan refused: a live-backed repository runs no scanner");
+            return;
+        }
 
         //stop scan if started
         stopScan();
@@ -142,18 +191,26 @@ public class RepoEngine {
                         //check file location
                         if(Paths.get(scanDirString).toFile().exists()) {
 
-                            // claim the gate atomically (get-then-set raced clearRepo/removeFile);
-                            // the finally guarantees release even if the scan/sync throws
+                            // claim the scan atomically; the finally guarantees release even if the scan/sync throws
                             if (inScan.compareAndSet(false, true)) {
                                 try {
-                                    logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
+                                    // the shared side of the repository gate: a clear holding it skips this cycle
+                                    if (gate.readLock().tryLock()) {
+                                        try {
+                                            logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
 
-                                    //build file list
-                                    Map<String, FileObject> diffList = getFileRepoDiff();
-                                    if (diffList.size() > 0) {
+                                            //build file list
+                                            Map<String, FileObject> diffList = getFileRepoDiff();
+                                            if (diffList.size() > 0) {
 
-                                        logger.debug("SYNC Files");
-                                        syncRegionFiles(diffList);
+                                                logger.debug("SYNC Files");
+                                                syncRegionFiles(diffList);
+                                            }
+                                        } finally {
+                                            gate.readLock().unlock();
+                                        }
+                                    } else {
+                                        logger.debug("scan skipped: a clear holds the repository gate");
                                     }
                                 } finally {
                                     inScan.set(false);
@@ -221,6 +278,11 @@ public class RepoEngine {
         }
         try { syncPool.shutdownNow(); } catch (Exception ex) { logger.error("syncPool shutdown error", ex); }
 
+    }
+
+    /** True while the scan timer is scheduled. */
+    boolean isScanScheduled() {
+        return fileScanTimer != null;
     }
 
     public void stopScan() {
@@ -713,23 +775,73 @@ public class RepoEngine {
         return dbEngine.isCatalogHealthy();
     }
 
-    public Boolean clearRepo() {
-        boolean isRemoved = false;
+    /**
+     * MIRROR or ONLY_COPY, from configuration and the catalog: a subscriber mirror is MIRROR until filerepo lands
+     * files in it directly (putfiles, putjar), and every other repository is the origin of what it holds. Costs one
+     * catalog lookup and one index probe, whatever the repository's size; never a walk. A subscriber's synced files are
+     * not cataloged, so cataloged rows there are files that were landed.
+     */
+    RepoState localState() {
+        Map<String, String> facts = new LinkedHashMap<>();
+        facts.put("backing", "local");
+        if (!subscriber) {
+            facts.put("role", fileScanTimer != null ? "producer" : "on-demand");
+            return RepoState.of(RepoState.ONLY_COPY, facts,
+                    "the origin of what it holds: no producer refills it");
+        }
+        facts.put("role", "subscriber");
+        boolean hasLanded = isLanded() || dbEngine.hasFiles();
+        facts.put("landed", String.valueOf(hasLanded));
+        if (hasLanded) {
+            return RepoState.of(RepoState.ONLY_COPY, facts,
+                    "a mirror that files were landed in directly (putfiles, putjar): its producer does not hold them");
+        }
+        return RepoState.of(RepoState.MIRROR, facts, "a mirror of its producer: what it holds, the producer holds");
+    }
+
+    /** What a clear did. */
+    static final class Clear {
+        static final String CLEARED = "cleared", ONLY_COPY = "only-copy", BUSY = "busy", FAILED = "failed";
+        final String outcome;
+        // the state the clear decided on, under the gate; null when the gate was not had
+        final RepoState state;
+        // files under the repository directory the delete could not remove
+        final long remaining;
+        final String why;
+
+        Clear(String outcome, RepoState state, long remaining, String why) {
+            this.outcome = outcome;
+            this.state = state;
+            this.remaining = remaining;
+            this.why = why;
+        }
+    }
+
+    /**
+     * Wipe the repository: every cataloged file and every regular file under the repository directory. Correct for a
+     * mirror, whose producer holds the same files; unrecoverable for an only copy, which is refused unless
+     * {@code force}. The repository gate is taken exclusively BEFORE the check and held through the delete, and every
+     * landing takes its shared side, so no file filerepo lands can arrive between the check and the delete.
+     */
+    public Clear clearRepo(boolean force) {
         boolean acquired = false;
         try {
-
-            // claim the scan gate atomically, with a bounded wait: the old get-then-set + unbounded
-            // sleep-loop could spin a dispatch thread forever if inScan was stuck latched
-            long deadline = System.currentTimeMillis() + 30000L;
-            while (!inScan.compareAndSet(false, true)) {
-                if (System.currentTimeMillis() > deadline) {
-                    logger.warn("clearRepo: timed out waiting for scan to stop");
-                    return false;
-                }
-                Thread.sleep(200);
-                logger.info("Waiting for file scan to stop");
+            // a bounded wait for the gate: a running scan or landing finishes first
+            acquired = gate.writeLock().tryLock(gateWaitMs, TimeUnit.MILLISECONDS);
+            if (!acquired) {
+                logger.warn("clearRepo: timed out waiting for the repository gate");
+                return new Clear(Clear.BUSY, null, 0, "the repository gate was held by a scan or a landing for "
+                        + gateWaitMs + " ms");
             }
-            acquired = true;
+
+            RepoState state = localState();
+            if (RepoState.ONLY_COPY.equals(state.state) && !force) {
+                logger.warn("clearrepo refused: " + state.desc + "; force=true clears it anyway");
+                return new Clear(Clear.ONLY_COPY, state, 0, state.desc);
+            }
+
+            Runnable hook = afterClearCheck;
+            if (hook != null) hook.run();
 
             //List all files recorded in repo and remove them
             List<Map<String,String>> repoFileList = dbEngine.getRepoList();
@@ -739,21 +851,94 @@ public class RepoEngine {
                 removeFile.delete();
             }
             //delete any files or directories not recorded in repo dir (close the walk stream)
+            long remaining = 0;
             try (java.util.stream.Stream<Path> walk = Files.walk(Paths.get(getRepoDir().getAbsolutePath()))) {
-                walk.filter(Files::isRegularFile).map(Path::toFile).forEach(File::delete);
+                for (Path p : (Iterable<Path>) walk::iterator) {
+                    if (Files.isRegularFile(p) && !p.toFile().delete()) remaining++;
+                }
             }
+            if (remaining == 0) {
+                // nothing landed is left: a mirror is a mirror again
+                clearLanded();
+            } else {
+                logger.warn("clearRepo: " + remaining + " file(s) could not be deleted");
+            }
+            return new Clear(Clear.CLEARED, state, remaining, remaining == 0 ? "cleared"
+                    : remaining + " file(s) could not be deleted");
 
-            isRemoved = true;
-
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            return new Clear(Clear.FAILED, null, 0, "interrupted");
         } catch (Exception ex) {
             logger.error("clearRepo: " + ex.getMessage());
-            isRemoved = false;
+            return new Clear(Clear.FAILED, null, 0, String.valueOf(ex.getMessage()));
         } finally {
-            // ALWAYS release the gate, even on exception, or the scanner stalls forever and every
-            // later clearrepo spins waiting for a flag that never clears
-            if (acquired) inScan.set(false);
+            // ALWAYS release the gate, even on exception, or every later scan, landing and clear waits on it
+            if (acquired) gate.writeLock().unlock();
         }
-        return isRemoved;
+    }
+
+    /**
+     * Take the shared side of the repository gate for a landing (putfiles, putjar): it waits, bounded, while a clear
+     * holds the gate. False when the gate could not be had, and nothing may be landed; otherwise call exitGate().
+     */
+    boolean enterGate() {
+        try {
+            if (gate.readLock().tryLock(gateWaitMs, TimeUnit.MILLISECONDS)) return true;
+            logger.warn("landing refused: a clear held the repository gate for " + gateWaitMs + " ms");
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+        }
+        return false;
+    }
+
+    void exitGate() {
+        gate.readLock().unlock();
+    }
+
+    /**
+     * Record, before the first byte lands, that filerepo landed files here directly. In memory first, so it holds even
+     * if the catalog write fails.
+     */
+    void markLanded() {
+        if (Boolean.TRUE.equals(landed)) return;
+        synchronized (landedLock) {
+            if (Boolean.TRUE.equals(landed)) return;
+            landed = Boolean.TRUE;
+            try {
+                dbEngine.setMeta(META_LANDED, "true");
+            } catch (Exception ex) {
+                logger.error("could not record a landing in the catalog: " + ex.getMessage());
+            }
+        }
+    }
+
+    private boolean isLanded() {
+        Boolean l = landed;
+        if (l != null) return l;
+        synchronized (landedLock) {
+            if (landed != null) return landed;
+            try {
+                landed = "true".equals(dbEngine.getMeta(META_LANDED));
+                return landed;
+            } catch (Exception ex) {
+                // fail closed (and not cached, so a later read can recover)
+                logger.error("landing record unreadable, counted as landed: " + ex.getMessage());
+                return true;
+            }
+        }
+    }
+
+    private void clearLanded() {
+        synchronized (landedLock) {
+            try {
+                dbEngine.deleteMeta(META_LANDED);
+                landed = Boolean.FALSE;
+            } catch (Exception ex) {
+                // keep counting it landed: the record still says so
+                logger.error("could not clear the landing record: " + ex.getMessage());
+            }
+        }
     }
 
     public Boolean removeFile(String fileRepoName, String fileName) {
@@ -783,6 +968,10 @@ public class RepoEngine {
     public Boolean putFiles(List<String> fileList, String repoName, boolean overwrite, boolean isLocal) {
 
         boolean isUploaded = false;
+        // the shared side of the repository gate: nothing lands between a clear's check and its delete
+        if (!enterGate()) {
+            return false;
+        }
         try {
 
             boolean isFault = false;
@@ -797,6 +986,9 @@ public class RepoEngine {
                 File checkFile = new File(fileSavePath);
 
                 if ((checkFile.exists() && overwrite) || (!checkFile.exists())) {
+
+                    // before the first byte lands: from here on, this repository holds files only it has
+                    markLanded();
 
                     File fileSaved = new File(fileSavePath);
 
@@ -841,6 +1033,8 @@ public class RepoEngine {
 
         } catch(Exception ex){
             logger.error("filerepo error", ex);
+        } finally {
+            exitGate();
         }
 
         return isUploaded;

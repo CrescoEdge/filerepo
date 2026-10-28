@@ -97,7 +97,7 @@ public class DBEngine {
         return isShutdown;
     }
 
-    /** Create the FILELIST table if it is absent. Idempotent; safe to run on every boot. */
+    /** Create the FILELIST and REPOMETA tables if they are absent. Idempotent; safe to run on every boot. */
     public void ensureSchema() {
         try (Connection conn = ds.getConnection()) {
             boolean exists;
@@ -109,8 +109,85 @@ public class DBEngine {
                 logger.info("FILELIST table absent; creating catalog schema");
                 initDB();
             }
+            boolean metaExists;
+            try (ResultSet rs = conn.getMetaData().getTables(null, null, "REPOMETA", null)) {
+                metaExists = rs.next();
+            }
+            if (!metaExists) {
+                initMeta();
+            }
         } catch (Exception ex) {
             logger.error("ensureSchema error", ex);
+        }
+    }
+
+    /**
+     * REPOMETA holds a few named facts about the repository itself (that something landed in it, the live-tier roots
+     * this agent holds), kept in the catalog rather than as marker files in the tree, where a scanner would catalog
+     * them and a peer would inherit them.
+     */
+    private void initMeta() {
+        String createRepoMeta = "CREATE TABLE repometa" +
+                "(" +
+                "   name varchar(128) primary key NOT NULL," +
+                "   val varchar(32672)" +
+                ")";
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate(createRepoMeta);
+        } catch(Exception ex) {
+            logger.error("initMeta error", ex);
+        }
+    }
+
+    /** A named repository fact, or null when it is not recorded. Throws when the catalog cannot be read. */
+    public String getMeta(String name) throws SQLException {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT val FROM repometa WHERE name = ?")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    /** Record a named repository fact (insert or replace). Throws when the catalog cannot be written. */
+    public void setMeta(String name, String val) throws SQLException {
+        try (Connection conn = ds.getConnection()) {
+            try (PreparedStatement up = conn.prepareStatement("UPDATE repometa SET val = ? WHERE name = ?")) {
+                up.setString(1, val);
+                up.setString(2, name);
+                if (up.executeUpdate() > 0) return;
+            }
+            try (PreparedStatement in = conn.prepareStatement("INSERT INTO repometa (name, val) VALUES (?,?)")) {
+                in.setString(1, name);
+                in.setString(2, val);
+                in.executeUpdate();
+            }
+        }
+    }
+
+    /** Forget a named repository fact. Throws when the catalog cannot be written. */
+    public void deleteMeta(String name) throws SQLException {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM repometa WHERE name = ?")) {
+            ps.setString(1, name);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * True if the catalog holds any row: one index probe, whatever the catalog's size. Fails closed: a catalog that
+     * cannot be read answers true, so nothing is treated as empty that might not be.
+     */
+    public boolean hasFiles() {
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT 1 FROM filelist FETCH FIRST 1 ROWS ONLY")) {
+            return rs.next();
+        } catch (Exception ex) {
+            logger.error("hasFiles error", ex);
+            return true;
         }
     }
 
