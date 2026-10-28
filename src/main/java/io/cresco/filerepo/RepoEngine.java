@@ -374,7 +374,7 @@ public class RepoEngine {
     }
 
     //build and sync
-    private Map<String,FileObject> getFileRepoDiff() {
+    Map<String,FileObject> getFileRepoDiff() {
 
         Map<String,FileObject> fileDiffMap = null;
         try {
@@ -497,6 +497,10 @@ public class RepoEngine {
                 }
                 File unsyncedFile = new File(filePath);
                 if (!unsyncedFile.isFile()) {
+                    continue;
+                }
+                // a row cataloged before a live-tier root was known is never offered from it
+                if (liveRootConflict(unsyncedFile.toPath()) != null) {
                     continue;
                 }
                 String reofferName;

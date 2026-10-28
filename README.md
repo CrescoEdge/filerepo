@@ -162,8 +162,8 @@ provider is away and across restarts:
   links resolved (`status 9`, `refusal=live-root`);
 - a repository whose `scan_dir` or `repo_dir` lies in, or contains, a live-tier root is refused like a live-backed one,
   and its scanner skips;
-- the scanner skips links into a root, the sync downloader refuses destinations that lead into one, and a clear
-  forgets cataloged files in a root without deleting them;
+- the scanner skips links into a root and never re-offers a cataloged file that lies in one, the sync downloader
+  refuses destinations that lead into one, and a clear forgets cataloged files in a root without deleting them;
 - while a provider is registered whose root cannot be learned, all of this fails closed (retried after 30 s, or as
   soon as a provider registers again).
 

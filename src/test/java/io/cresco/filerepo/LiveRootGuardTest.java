@@ -185,6 +185,23 @@ class LiveRootGuardTest {
     }
 
     @Test
+    void aRowCatalogedBeforeTheRootWasKnownIsNeverReoffered() throws Exception {
+        registerProvider(provider);
+        Path scan = Files.createDirectories(tmp.resolve("scan"));
+        Path plain = Files.write(scan.resolve("plain.txt"), "scanned".getBytes());
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put("scan_dir", scan.toString());
+        cfg.put("filerepo_name", "fr");
+        rig(cfg);
+        // unconfirmed rows (insync=0): one ordinary, one in the live root, cataloged before the root was known
+        rig.db.addFile(plain.toString(), rig.plugin.getMD5(plain.toString()), Files.getLastModifiedTime(plain).toMillis(), 7L);
+        rig.db.addFile(secret.toString(), "md5", 1L, 9L);
+        Map<String, FileObject> offered = rig.repo.getFileRepoDiff();
+        assertTrue(offered.containsKey(plain.toString()), "an unconfirmed ordinary file is re-offered as before: " + offered.keySet());
+        assertFalse(offered.containsKey(secret.toString()), "one in a live-tier root never is");
+    }
+
+    @Test
     void syncNeverWritesThroughALinkIntoALiveRoot() throws Exception {
         registerProvider(provider);
         Path mirror = Files.createDirectories(tmp.resolve("mirror"));
