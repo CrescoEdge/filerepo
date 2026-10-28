@@ -89,6 +89,14 @@ class LiveRootGuardTest {
         Path link = Files.createSymbolicLink(tmp.resolve("innocent.txt"), secret);
         assertEquals("live-root", rig.call(pushRemote(link)).getParam("refusal"), "a link into the root is resolved");
 
+        // dir/link/../secret.txt is, to the filesystem, the secret beside the link's target, not dir/secret.txt
+        Path inner = Files.createDirectories(secret.getParent().resolve("inner"));
+        Path dir = Files.createDirectories(tmp.resolve("dir"));
+        Files.createSymbolicLink(dir.resolve("link"), inner);
+        Path dotted = Path.of(dir + "/link/../secret.txt");
+        assertTrue(Files.exists(dotted), "the filesystem reaches the secret through it");
+        assertEquals("live-root", rig.call(pushRemote(dotted)).getParam("refusal"), ".. is resolved after the link, not before");
+
         MsgEvent ok = rig.call(pushRemote(ordinary));
         assertEquals("10", ok.getParam("status"), "an ordinary file is pushed as before");
         assertEquals(1, rig.sent.size());

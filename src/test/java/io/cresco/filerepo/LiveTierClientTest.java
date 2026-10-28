@@ -229,6 +229,24 @@ class LiveTierClientTest {
     }
 
     @Test
+    void canonicalResolvesAPathAsTheFilesystemDoes(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) throws Exception {
+        java.nio.file.Path base = tmp.toRealPath();
+        java.nio.file.Path target = java.nio.file.Files.createDirectories(base.resolve("t/inner"));
+        java.nio.file.Path dir = java.nio.file.Files.createDirectories(base.resolve("d"));
+        java.nio.file.Files.createSymbolicLink(dir.resolve("link"), target);
+        // an existing path: its real path
+        assertEquals(target, LiveTierClient.canonical(dir.resolve("link")));
+        // a name below a link that does not exist yet: under the link's target
+        assertEquals(target.resolve("new/file"), LiveTierClient.canonical(dir.resolve("link/new/file")));
+        // .. after a link is the target's parent, not the link's
+        assertEquals(base.resolve("t/x"), LiveTierClient.canonical(java.nio.file.Path.of(dir + "/link/../x")));
+        // a missing directory, then .., then the link
+        assertEquals(target.resolve("y"), LiveTierClient.canonical(java.nio.file.Path.of(dir + "/missing/../link/y")));
+        // nothing exists below the root of the filesystem but the root itself: still an absolute path
+        assertTrue(LiveTierClient.canonical(java.nio.file.Path.of("relative/name")).isAbsolute());
+    }
+
+    @Test
     void rowFindsOneRowOfAListAnswer() {
         registerProvider(provider, SELF);
         LiveTierClient c = client(SELF, 1000, 1000, 2);

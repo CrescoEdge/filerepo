@@ -142,95 +142,6 @@ public class LiveTierClient {
         return a;
     }
 
-    /**
-     * Seed the live roots remembered from before (they hold while no provider is registered), and be told of each root
-     * learned from now on, to remember it.
-     */
-    public void rememberRoots(Collection<String> known, Consumer<String> onNew) {
-        if (known != null) {
-            for (String r : known) {
-                if (r != null && !r.trim().isEmpty()) roots.add(canonical(Paths.get(r.trim())));
-            }
-        }
-        this.onNewRoot = onNew;
-    }
-
-    /** The live roots known now, learning the provider's first when one is registered whose root is not known yet. */
-    public Set<Path> liveRoots() {
-        learn();
-        return java.util.Collections.unmodifiableSet(roots);
-    }
-
-    /**
-     * Why {@code p} may not be touched through filerepo, as a phrase ("lies in a live-tier root", "contains a live-tier
-     * root", "cannot be checked: ..." while a registered provider's root cannot be learned: fail closed), or null when it
-     * may. Symbolic links are resolved
-     * through the nearest existing ancestor, so a link into a live root is caught. O(live roots), not O(files).
-     */
-    public String liveRootConflict(Path p) {
-        if (p == null) return null;
-        learn();
-        if (roots.isEmpty()) {
-            return present() ? "cannot be checked: a live-tier provider is registered and its root is not known yet" : null;
-        }
-        Path c = canonical(p);
-        for (Path r : roots) {
-            if (c.startsWith(r)) return "lies in a live-tier root";
-            if (r.startsWith(c)) return "contains a live-tier root";
-        }
-        return null;
-    }
-
-    private void learn() {
-        ServiceTracker<Object, Object> t = tracker;
-        if (t == null) return;
-        int tc = t.getTrackingCount();
-        if (tc == learnedAt || provider() == null) return;
-        long now = System.currentTimeMillis();
-        if (tc == failedAt && now < retryLearnAt) return;
-        Answer a = list();
-        if (a.ok() && a.reply.get("root") != null) {
-            learnedAt = tc;
-        } else {
-            failedAt = tc;
-            retryLearnAt = now + LEARN_RETRY_MS;
-        }
-    }
-
-    private void noteRoot(Object root) {
-        if (root == null || String.valueOf(root).trim().isEmpty()) return;
-        Path r = canonical(Paths.get(String.valueOf(root).trim()));
-        if (roots.add(r)) {
-            logger.info("live-tier root learned: filerepo serves, lands, deletes and syncs nothing under it");
-            Consumer<String> remember = onNewRoot;
-            if (remember != null) {
-                try {
-                    remember.accept(r.toString());
-                } catch (Exception ex) {
-                    logger.error("could not remember a live-tier root: " + ex.getMessage());
-                }
-            }
-        }
-    }
-
-    /** The real path of {@code p}, resolved through its nearest existing ancestor; the normalized path otherwise. */
-    static Path canonical(Path p) {
-        Path abs = p.toAbsolutePath().normalize();
-        Path cur = abs, tail = null;
-        while (cur != null) {
-            try {
-                Path real = cur.toRealPath();
-                return tail == null ? real : real.resolve(tail).normalize();
-            } catch (IOException | SecurityException notThere) {
-                Path name = cur.getFileName();
-                if (name == null) break;
-                tail = tail == null ? name : name.resolve(tail);
-                cur = cur.getParent();
-            }
-        }
-        return abs;
-    }
-
     /** A workspace row's cached change summary: no walk, whatever the workspace's size. */
     public Answer changes(String row) {
         Map<String, Object> q = request("changes");
@@ -279,6 +190,109 @@ public class LiveTierClient {
             }
         }
         return null;
+    }
+
+    // ------------------------------------------------------------------ live roots
+
+    /**
+     * Seed the live roots remembered from before (they hold while no provider is registered), and be told of each root
+     * learned from now on, to remember it.
+     */
+    public void rememberRoots(Collection<String> known, Consumer<String> onNew) {
+        if (known != null) {
+            for (String r : known) {
+                if (r != null && !r.trim().isEmpty()) roots.add(canonical(Paths.get(r.trim())));
+            }
+        }
+        this.onNewRoot = onNew;
+    }
+
+    /**
+     * Why {@code p} may not be touched through filerepo, as a phrase ("lies in a live-tier root", "contains a live-tier
+     * root", or "cannot be checked: ..." while a registered provider's root cannot be learned: fail closed), or null when
+     * it may. The path is resolved as the filesystem resolves it (see {@link #canonical}), so a link into a root is
+     * caught. O(live roots), not O(files).
+     */
+    public String liveRootConflict(Path p) {
+        if (p == null) return null;
+        learn();
+        if (roots.isEmpty()) {
+            return present() ? "cannot be checked: a live-tier provider is registered and its root is not known yet" : null;
+        }
+        Path c = canonical(p);
+        for (Path r : roots) {
+            if (c.startsWith(r)) return "lies in a live-tier root";
+            if (r.startsWith(c)) return "contains a live-tier root";
+        }
+        return null;
+    }
+
+    private void learn() {
+        ServiceTracker<Object, Object> t = tracker;
+        if (t == null) return;
+        int tc = t.getTrackingCount();
+        if (tc == learnedAt || provider() == null) return;
+        long now = System.currentTimeMillis();
+        if (tc == failedAt && now < retryLearnAt) return;
+        Answer a = list();
+        if (a.ok() && a.reply.get("root") != null) {
+            learnedAt = tc;
+        } else {
+            failedAt = tc;
+            retryLearnAt = now + LEARN_RETRY_MS;
+        }
+    }
+
+    private void noteRoot(Object root) {
+        if (root == null || String.valueOf(root).trim().isEmpty()) return;
+        Path r = canonical(Paths.get(String.valueOf(root).trim()));
+        if (roots.add(r)) {
+            logger.info("live-tier root learned: filerepo serves, lands, deletes and syncs nothing under it");
+            Consumer<String> remember = onNewRoot;
+            if (remember != null) {
+                try {
+                    remember.accept(r.toString());
+                } catch (Exception ex) {
+                    logger.error("could not remember a live-tier root: " + ex.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * {@code p} as the filesystem resolves it: the real path of its nearest existing ancestor, then the rest name by
+     * name, a {@code ..} taking the physical parent and every name that exists resolved again. Never normalized
+     * lexically first: {@code dir/link/../x} is where {@code link}'s target's parent says, not {@code dir/x}.
+     */
+    static Path canonical(Path p) {
+        Path abs = p.toAbsolutePath();
+        java.util.Deque<Path> below = new java.util.ArrayDeque<>();
+        Path real = null;
+        for (Path cur = abs; cur != null; cur = cur.getParent()) {
+            try {
+                real = cur.toRealPath();
+                break;
+            } catch (IOException | SecurityException notThere) {
+                if (cur.getFileName() == null) break;
+                below.push(cur.getFileName());
+            }
+        }
+        if (real == null) return abs.normalize();
+        for (Path name : below) {
+            String n = name.toString();
+            if (n.equals(".")) continue;
+            if (n.equals("..")) {
+                if (real.getParent() != null) real = real.getParent();
+                continue;
+            }
+            real = real.resolve(n);
+            try {
+                real = real.toRealPath();
+            } catch (IOException | SecurityException notThere) {
+                // does not exist (yet): kept as named
+            }
+        }
+        return real;
     }
 
     private static Map<String, Object> request(String op) {
