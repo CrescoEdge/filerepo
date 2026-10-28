@@ -256,6 +256,13 @@ public class ExecutorImpl implements Executor {
             if (repoEngine.isLiveBacked() && (action == null || !LIVE_BACKED_VERBS.contains(action))) {
                 return refuseLiveBacked(incoming);
             }
+            // a repository whose own directory lies in (or contains) a live-tier root is refused the same way
+            if (action != null && !LIVE_BACKED_VERBS.contains(action)) {
+                String conflict = repoEngine.repoDirConflict();
+                if (conflict != null) {
+                    return refuseLiveRoot(incoming, "this repository's directory " + conflict);
+                }
+            }
             switch (action) {
 
                 case "repolist":
@@ -547,6 +554,10 @@ public class ExecutorImpl implements Executor {
 
             if(incoming.getParam("file_path") != null){
                 String filePath = incoming.getParam("file_path");
+                String conflict = repoEngine.liveRootConflict(Paths.get(filePath));
+                if (conflict != null) {
+                    return refuseLiveRoot(incoming, "the file " + conflict);
+                }
                 //logger.error("file_name: " + filename);
 
                 ///opt/cresco/filerepo/extract_dump_7e90b402-8076-11ec-bc89-0242ac11001a.json
@@ -699,6 +710,10 @@ public class ExecutorImpl implements Executor {
 
             if(incoming.getParam("file_path") != null) {
                 String filePath = incoming.getParam("file_path");
+                String conflict = repoEngine.liveRootConflict(Paths.get(filePath));
+                if (conflict != null) {
+                    return refuseLiveRoot(incoming, "the file " + conflict);
+                }
 
                 File file = new File(filePath);
                 if(file.exists()) {
@@ -805,6 +820,13 @@ public class ExecutorImpl implements Executor {
 
                 String fileListString = incoming.getCompressedParam("file_list");
                 List<String> fileList = gson.fromJson(fileListString, listType);
+                // these are any paths the caller names: none may lie in a live-tier root
+                for (String f : fileList == null ? Collections.<String>emptyList() : fileList) {
+                    String conflict = repoEngine.liveRootConflict(Paths.get(f));
+                    if (conflict != null) {
+                        return refuseLiveRoot(incoming, "a listed file " + conflict);
+                    }
+                }
                 String dst_region = incoming.getParam("dst_region");
                 String dst_agent = incoming.getParam("dst_agent");
                 String dst_plugin = incoming.getParam("dst_plugin");
@@ -897,6 +919,21 @@ public class ExecutorImpl implements Executor {
         incoming.setParam("status_desc","refused: this repository is backed by live-tier row " + repoEngine.getLiveRow()
                 + ", read only through the filesystem at this node; filerepo does not serve, write, delete, sync or list it");
         incoming.setParam("refusal","live-backed");
+        return incoming;
+    }
+
+    /**
+     * The refusal of anything in a live-tier root, whatever the repository: those files are the provider's, read only
+     * through the filesystem at this node, never served, landed, deleted or synced through filerepo.
+     */
+    private MsgEvent refuseLiveRoot(MsgEvent incoming, String why) {
+        for (String payload : new String[]{"jardata", "filedata", "file_data", "repolistin"}) {
+            if (incoming.getParams().containsKey(payload)) incoming.removeParam(payload);
+        }
+        incoming.setParam("status","9");
+        incoming.setParam("status_code","9");
+        incoming.setParam("status_desc","refused: " + why + "; files in a live-tier root are read only through the filesystem at this node");
+        incoming.setParam("refusal","live-root");
         return incoming;
     }
 
@@ -1103,6 +1140,14 @@ public class ExecutorImpl implements Executor {
             if((fileList != null) && incoming.paramsContains("repo_name")){
 
                 String repoName = incoming.getParam("repo_name");
+
+                // a landing from this agent copies the paths the caller names: none may lie in a live-tier root
+                for (String f : fileList) {
+                    String conflict = repoEngine.liveRootConflict(Paths.get(f));
+                    if (conflict != null) {
+                        return refuseLiveRoot(incoming, "a file to land " + conflict);
+                    }
+                }
 
 
                 try{

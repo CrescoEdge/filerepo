@@ -37,6 +37,8 @@ final class TestRig implements AutoCloseable {
     final List<String> listeners = Collections.synchronizedList(new ArrayList<>());
     /** Dataplane messages filerepo sent. */
     final List<Object> dataplaneSent = Collections.synchronizedList(new ArrayList<>());
+    /** Remote files filerepo asked the agent to download (remote path), in order; each "fails" (null). */
+    final List<String> downloads = Collections.synchronizedList(new ArrayList<>());
     /** Every warn and error line logged. */
     final List<String> log = Collections.synchronizedList(new ArrayList<>());
 
@@ -48,7 +50,7 @@ final class TestRig implements AutoCloseable {
         this.config.put("pluginID", PLUGIN_ID);
         this.plugin = new PluginBuilder(agent(), "io.cresco.filerepo.Plugin", null, this.config);
         this.db = new DBEngine(plugin);
-        this.repo = new RepoEngine(plugin, db);
+        this.repo = new RepoEngine(plugin, db, live);
         this.exec = new ExecutorImpl(plugin, repo, live);
         plugin.setIsActive(true);
     }
@@ -109,6 +111,9 @@ final class TestRig implements AutoCloseable {
                         case "sendMessage":
                             dataplaneSent.add(a[a.length > 2 && !(a[1] instanceof jakarta.jms.Message) ? 2 : 1]);
                             return true;
+                        case "downloadRemoteFile":
+                            downloads.add(String.valueOf(a[2]));
+                            return null;
                         default:
                             return defaultValue(m.getReturnType());
                     }

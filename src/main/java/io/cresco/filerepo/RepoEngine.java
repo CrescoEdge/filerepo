@@ -58,6 +58,13 @@ public class RepoEngine {
     private volatile Boolean landed;
     private final Object landedLock = new Object();
 
+    // the live-tier client (may be null): nothing under a live-tier root it knows of is scanned, synced or deleted
+    // here, and the roots it learns are remembered in the catalog, so they hold while the provider is away
+    private final LiveTierClient liveTier;
+    static final String META_LIVE_ROOTS = "live_roots";
+    private final Object liveRootsLock = new Object();
+    private volatile boolean warnedRepoDirConflict;
+
     private AtomicBoolean lockFileMap = new AtomicBoolean();
     private Map<String, Map<String,FileObject>> fileMap;
 
@@ -105,10 +112,15 @@ public class RepoEngine {
             r -> { Thread t = new Thread(r, "filerepo-sync"); t.setDaemon(true); return t; });
 
     public RepoEngine(PluginBuilder pluginBuilder, DBEngine dbEngine) {
+        this(pluginBuilder, dbEngine, null);
+    }
+
+    public RepoEngine(PluginBuilder pluginBuilder, DBEngine dbEngine, LiveTierClient liveTier) {
 
         this.plugin = pluginBuilder;
         logger = plugin.getLogger(RepoEngine.class.getName(), CLogger.Level.Info);
         this.dbEngine = dbEngine;
+        this.liveTier = liveTier;
         gson = new Gson();
 
         this.repoListType = new TypeToken<Map<String,FileObject>>() {}.getType();
@@ -132,8 +144,52 @@ public class RepoEngine {
         // the same test start() applies to choose the subscriber mode
         subscriber = (liveRow == null) && (scanDirString == null) && (fileRepoName != null) && (repoDir != null);
 
+        if (liveTier != null) {
+            List<String> known = new ArrayList<>();
+            try {
+                String v = dbEngine.getMeta(META_LIVE_ROOTS);
+                if (v != null) known.addAll(Arrays.asList(v.split("\n")));
+            } catch (Exception ex) {
+                logger.error("remembered live-tier roots unreadable: " + ex.getMessage());
+            }
+            liveTier.rememberRoots(known, this::rememberLiveRoot);
+        }
+
         // let idle sync threads retire (core==max would otherwise keep 8 daemons alive forever)
         syncPool.allowCoreThreadTimeOut(true);
+    }
+
+    /** Keep a live-tier root in the catalog, so it is refused even while no provider is registered. */
+    private void rememberLiveRoot(String root) {
+        synchronized (liveRootsLock) {
+            try {
+                Set<String> all = new LinkedHashSet<>();
+                String v = dbEngine.getMeta(META_LIVE_ROOTS);
+                if (v != null) all.addAll(Arrays.asList(v.split("\n")));
+                if (all.add(root)) dbEngine.setMeta(META_LIVE_ROOTS, String.join("\n", all));
+            } catch (Exception ex) {
+                logger.error("could not remember a live-tier root in the catalog: " + ex.getMessage());
+            }
+        }
+    }
+
+    /** Why {@code p} may not be touched through filerepo (it lies in or contains a live-tier root), or null. */
+    String liveRootConflict(Path p) {
+        return liveTier == null ? null : liveTier.liveRootConflict(p);
+    }
+
+    /**
+     * Why this repository's own directories (scan_dir, repo_dir) may not be used, or null: they lie in or contain a
+     * live-tier root. Such a repository is refused like a live-backed one and scans nothing.
+     */
+    String repoDirConflict() {
+        if (liveTier == null) return null;
+        for (String dir : new String[]{scanDirString, plugin.getConfig().getStringParam("repo_dir", "filerepo")}) {
+            if (dir == null) continue;
+            String why = liveTier.liveRootConflict(Paths.get(dir));
+            if (why != null) return why;
+        }
+        return null;
     }
 
     /** True when the repository is backed by a live-tier row (config live_row). */
@@ -194,8 +250,15 @@ public class RepoEngine {
                             // claim the scan atomically; the finally guarantees release even if the scan/sync throws
                             if (inScan.compareAndSet(false, true)) {
                                 try {
+                                    String conflict = repoDirConflict();
+                                    if (conflict != null) {
+                                        // a scan dir over live-tier files: catalog and offer none of them
+                                        if (!warnedRepoDirConflict) {
+                                            logger.error("scan refused: the scan dir " + conflict);
+                                            warnedRepoDirConflict = true;
+                                        }
                                     // the shared side of the repository gate: a clear holding it skips this cycle
-                                    if (gate.readLock().tryLock()) {
+                                    } else if (gate.readLock().tryLock()) {
                                         try {
                                             logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
 
@@ -384,6 +447,12 @@ public class RepoEngine {
 
                         String MD5hash = null;
                         if (add || update) {
+                            // a link into a live-tier root is never read, cataloged or offered
+                            String conflict = liveRootConflict(listOfFiles[i].toPath());
+                            if (conflict != null) {
+                                logger.warn("skipping a file that " + conflict);
+                                continue;
+                            }
                             MD5hash = plugin.getMD5(filePath);
                             // Skip files we can't safely catalog: a null md5 means the file vanished
                             // mid-scan (getMD5 failed); a path longer than the catalog column would
@@ -672,6 +741,13 @@ public class RepoEngine {
                                             failedFiles.add(fileObject.filePath);
                                             continue;
                                         }
+                                        // nor may it lead, through a link, into a live-tier root
+                                        String conflict = liveRootConflict(localPath);
+                                        if (conflict != null) {
+                                            logger.error("rejecting peer file: its destination " + conflict);
+                                            failedFiles.add(fileObject.filePath);
+                                            continue;
+                                        }
                                         logger.debug("localFilePath: " + localPath.toFile().getAbsolutePath());
                                         //check that file exists
                                         boolean downloadFile = true;
@@ -843,12 +919,14 @@ public class RepoEngine {
             Runnable hook = afterClearCheck;
             if (hook != null) hook.run();
 
-            //List all files recorded in repo and remove them
+            //List all files recorded in repo and remove them (never one in a live-tier root: only a drop removes those)
             List<Map<String,String>> repoFileList = dbEngine.getRepoList();
             for(Map<String,String> filerecord : repoFileList) {
                 File removeFile = Paths.get(filerecord.get("filepath")).toFile();
                 dbEngine.deleteFile(removeFile.getAbsolutePath());
-                removeFile.delete();
+                if (liveRootConflict(removeFile.toPath()) == null) {
+                    removeFile.delete();
+                }
             }
             //delete any files or directories not recorded in repo dir (close the walk stream)
             long remaining = 0;

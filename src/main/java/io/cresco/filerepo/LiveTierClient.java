@@ -6,9 +6,14 @@ import org.osgi.framework.ServiceReference;
 import org.osgi.util.tracker.ServiceTracker;
 import org.osgi.util.tracker.ServiceTrackerCustomizer;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
@@ -16,6 +21,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
@@ -50,6 +56,11 @@ import java.util.function.Function;
  * </table>
  * An answer may name paths and collections. It stays in this JVM: callers reply over the fabric with states, counts
  * and ids only.
+ *
+ * <p><b>Live roots.</b> The provider's {@code list} names the directory its live copies are held under. The client
+ * learns it (once per registration of a provider), the caller remembers it, and {@link #liveRootConflict} lets filerepo
+ * refuse to serve, land, delete or sync any file inside it, whatever a repository's configuration: those files are read
+ * only through the filesystem at this node, never through filerepo's verbs.
  */
 public class LiveTierClient {
 
@@ -67,6 +78,14 @@ public class LiveTierClient {
     private final ThreadPoolExecutor calls;
     // null when there is no framework (no provider, ever)
     private final ServiceTracker<Object, Object> tracker;
+
+    // Live roots: learned from list answers and from what the caller remembers, kept while the provider is away.
+    private final Set<Path> roots = ConcurrentHashMap.newKeySet();
+    private volatile Consumer<String> onNewRoot;
+    // the tracking count a root was last learned at, and the one a learn last failed at (retried after a pause)
+    private volatile int learnedAt = Integer.MIN_VALUE, failedAt = Integer.MIN_VALUE;
+    private volatile long retryLearnAt;
+    static final long LEARN_RETRY_MS = 30000L;
 
     /**
      * @param context        this bundle's context (the provider admits by its bundle), or null for none
@@ -116,9 +135,100 @@ public class LiveTierClient {
         return provider() != null;
     }
 
-    /** The rows held at this node, and the node's live root. */
+    /** The rows held at this node, and the node's live root (which is learned from every successful answer). */
     public Answer list() {
-        return call(request("list"), localTimeoutMs);
+        Answer a = call(request("list"), localTimeoutMs);
+        if (a.ok()) noteRoot(a.reply.get("root"));
+        return a;
+    }
+
+    /**
+     * Seed the live roots remembered from before (they hold while no provider is registered), and be told of each root
+     * learned from now on, to remember it.
+     */
+    public void rememberRoots(Collection<String> known, Consumer<String> onNew) {
+        if (known != null) {
+            for (String r : known) {
+                if (r != null && !r.trim().isEmpty()) roots.add(canonical(Paths.get(r.trim())));
+            }
+        }
+        this.onNewRoot = onNew;
+    }
+
+    /** The live roots known now, learning the provider's first when one is registered whose root is not known yet. */
+    public Set<Path> liveRoots() {
+        learn();
+        return java.util.Collections.unmodifiableSet(roots);
+    }
+
+    /**
+     * Why {@code p} may not be touched through filerepo, as a phrase ("lies in a live-tier root", "contains a live-tier
+     * root", "cannot be checked: ..." while a registered provider's root cannot be learned: fail closed), or null when it
+     * may. Symbolic links are resolved
+     * through the nearest existing ancestor, so a link into a live root is caught. O(live roots), not O(files).
+     */
+    public String liveRootConflict(Path p) {
+        if (p == null) return null;
+        learn();
+        if (roots.isEmpty()) {
+            return present() ? "cannot be checked: a live-tier provider is registered and its root is not known yet" : null;
+        }
+        Path c = canonical(p);
+        for (Path r : roots) {
+            if (c.startsWith(r)) return "lies in a live-tier root";
+            if (r.startsWith(c)) return "contains a live-tier root";
+        }
+        return null;
+    }
+
+    private void learn() {
+        ServiceTracker<Object, Object> t = tracker;
+        if (t == null) return;
+        int tc = t.getTrackingCount();
+        if (tc == learnedAt || provider() == null) return;
+        long now = System.currentTimeMillis();
+        if (tc == failedAt && now < retryLearnAt) return;
+        Answer a = list();
+        if (a.ok() && a.reply.get("root") != null) {
+            learnedAt = tc;
+        } else {
+            failedAt = tc;
+            retryLearnAt = now + LEARN_RETRY_MS;
+        }
+    }
+
+    private void noteRoot(Object root) {
+        if (root == null || String.valueOf(root).trim().isEmpty()) return;
+        Path r = canonical(Paths.get(String.valueOf(root).trim()));
+        if (roots.add(r)) {
+            logger.info("live-tier root learned: filerepo serves, lands, deletes and syncs nothing under it");
+            Consumer<String> remember = onNewRoot;
+            if (remember != null) {
+                try {
+                    remember.accept(r.toString());
+                } catch (Exception ex) {
+                    logger.error("could not remember a live-tier root: " + ex.getMessage());
+                }
+            }
+        }
+    }
+
+    /** The real path of {@code p}, resolved through its nearest existing ancestor; the normalized path otherwise. */
+    static Path canonical(Path p) {
+        Path abs = p.toAbsolutePath().normalize();
+        Path cur = abs, tail = null;
+        while (cur != null) {
+            try {
+                Path real = cur.toRealPath();
+                return tail == null ? real : real.resolve(tail).normalize();
+            } catch (IOException | SecurityException notThere) {
+                Path name = cur.getFileName();
+                if (name == null) break;
+                tail = tail == null ? name : name.resolve(tail);
+                cur = cur.getParent();
+            }
+        }
+        return abs;
     }
 
     /** A workspace row's cached change summary: no walk, whatever the workspace's size. */

@@ -62,7 +62,8 @@ class NonLiveRepositoryTest {
     @Test
     void theTouchedVerbsAnswerAsBeforeWithAProviderPresent() throws Exception {
         assertVerbsAsBefore(onDemand(true));
-        assertTrue(provider.requests.isEmpty(), "a repository that is not live-backed never asks the provider: " + provider.requests);
+        assertEquals(List.of(Map.of("op", "list")), provider.requests,
+                "a repository that is not live-backed asks the provider once, for its live root, and nothing else");
     }
 
     void assertVerbsAsBefore(TestRig rig) throws Exception {

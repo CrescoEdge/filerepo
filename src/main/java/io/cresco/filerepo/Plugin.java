@@ -91,9 +91,6 @@ public class Plugin implements PluginService {
 
                 dbEngine = new DBEngine(pluginBuilder);
 
-                //Starting the RepoEngine Threads
-                repoEngine = new RepoEngine(pluginBuilder, dbEngine);
-
                 // Track a live-tier provider service through this bundle's own context (the provider admits callers by
                 // bundle). Without one filerepo works exactly as before; every call to one is bounded.
                 liveTier = new LiveTierClient(context,
@@ -101,6 +98,9 @@ public class Plugin implements PluginService {
                         pluginBuilder.getConfig().getLongParam("live_timeout_ms", 5000L),
                         pluginBuilder.getConfig().getLongParam("live_core_timeout_ms", 25000L),
                         (int) (long) pluginBuilder.getConfig().getLongParam("live_max_calls", 4L));
+
+                //Starting the RepoEngine Threads
+                repoEngine = new RepoEngine(pluginBuilder, dbEngine, liveTier);
 
                 //Starting custom message handler
                 this.executor = new ExecutorImpl(pluginBuilder, repoEngine, liveTier);
