@@ -95,20 +95,23 @@ filerepo looks the provider up in the OSGi service registry with the filter
 that is, a `java.util.function.Function<Map<String,Object>,Map<String,Object>>` registered with the property
 `gfs.livetier=local`. It is tracked with a `ServiceTracker` through filerepo's own bundle context, so its absence,
 its arrival and its departure are all tolerated. The provider admits callers by the **bundle** the framework names
-when the service is got (filerepo's symbolic name is `io.cresco.filerepo`), never by anything a message carries; a
-provider that does not admit filerepo hands it nothing, which filerepo treats as no provider.
+when the service is got (filerepo's symbolic name is `io.cresco.filerepo`), never by anything a message carries. A
+provider that does not admit filerepo hands it nothing: filerepo never asks it anything and never counts it present,
+but it still tracks it, because it cannot learn that provider's root (see [Live-tier roots](#live-tier-roots)). With
+several providers registered, filerepo asks the highest-ranked one that admits it.
 
-Every call runs on a small pool of its own and is bounded: `live_timeout_ms` for `list` and `changes`,
-`live_core_timeout_ms` for `realise` and `relay`. A hung provider costs a caller its timeout and holds at most
-`live_max_calls` threads; while they are all held, further calls are refused at once. filerepo's message threads are
-never wedged.
+Every call is bounded: `live_timeout_ms` for `list` and `changes`, which the provider answers itself, and
+`live_core_timeout_ms` for `realise` and `relay`, which it forwards. The two kinds run on separate small pools, so
+forwarded calls that are held up elsewhere never starve the local answers that `repostate` and the root checks need.
+A hung provider costs a caller its timeout and holds at most `live_max_calls` threads of each pool; while a pool's
+threads are all held, further calls of that kind are refused at once. filerepo's message threads are never wedged.
 
 The maps filerepo sends, and the answers it expects (every answer carries `status`, `10` for success, and
 `status_desc` on a refusal):
 
 | Op | Request | Answer |
 |---|---|---|
-| `list` | `{op: list}` | `rows`: one map per row held at this node (`row`, `state`, `mode` `copy` or `workspace`, `files`, `bytes`, `lease_until`, `damaged`, and what it holds), and `root`, the directory the rows are held under |
+| `list` | `{op: list}`, or `{op: list, row}` for one row | `rows`: one map per row held at this node (`row`, `state`, `mode` `copy` or `workspace`, `files`, `bytes`, `lease_until`, `damaged`, and what it holds), and `root`, the directory the rows are held under. Asked for one `row`, a provider may answer with that row alone (one lookup, whatever the number of rows); filerepo finds the row either way |
 | `changes` | `{op: changes, row}` | a workspace's cached change summary: `state` `clean` or `dirty`, `changed`, `refused`, `as_of`, and `scanning` while its first walk runs |
 | `realise` | `{op: realise, params: {collection, vid, prefix, lease_ms, request_id, mode: copy}}` | the realise reply (`job_id`); made by the node itself, **copies only, at this node only**: filerepo refuses a `mode` other than `copy`, or a `node`, before anything is sent |
 | `relay` | `{op: relay, request: {...}}` | the reply to a request **already signed by its end user**, forwarded unchanged; it comes back as it came |
@@ -128,12 +131,14 @@ The backing is read once, when the plugin starts. No message can set, change or 
 different row, configure a new plugin instance. A live-backed repository:
 
 - runs **no scanner, no broadcast and no subscription**, whatever `scan_dir`, `filerepo_name` or `enable_scan` say;
-- answers only `repostate`, `liverelay`, `liverealise`, `getscandir`, `getmetrics` and `getcapabilities`;
+- answers only `repostate`, `liverelay`, `liverealise`, `getmetrics` and `getcapabilities`, none of which names a
+  path;
 - **refuses every other verb** (including any added later) with `status 9` and `refusal=live-backed`: `getfile`,
   `streamfile` and `getjar` (serve), `putfiles` and `putjar` (write), `removefile` and `clearrepo` (delete, `force` or
   not), `putfilesremote` (serve and push), `repolistin` (subscriber sync), `repoconfirm` (producer sync), and also
-  `repolist`, `getrepofilelist` and `streamfilecancel`. Its files are read through the filesystem at the node only.
-  The refusal needs no provider: it holds even when the provider cannot be reached.
+  `repolist`, `getrepofilelist`, `streamfilecancel` and `getscandir` (which would name where the row is held). Its
+  files are read through the filesystem at the node only. The refusal needs no provider: it holds even when the
+  provider cannot be reached.
 
 Its health check reports `OK` while a provider admitting filerepo is registered, `WARN` otherwise; it never calls
 the provider.
@@ -154,9 +159,11 @@ the provider.
 
 ### Live-tier roots
 
-Files under the provider's live root are the provider's, whatever any repository's configuration says. filerepo
-learns the root from the provider's `list` answer and remembers it in its catalog, so the rule holds while the
-provider is away and across restarts:
+Files under a provider's live root are the provider's, whatever any repository's configuration says. filerepo
+learns the root of every registered provider from its `list` answer (once per registration) and remembers it in its
+catalog, so the rule holds while the provider is away and across restarts. Roots can also be named in configuration
+(`live_roots`, comma-separated), which makes them hold from the start, before any provider has registered (for
+example on a fresh catalog). For every such root:
 
 - `getfile`, `streamfile`, `putfilesremote` and `putfiles` refuse any file that lies in a live-tier root, symbolic
   links resolved (`status 9`, `refusal=live-root`);
@@ -164,14 +171,18 @@ provider is away and across restarts:
   and its scanner skips;
 - the scanner skips links into a root and never re-offers a cataloged file that lies in one, the sync downloader
   refuses destinations that lead into one, and a clear forgets cataloged files in a root without deleting them;
-- while a provider is registered whose root cannot be learned, all of this fails closed (retried after 30 s, or as
-  soon as a provider registers again).
+- while any registered provider's root is not known, **every** file path is refused (`refusal=live-root`, "cannot be
+  checked"), whatever roots are already known: a provider whose `list` has not answered yet or failed (retried after
+  30 s, or as soon as it registers again), a provider that does not admit filerepo (for as long as it is registered:
+  admit `io.cresco.filerepo` in its configuration), or a framework whose registrations cannot be followed.
 
 ## What a repository is: `repostate`, and clearing it
 
 `repostate` answers what would be lost with the repository. It comes from the provider's cached answers (a
 live-backed repository) or from configuration and filerepo's own catalog (any other), **never from markers in the
-tree or a walk**: its cost does not grow with the number of files.
+tree or a walk**: its cost does not grow with the number of files. A live-backed repository asks for its own row's
+listing, and reuses a successful one for `live_list_cache_ms`, so a stream of `repostate` calls costs the provider at
+most one `list` per period.
 
 | State | Meaning |
 |---|---|
@@ -238,7 +249,7 @@ are base64 in the reply. A refusal of the live-tier and clear rules is `status 9
 | `putfilesremote` | `file_list` (json, req), `dst_region`, `dst_agent`, `dst_plugin`, `repo_name` | `status` | Push a set of local files to another agent's repo. |
 | `streamfile` | `file_path`, `start_byte` (long), `byte_length` (long), `transfer_id`, `ident_key`, `ident_id`, optional `buffer_size` | `status` | Stream a byte-range over the dataplane in chunks. Any size. |
 | `streamfilecancel` | `transfer_id` | `status_code` | Cancel an in-flight streamfile transfer. |
-| `getscandir` | — | `scan_dir` | Report the configured scan directory. |
+| `getscandir` | — | `scan_dir` | Report the configured scan directory. Refused on a live-backed repository. |
 | `removefile` | `repo_name`, `file_name` | `status` | Remove a file (disk + catalog row). Path-traversal-safe. |
 | `clearrepo` | `repo_name`, optional `force` | `status`, `state`, `refusal` | Delete all files in a repo (disk + catalog). An only copy is refused unless `force=true`. |
 | `repostate` | — | `state`, `backing`, facts | What the repo is: `LIVE`, `WORKSPACE_CLEAN`, `WORKSPACE_DIRTY`, `MIRROR` or `ONLY_COPY`. |
@@ -287,7 +298,9 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `live_row` | *(unset)* | Back this repository by that live-tier row (a copy or a workspace). Read once at start. |
 | `live_timeout_ms` | `5000` | Bound on a provider call answered by the provider itself (`list`, `changes`). |
 | `live_core_timeout_ms` | `25000` | Bound on a provider call the provider forwards (`realise`, `relay`). |
-| `live_max_calls` | `4` | Provider calls in flight at once; more are refused at once. |
+| `live_max_calls` | `4` | Provider calls of each kind (answered locally; forwarded) in flight at once; more are refused at once. |
+| `live_list_cache_ms` | `1000` | How long a live-backed repository reuses its row's successful listing (`0`: never). |
+| `live_roots` | *(unset)* | Comma-separated directories that are live-tier roots on this agent, refused from the start (before any provider registers). |
 
 ## Safeguards
 
@@ -309,7 +322,8 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 - **Only copies** — `clearrepo` refuses a repository that is the only copy of what it holds unless `force=true`,
   deciding under the repository gate that every landing also takes, so nothing lands between the check and the delete.
 - **Live tier** — a live-backed repository serves, writes, deletes, syncs and lists nothing, provider or not; files
-  in a live-tier root are never served, landed, deleted or synced through any repository.
+  in a live-tier root are never served, landed, deleted or synced through any repository, and while any registered
+  provider's root is unknown no file path is.
 - **Scan resilience** — files that vanish mid-scan (null MD5) or whose path exceeds the catalog column
   are skipped, so one bad file can't wedge the scanner.
 - **Resource hygiene** — bounded, named, daemon thread pools for transfers and peer-sync (no unbounded
@@ -385,10 +399,12 @@ def stream_get(path, size):
 ## Testing
 
 `mvn test` runs filerepo's JUnit 5 suite (part of every `package` build): the live-tier client against a real
-`ServiceTracker` over a fake registry (absence, admission by bundle, coming and going, a hung provider, the exact
-request maps), every repository state, every refused verb on live-backed repositories with and without a provider,
-the clear refusals and the gate (including two concurrent clearrepo/putfiles sequences), the live-root rules, and the
-touched verbs answering as before on ordinary repositories. It needs no agent: filerepo's own engines run over a
+`ServiceTracker` over a fake registry (absence, admission by bundle, coming and going, a hung provider, forwarded
+calls that never starve local ones, the reuse of a row's listing, the exact request maps), every repository state,
+every refused verb on live-backed repositories with and without a provider, the clear refusals and the gate
+(including two concurrent clearrepo/putfiles sequences), the live-root rules (including failing closed while any
+registered provider's root is unknown, several providers, and configured roots), and the touched verbs answering as
+before on ordinary repositories. It needs no agent: filerepo's own engines run over a
 stand-in agent, with the real Derby catalog in temporary directories.
 
 Live checks against a running agent:

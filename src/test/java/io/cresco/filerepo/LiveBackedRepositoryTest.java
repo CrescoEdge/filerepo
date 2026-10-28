@@ -25,7 +25,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * A repository backed by a live-tier row (config live_row): its state comes from the provider's cached answers, it
- * refuses every verb that would serve, write, delete, sync or list it (with or without a provider), it runs no scanner,
+ * refuses every verb that would serve, write, delete, sync or list it, or say where it is (with or without a provider),
+ * it runs no scanner,
  * nothing a caller sends can change its backing, and it keeps its copy live through the node's own realise. Nothing a
  * reply carries names what the row holds.
  */
@@ -100,7 +101,44 @@ class LiveBackedRepositoryTest {
         assertEquals("300", r.getParam("bytes"));
         assertEquals("1234567", r.getParam("lease_until"));
         assertNamesNothing(r);
-        assertEquals(List.of(Map.of("op", "list")), provider.requests, "a copy needs the list only");
+        assertEquals(List.of(Map.of("op", "list", "row", COPY)), provider.requests, "a copy needs its row's listing only");
+    }
+
+    @Test
+    void aProviderThatListsTheNamedRowAloneIsReadTheSameWay() throws Exception {
+        provider.listsOneRow = true;
+        provider.copy("lt_00000000000000c0");
+        provider.copy(COPY);
+        registerProvider();
+        MsgEvent r = liveRig(COPY).call("repostate");
+        assertEquals("LIVE", r.getParam("state"), r.getParams().toString());
+        assertEquals("3", r.getParam("files"));
+        rig.close();
+        client.close();
+        assertEquals("9", liveRig("lt_000000000000dead").call("repostate").getParam("status"), "an empty listing: not held");
+    }
+
+    @Test
+    void aStreamOfRepostateCallsCostsTheProviderOneListPerPeriod() throws Exception {
+        provider.copy(COPY);
+        org.osgi.framework.ServiceReference<?> first =
+                registry.register(FakeProvider.props(), b -> "io.cresco.filerepo".equals(b.getSymbolicName()) ? provider : null);
+        liveRig(COPY);
+        client.close();
+        rig.close();
+        client = new LiveTierClient(registry.contextOf("io.cresco.filerepo"), quiet(), 500, 800, 2, 60000L);
+        rig = new TestRig(tmp.resolve("agent"), rig.config, client);
+        for (int i = 0; i < 50; i++) {
+            assertEquals("LIVE", rig.call("repostate").getParam("state"));
+        }
+        assertEquals(1, provider.requests.size(), "one list in the period, whatever the number of calls: " + provider.requests.size());
+        FakeProvider restarted = new FakeProvider();
+        restarted.copy(COPY);
+        restarted.rows.get(COPY).put("files", 4);
+        registry.register(FakeProvider.props(), b -> restarted);
+        // the first provider stays the higher-ranked one; once it goes, the one left is asked afresh
+        registry.unregister(first);
+        assertEquals("4", rig.call("repostate").getParam("files"), "a listing is never reused across providers");
     }
 
     @Test
@@ -190,6 +228,32 @@ class LiveBackedRepositoryTest {
         assertEveryUnsafeVerbIsRefused();
     }
 
+    @Test
+    void relaysHeldUpElsewhereNeverStarveRepostate() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        provider.relay = r -> {
+            while (release.getCount() > 0) {                   // whatever the provider forwards to does not answer
+                try { release.await(); } catch (InterruptedException ignored) { }
+            }
+            return FakeProvider.answer("11");
+        };
+        provider.copy(COPY);
+        registerProvider();
+        liveRig(COPY);
+        try {
+            assertEquals("LIVE", rig.call("repostate").getParam("state"), "healthy at first");
+            for (int i = 0; i < 3; i++) {                     // more relays than there are threads for them
+                MsgEvent q = TestRig.request("liverelay");
+                q.setCompressedParam("request", gson.toJson(Map.of("k1", "v1")));
+                assertEquals("11", rig.call(q).getParam("status"), "the relay was not answered");
+            }
+            MsgEvent s = rig.call("repostate");
+            assertEquals("LIVE", s.getParam("state"), "the provider's own list still answers: " + s.getParams());
+        } finally {
+            release.countDown();
+        }
+    }
+
     // ------------------------------------------------------------------ refusals
 
     @Test
@@ -229,6 +293,7 @@ class LiveBackedRepositoryTest {
         requests.add(TestRig.request("repolist"));
         requests.add(TestRig.request("getrepofilelist", "repo_name", "fr-live"));
         requests.add(TestRig.request("streamfilecancel", "transfer_id", "t-1"));
+        requests.add(TestRig.request("getscandir"));
         requests.add(TestRig.request("averbaddedlater"));
 
         for (MsgEvent q : requests) {
@@ -243,6 +308,8 @@ class LiveBackedRepositoryTest {
             assertNull(r.getParam("repofilelist"), action);
             assertNull(r.getParam("file_data"), action);
             assertNull(r.getParam("repolist"), action);
+            assertNull(r.getParam("scan_dir"), action + " names no path");
+            assertFalse(r.getParam("status_desc").contains(tmp.toString()), action + " names no path: " + r.getParam("status_desc"));
         }
         assertTrue(rig.sent.isEmpty(), "nothing was pushed or confirmed: " + rig.sent);
         assertTrue(Files.exists(scanFile), "nothing was deleted");
@@ -259,7 +326,6 @@ class LiveBackedRepositoryTest {
         registerProvider();
         liveRig(COPY);
         assertEquals("10", rig.call("repostate").getParam("status"));
-        assertEquals("10", rig.call("getscandir").getParam("status"));
         assertNotNull(rig.call("getcapabilities").getParam("capabilities"));
         assertEquals("10", rig.call("getmetrics").getParam("status"));
         for (String verb : ExecutorImpl.LIVE_BACKED_VERBS) {
@@ -308,14 +374,11 @@ class LiveBackedRepositoryTest {
         registerProvider();
         liveRig(COPY);
         Map<String, String> signed = new LinkedHashMap<>();
-        signed.put("action", "core.livehold");
-        signed.put("principal", "user-a");
-        signed.put("op", "extend");
-        signed.put("row", COPY);
-        signed.put("sig_ts", "1700000000000");
-        signed.put("sig_nonce", "n-1");
-        signed.put("sig_params", "op,row");
-        signed.put("sig", "c2lnbmF0dXJl");
+        signed.put("k1", "v1");
+        signed.put("k2", "v2");
+        signed.put("k3", COPY);
+        signed.put("k4", "1700000000000");
+        signed.put("k5", "c2lnbmF0dXJl");
         Map<String, Object> coreReply = FakeProvider.answer("10", "status_desc", "held", "lease_until", "99");
         provider.relay = req -> coreReply;
 
@@ -330,9 +393,9 @@ class LiveBackedRepositoryTest {
         assertEquals(Map.of("op", "relay", "request", signed), provider.requests.get(provider.requests.size() - 1),
                 "relayed unchanged: filerepo adds and signs nothing");
 
-        provider.relay = req -> FakeProvider.answer("3", "status_desc", "a relayed request must be signed by its user");
+        provider.relay = req -> FakeProvider.answer("3", "status_desc", "refused");
         MsgEvent refused = TestRig.request("liverelay");
-        refused.setCompressedParam("request", gson.toJson(Map.of("action", "core.get")));
+        refused.setCompressedParam("request", gson.toJson(Map.of("k1", "v1")));
         MsgEvent rr = rig.call(refused);
         assertEquals("10", rr.getParam("status"), "the provider answered");
         assertEquals("3", rr.getParam("reply_status"), "and its answer was a refusal");
@@ -348,7 +411,7 @@ class LiveBackedRepositoryTest {
         provider.copy(COPY);
         liveRig(COPY);
         MsgEvent q = TestRig.request("liverelay");
-        q.setCompressedParam("request", gson.toJson(Map.of("action", "core.livelist", "principal", "u", "sig", "s")));
+        q.setCompressedParam("request", gson.toJson(Map.of("k1", "v1", "k2", "v2")));
         MsgEvent r = rig.call(q);
         assertEquals("11", r.getParam("status"));
         assertNull(r.getParam("reply"));

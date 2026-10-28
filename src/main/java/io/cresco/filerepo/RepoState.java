@@ -48,9 +48,9 @@ final class RepoState {
     }
 
     /**
-     * A live-backed repository's state, from the provider: its row in {@code list} (O(rows held at this node)) and, for
-     * a workspace, the cached {@code changes} summary (no walk). A workspace whose summary cannot be read is counted
-     * dirty: it may hold the only copy of unpublished work.
+     * A live-backed repository's state, from the provider: the listing of its row (a {@code list} naming the row, which
+     * the client reuses for a short period) and, for a workspace, the cached {@code changes} summary (no walk). A
+     * workspace whose summary cannot be read is counted dirty: it may hold the only copy of unpublished work.
      */
     static RepoState live(String row, LiveTierClient client) {
         Map<String, String> f = new LinkedHashMap<>();
@@ -60,7 +60,8 @@ final class RepoState {
             f.put("provider", LiveTierClient.ABSENT);
             return new RepoState(null, UNAVAILABLE, "no live-tier provider admits this bundle", f);
         }
-        LiveTierClient.Answer list = client.list();
+        LiveTierClient.Listing listing = client.listRow(row);
+        LiveTierClient.Answer list = listing.answer;
         if (!list.answered()) {
             f.put("provider", list.failure);
             return new RepoState(null, UNAVAILABLE, "the live-tier provider did not answer: " + list.desc(), f);
@@ -69,7 +70,7 @@ final class RepoState {
             f.put("provider_status", list.status());
             return new RepoState(null, UNAVAILABLE, "the live-tier provider refused list (status " + list.status() + ")", f);
         }
-        Map<String, Object> r = LiveTierClient.row(list, row);
+        Map<String, Object> r = listing.row;
         if (r == null) {
             return new RepoState(null, NOT_HELD, "live row " + row + " is not held at this node", f);
         }

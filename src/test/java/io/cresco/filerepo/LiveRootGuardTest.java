@@ -145,7 +145,7 @@ class LiveRootGuardTest {
         Map<String, Object> inside = new HashMap<>();
         inside.put("repo_dir", root.resolve("tenant-a").toString());
         rig(inside);
-        for (String verb : new String[]{"getrepofilelist", "repolist", "clearrepo", "removefile", "putjar", "repolistin", "getjar"}) {
+        for (String verb : new String[]{"getrepofilelist", "repolist", "clearrepo", "removefile", "putjar", "repolistin", "getjar", "getscandir"}) {
             MsgEvent r = rig.call(verb, "repo_name", "fr", "force", "true", "file_name", "collection-a/v1/secret.txt");
             assertEquals("live-root", r.getParam("refusal"), verb + ": " + r.getParams());
         }
@@ -269,5 +269,99 @@ class LiveRootGuardTest {
         assertEquals("10", rig.call("getrepofilelist", "repo_name", "fr").getParam("status"));
         assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));
         assertEquals("live-root", rig.call(pushRemote(secret)).getParam("refusal"));
+    }
+
+    // ------------------------------------------------------------------ fail closed while any registered root is unknown
+
+    LiveTierClient clientOver(FakeRegistry reg) {
+        return new LiveTierClient(reg.contextOf("io.cresco.filerepo"),
+                (CLogger) Proxy.newProxyInstance(CLogger.class.getClassLoader(), new Class<?>[]{CLogger.class}, (p, m, a) -> null),
+                300, 300, 2);
+    }
+
+    @Test
+    void aRememberedRootNeverStandsInForANewProvidersUnlearnedOne() throws Exception {
+        // an earlier run: a provider whose root is A, learned and remembered in the catalog
+        Path rootA = Files.createDirectories(tmp.resolve("liveA"));
+        provider.root = rootA.toString();
+        registerProvider(provider);
+        onDemand();
+        assertEquals("live-root", rig.call(pushRemote(rootA.resolve("x"))).getParam("refusal"));
+        Map<String, Object> cfg = rig.config;
+        rig.close();
+        client.close();
+
+        // now: the provider registered holds another root, and its list does not answer
+        FakeRegistry now = new FakeRegistry();
+        FakeProvider hung = new FakeProvider();
+        hung.root = root.toString();
+        hung.hang = new java.util.concurrent.CountDownLatch(1);
+        ServiceReference<?> ref = now.register(FakeProvider.props(), b -> hung);
+        client = clientOver(now);
+        rig = new TestRig(tmp.resolve("agent"), cfg, client);
+        Path ordinary = Files.write(tmp.resolve("ordinary.txt"), "shareable".getBytes());
+        try {
+            MsgEvent r = rig.call(pushRemote(secret));
+            assertEquals("live-root", r.getParam("refusal"), "fail closed, root A notwithstanding: " + r.getParams());
+            assertTrue(r.getParam("status_desc").contains("cannot be checked"), r.getParam("status_desc"));
+            assertEquals("live-root", rig.call(pushRemote(ordinary)).getParam("refusal"), "every path, while its root is unknown");
+            assertTrue(rig.sent.isEmpty(), "nothing was pushed");
+        } finally {
+            hung.hang.countDown();
+        }
+
+        now.unregister(ref);
+        FakeProvider answering = new FakeProvider();
+        answering.root = root.toString();
+        now.register(FakeProvider.props(), b -> answering);
+        assertEquals("live-root", rig.call(pushRemote(secret)).getParam("refusal"), "its root, learned");
+        assertEquals("live-root", rig.call(pushRemote(rootA.resolve("x"))).getParam("refusal"), "and root A, remembered");
+        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));
+    }
+
+    @Test
+    void aRegisteredProviderThatDoesNotAdmitFilerepoKeepsEveryPathClosed() throws Exception {
+        ServiceReference<?> ref = registry.register(FakeProvider.props(), b -> null);   // admits no bundle filerepo runs as
+        onDemand();
+        assertFalse(client.present());
+        Path ordinary = Files.write(tmp.resolve("ordinary.txt"), "shareable".getBytes());
+        for (Path p : new Path[]{secret, ordinary}) {
+            MsgEvent r = rig.call(pushRemote(p));
+            assertEquals("live-root", r.getParam("refusal"), r.getParams().toString());
+            assertTrue(r.getParam("status_desc").contains("does not admit"), r.getParam("status_desc"));
+        }
+        assertEquals("live-root", rig.call("getrepofilelist", "repo_name", "fr").getParam("refusal"));
+        assertTrue(rig.sent.isEmpty(), "nothing was pushed");
+
+        registry.unregister(ref);                                          // gone: no provider and no root known
+        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"), "as before, without a provider");
+    }
+
+    @Test
+    void everyRegisteredProvidersRootIsGuarded() throws Exception {
+        Path rootB = Files.createDirectories(tmp.resolve("liveB"));
+        Path secretB = Files.write(Files.createDirectories(rootB.resolve("t/c/v1")).resolve("b.txt"), "plaintext".getBytes());
+        FakeProvider second = new FakeProvider();
+        second.root = rootB.toString();
+        registerProvider(provider);
+        registerProvider(second);
+        onDemand();
+        assertEquals("live-root", rig.call(pushRemote(secret)).getParam("refusal"), "the first provider's root");
+        assertEquals("live-root", rig.call(pushRemote(secretB)).getParam("refusal"), "and the second's");
+        assertTrue(rig.sent.isEmpty(), "nothing was pushed");
+        Path ordinary = Files.write(tmp.resolve("ordinary.txt"), "shareable".getBytes());
+        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));
+    }
+
+    @Test
+    void configuredRootsHoldBeforeAnyProviderHasRegistered() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put("repo_dir", Files.createDirectories(tmp.resolve("repo")).toString());
+        cfg.put("live_roots", tmp.resolve("elsewhere") + " , " + root);
+        rig(cfg);
+        assertFalse(client.present());
+        assertEquals("live-root", rig.call(pushRemote(secret)).getParam("refusal"), "named in configuration");
+        Path ordinary = Files.write(tmp.resolve("ordinary.txt"), "shareable".getBytes());
+        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));
     }
 }

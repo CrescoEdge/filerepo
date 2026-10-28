@@ -157,7 +157,7 @@ class NonLiveRepositoryTest {
     void liverelayIsANodeServiceAnyRepositoryMayCarry() throws Exception {
         onDemand(true);
         MsgEvent q = TestRig.request("liverelay");
-        q.setCompressedParam("request", gson.toJson(Map.of("action", "core.livelist", "principal", "user-a", "sig", "s")));
+        q.setCompressedParam("request", gson.toJson(Map.of("k1", "v1", "k2", "v2")));
         MsgEvent r = rig.call(q);
         assertEquals("10", r.getParam("status"), r.getParams().toString());
         assertEquals("10", r.getParam("reply_status"));

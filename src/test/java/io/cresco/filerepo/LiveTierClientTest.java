@@ -58,7 +58,7 @@ class LiveTierClientTest {
         LiveTierClient c = client(SELF, 1000, 1000, 2);
         assertFalse(c.present());
         for (LiveTierClient.Answer a : List.of(c.list(), c.changes("lt_1"), c.realise(Map.of("collection", "c", "vid", "v")),
-                c.relay(Map.of("action", "core.list", "sig", "s")))) {
+                c.relay(Map.of("k1", "v1")))) {
             assertFalse(a.answered());
             assertFalse(a.ok());
             assertEquals(LiveTierClient.ABSENT, a.failure);
@@ -105,6 +105,30 @@ class LiveTierClientTest {
     }
 
     @Test
+    void aProviderThatDoesNotAdmitThisBundleIsTrackedAndEveryPathFailsClosed() {
+        ServiceReference<?> refusing = registerProvider(provider, "io.cresco.other");
+        LiveTierClient c = client(SELF, 1000, 1000, 2);
+        assertFalse(c.present(), "it is never asked");
+        assertEquals(LiveTierClient.ABSENT, c.list().failure);
+        String why = c.liveRootConflict(java.nio.file.Path.of("/any/file"));
+        assertNotNull(why, "its root cannot be learned: nothing can be checked");
+        assertTrue(why.startsWith("cannot be checked") && why.contains("does not admit"), why);
+
+        FakeProvider admitting = new FakeProvider();
+        admitting.root = "/nonexistent/live-a";
+        registerProvider(admitting, SELF);                     // another provider, lower-ranked, that admits it
+        assertTrue(c.present());
+        assertTrue(c.list().ok());
+        assertEquals(1, admitting.requests.size(), "the one that admits this bundle is asked");
+        assertNotNull(c.liveRootConflict(java.nio.file.Path.of("/any/file")), "still closed while the other is registered");
+
+        registry.unregister(refusing);
+        assertNull(c.liveRootConflict(java.nio.file.Path.of("/any/file")), "every registered root known: open");
+        assertEquals("lies in a live-tier root", c.liveRootConflict(java.nio.file.Path.of("/nonexistent/live-a/t/f")));
+        assertTrue(provider.requests.isEmpty(), "the provider that does not admit this bundle was never called");
+    }
+
+    @Test
     void theProviderComesAndGoes() {
         LiveTierClient c = client(SELF, 1000, 1000, 2);
         assertEquals(LiveTierClient.ABSENT, c.list().failure, "filerepo starts before the provider");
@@ -128,37 +152,68 @@ class LiveTierClientTest {
     }
 
     @Test
-    void aHungProviderCostsACallerItsTimeoutAndHoldsAtMostMaxCallsThreads() throws Exception {
+    void aHungProviderCostsACallerItsTimeoutAndHoldsAtMostMaxCallsThreadsOfEachKind() throws Exception {
         registerProvider(provider, SELF);
-        LiveTierClient c = client(SELF, 1000, 1500, 2);
+        LiveTierClient c = client(SELF, 600, 900, 2);
         provider.hang = new CountDownLatch(1);
 
+        for (int i = 0; i < 2; i++) {
+            long t0 = System.nanoTime();
+            LiveTierClient.Answer a = i == 0 ? c.list() : c.changes("lt_1");
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            assertEquals(LiveTierClient.TIMEOUT, a.failure);
+            assertTrue(ms >= 590 && ms < 6000, "waited its timeout, no more: " + ms + " ms");
+        }
         long t0 = System.nanoTime();
-        LiveTierClient.Answer a = c.list();
-        long ms = (System.nanoTime() - t0) / 1_000_000;
-        assertEquals(LiveTierClient.TIMEOUT, a.failure);
-        assertTrue(ms >= 990 && ms < 6000, "waited its timeout, no more: " + ms + " ms");
-
-        t0 = System.nanoTime();
-        assertEquals(LiveTierClient.TIMEOUT, c.relay(Map.of("action", "core.list", "sig", "s")).failure);
-        ms = (System.nanoTime() - t0) / 1_000_000;
-        assertTrue(ms >= 1490 && ms < 6000, "the core-bound timeout for relay: " + ms + " ms");
-        assertEquals(2, provider.inFlight.get(), "both calls still hang in the provider, ignoring interrupts");
-
-        t0 = System.nanoTime();
         LiveTierClient.Answer busy = c.changes("lt_1");
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        assertEquals(LiveTierClient.BUSY, busy.failure, "both local call threads are held: refused at once");
+        assertTrue(ms < 500, "refused without waiting for the 600 ms timeout: " + ms + " ms");
+
+        // the forwarded calls have threads of their own, and their own timeout
+        t0 = System.nanoTime();
+        assertEquals(LiveTierClient.TIMEOUT, c.relay(Map.of("k1", "v1")).failure);
         ms = (System.nanoTime() - t0) / 1_000_000;
-        assertEquals(LiveTierClient.BUSY, busy.failure, "every call thread is held: refused at once");
-        assertTrue(ms < 800, "refused without waiting for the 1000 ms timeout: " + ms + " ms");
-        assertEquals(2, provider.requests.size(), "the busy call never reached the provider");
+        assertTrue(ms >= 890 && ms < 6000, "the forwarded timeout for relay: " + ms + " ms");
+        assertEquals(LiveTierClient.TIMEOUT, c.realise(Map.of("collection", "c", "vid", "v")).failure);
+        assertEquals(LiveTierClient.BUSY, c.relay(Map.of("k1", "v1")).failure, "both forwarded call threads are held");
+        assertEquals(4, provider.inFlight.get(), "every held call still hangs in the provider, ignoring interrupts");
+        assertEquals(4, provider.requests.size(), "the busy calls never reached the provider");
 
         provider.hang.countDown();                            // the provider recovers
         long deadline = System.currentTimeMillis() + 5000;
-        LiveTierClient.Answer back;
+        LiveTierClient.Answer back, relayed;
         do {
             back = c.list();
-        } while (!back.ok() && System.currentTimeMillis() < deadline);
-        assertTrue(back.ok(), "calls succeed again once the provider answers: " + back.failure);
+            relayed = c.relay(Map.of("k1", "v1"));
+        } while (!(back.ok() && relayed.ok()) && System.currentTimeMillis() < deadline);
+        assertTrue(back.ok() && relayed.ok(), "calls succeed again once the provider answers: " + back.failure + " " + relayed.failure);
+    }
+
+    @Test
+    void forwardedCallsHeldUpElsewhereNeverStarveTheLocalAnswers() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        provider.relay = r -> {
+            while (release.getCount() > 0) {                   // whatever the provider forwards to does not answer
+                try { release.await(); } catch (InterruptedException ignored) { }
+            }
+            return FakeProvider.answer("11");
+        };
+        provider.workspace("lt_000000000000000a");
+        registerProvider(provider, SELF);
+        LiveTierClient c = client(SELF, 600, 300, 2);
+        try {
+            for (int i = 0; i < 2; i++) assertEquals(LiveTierClient.TIMEOUT, c.relay(Map.of("k1", "v1")).failure);
+            assertEquals(LiveTierClient.BUSY, c.relay(Map.of("k1", "v1")).failure, "the forwarded threads are all held");
+            for (int i = 0; i < 5; i++) {
+                assertTrue(c.list().ok(), "list has threads of its own");
+                assertTrue(c.changes("lt_000000000000000a").ok(), "changes has threads of its own");
+            }
+            assertEquals("lies in a live-tier root", c.liveRootConflict(java.nio.file.Path.of(provider.root, "f")),
+                    "the root is still learned");
+        } finally {
+            release.countDown();
+        }
     }
 
     @Test
@@ -201,19 +256,51 @@ class LiveTierClientTest {
         assertEquals(Map.of("op", "realise", "params", sentParams), provider.requests.get(2));
 
         Map<String, String> signed = new LinkedHashMap<>();
-        signed.put("action", "core.livehold");
-        signed.put("principal", "user-a");
-        signed.put("sig_ts", "1700000000000");
-        signed.put("sig_nonce", "n-1");
-        signed.put("sig_params", "op,row");
-        signed.put("op", "extend");
-        signed.put("row", "lt_000000000000000a");
-        signed.put("sig", "c2lnbmF0dXJl");
+        signed.put("k1", "v1");
+        signed.put("k2", "v2");
+        signed.put("k3", "lt_000000000000000a");
+        signed.put("k4", "1700000000000");
+        signed.put("k5", "c2lnbmF0dXJl");
         Map<String, Object> coreReply = FakeProvider.answer("10", "status_desc", "ok", "lease_until", "99");
         provider.relay = req -> coreReply;
         LiveTierClient.Answer rel = c.relay(signed);
         assertSame(coreReply, rel.reply, "the reply comes back as it came");
         assertEquals(Map.of("op", "relay", "request", signed), provider.requests.get(3), "the request goes unchanged");
+
+        LiveTierClient.Listing one = c.listRow("lt_000000000000000a");
+        assertTrue(one.answer.ok());
+        assertEquals("workspace", one.row.get("mode"));
+        assertEquals(Map.of("op", "list", "row", "lt_000000000000000a"), provider.requests.get(4), "a row's listing names it");
+    }
+
+    @Test
+    void aRowsListingIsReusedForItsPeriodOnlyAndOnlyWhenItSucceeded() throws Exception {
+        registerProvider(provider, SELF);
+        provider.copy("lt_0000000000000001");
+        client = new LiveTierClient(registry.contextOf(SELF), logger(), 1000, 1000, 2, 1000);
+        LiveTierClient c = client;
+        assertEquals("copy", c.listRow("lt_0000000000000001").row.get("mode"));
+        assertEquals("copy", c.listRow("lt_0000000000000001").row.get("mode"));
+        assertEquals(1, provider.requests.size(), "reused within its period");
+        assertNull(c.listRow("lt_0000000000000002").row, "another row is listed afresh");
+        assertEquals(2, provider.requests.size());
+        Thread.sleep(1100);
+        assertTrue(c.listRow("lt_0000000000000002").answer.ok());
+        assertEquals(3, provider.requests.size(), "and listed again once its period is over");
+        Thread.sleep(1100);
+        provider.fail = new IllegalStateException("boom");
+        assertEquals(LiveTierClient.ERROR, c.listRow("lt_0000000000000002").answer.failure);
+        provider.fail = null;
+        assertTrue(c.listRow("lt_0000000000000002").answer.ok(), "a failure is never reused");
+        assertEquals(5, provider.requests.size());
+        LiveTierClient none = new LiveTierClient(registry.contextOf(SELF), logger(), 1000, 1000, 2);
+        try {
+            none.listRow("lt_0000000000000001");
+            none.listRow("lt_0000000000000001");
+            assertEquals(7, provider.requests.size(), "a period of 0 never reuses");
+        } finally {
+            none.close();
+        }
     }
 
     @Test

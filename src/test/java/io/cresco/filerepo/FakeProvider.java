@@ -28,6 +28,8 @@ final class FakeProvider implements Function<Map<String, Object>, Map<String, Ob
     volatile Function<Map<String, String>, Map<String, Object>> realise = p -> answer("10", "job_id", "j_realise_1");
     volatile Function<Map<String, String>, Map<String, Object>> relay = r -> answer("10", "echoed", "1");
     volatile RuntimeException fail;
+    /** Answer a list naming a row with that row alone, as a provider may; otherwise every row, whatever is named. */
+    volatile boolean listsOneRow;
 
     @SuppressWarnings("unchecked")
     @Override public Map<String, Object> apply(Map<String, Object> req) {
@@ -48,7 +50,10 @@ final class FakeProvider implements Function<Map<String, Object>, Map<String, Ob
                 Map<String, Object> out = answer("10");
                 synchronized (rows) {
                     List<Map<String, Object>> view = new ArrayList<>();
-                    for (Map<String, Object> r : rows.values()) view.add(new LinkedHashMap<>(r));
+                    Object named = req.get("row");
+                    for (Map<String, Object> r : rows.values()) {
+                        if (!listsOneRow || named == null || named.equals(r.get("row"))) view.add(new LinkedHashMap<>(r));
+                    }
                     out.put("rows", view);
                 }
                 out.put("root", root);
@@ -56,7 +61,7 @@ final class FakeProvider implements Function<Map<String, Object>, Map<String, Ob
             }
             if ("changes".equals(op)) {
                 Map<String, Object> c = changes.get(String.valueOf(req.get("row")));
-                if (c == null) return answer("9", "status_desc", "no such workspace at this node");
+                if (c == null) return answer("9", "status_desc", "unknown row");
                 Map<String, Object> out = new LinkedHashMap<>(c);
                 out.put("status", "10");
                 return out;

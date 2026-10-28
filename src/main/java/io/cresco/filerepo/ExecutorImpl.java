@@ -105,7 +105,7 @@ import io.cresco.library.capability.*;
                    @CrescoReturn(name = "status", description = "10 answered (see reply_status); 8 no request; 11 the live-tier provider did not answer")}),
     @CrescoAction(name = "liverealise", type = "EXEC",
         summary = "Keep a live-backed repo's copy live: realise it again at this node as the node itself (copies only).",
-        why = "Extend a live copy's lease without a person's credentials.",
+        why = "Keep the copy a live-backed repo is configured with available at this node.",
         params = {@CrescoParam(name = "lease_ms", type = "long", description = "requested lease"),
                   @CrescoParam(name = "request_id", description = "idempotency key: 1-64 letters, digits, - or _")},
         returns = {@CrescoReturn(name = "job_id", description = "the realise job"),
@@ -131,11 +131,11 @@ import io.cresco.library.capability.*;
 })
 public class ExecutorImpl implements Executor {
 
-    // Verbs a live-backed repository still answers. Every other verb, including any added later, is refused: the
-    // repository is a live-tier copy or workspace, read only through the filesystem at this node, and filerepo never
-    // serves, writes, deletes, syncs or lists it.
+    // Verbs a live-backed repository still answers: none of them names a path. Every other verb, including any added
+    // later, is refused: the repository is a live-tier copy or workspace, read only through the filesystem at this
+    // node, and filerepo never serves, writes, deletes, syncs or lists it, nor says where it is (getscandir).
     static final Set<String> LIVE_BACKED_VERBS = Set.of("repostate", "liverelay", "liverealise",
-            "getscandir", "getmetrics", "getcapabilities");
+            "getmetrics", "getcapabilities");
 
     private PluginBuilder plugin;
     private CLogger logger;
@@ -997,9 +997,8 @@ public class ExecutorImpl implements Executor {
 
     /**
      * liverealise: realise this live-backed repository's own copy again, as the node itself: copies only, at this node
-     * only. A copy still held is a hit, which raises its lease; so an operator keeps a dataset live without a person's
-     * credentials. What is realised comes from the provider's own row, in this JVM: no collection, version or path is
-     * taken from the request or put on the reply.
+     * only. Asking again for a copy that is still held keeps it. What is realised comes from the provider's own row, in
+     * this JVM: no collection, version or path is taken from the request or put on the reply.
      */
     private MsgEvent liveRealise(MsgEvent incoming) {
         try {
@@ -1028,14 +1027,15 @@ public class ExecutorImpl implements Executor {
                 incoming.setParam("status_desc","not sent: no live-tier provider admits this bundle");
                 return incoming;
             }
-            LiveTierClient.Answer list = liveTier.list();
+            LiveTierClient.Listing listing = liveTier.listRow(repoEngine.getLiveRow());
+            LiveTierClient.Answer list = listing.answer;
             if (!list.ok()) {
                 incoming.setParam("status","11");
                 incoming.setParam("status_desc","not sent: the live-tier provider did not list its rows ("
                         + (list.answered() ? "status " + list.status() : list.desc()) + ")");
                 return incoming;
             }
-            Map<String, Object> row = LiveTierClient.row(list, repoEngine.getLiveRow());
+            Map<String, Object> row = listing.row;
             if (row == null) {
                 incoming.setParam("status","9");
                 incoming.setParam("status_desc","refused: live row " + repoEngine.getLiveRow() + " is not held at this node;"

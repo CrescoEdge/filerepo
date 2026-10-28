@@ -146,6 +146,9 @@ public class RepoEngine {
 
         if (liveTier != null) {
             List<String> known = new ArrayList<>();
+            // roots the operator names (comma-separated): refused from the start, before any provider has registered
+            String configured = plugin.getConfig().getStringParam("live_roots");
+            if (configured != null) known.addAll(Arrays.asList(configured.split(",")));
             try {
                 String v = dbEngine.getMeta(META_LIVE_ROOTS);
                 if (v != null) known.addAll(Arrays.asList(v.split("\n")));

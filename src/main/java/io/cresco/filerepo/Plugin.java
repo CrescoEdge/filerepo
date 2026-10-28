@@ -97,7 +97,8 @@ public class Plugin implements PluginService {
                         pluginBuilder.getLogger(LiveTierClient.class.getName(), CLogger.Level.Info),
                         pluginBuilder.getConfig().getLongParam("live_timeout_ms", 5000L),
                         pluginBuilder.getConfig().getLongParam("live_core_timeout_ms", 25000L),
-                        (int) (long) pluginBuilder.getConfig().getLongParam("live_max_calls", 4L));
+                        (int) (long) pluginBuilder.getConfig().getLongParam("live_max_calls", 4L),
+                        pluginBuilder.getConfig().getLongParam("live_list_cache_ms", 1000L));
 
                 //Starting the RepoEngine Threads
                 repoEngine = new RepoEngine(pluginBuilder, dbEngine, liveTier);
