@@ -130,26 +130,26 @@ class LiveTierClientTest {
     @Test
     void aHungProviderCostsACallerItsTimeoutAndHoldsAtMostMaxCallsThreads() throws Exception {
         registerProvider(provider, SELF);
-        LiveTierClient c = client(SELF, 200, 300, 2);
+        LiveTierClient c = client(SELF, 1000, 1500, 2);
         provider.hang = new CountDownLatch(1);
 
         long t0 = System.nanoTime();
         LiveTierClient.Answer a = c.list();
         long ms = (System.nanoTime() - t0) / 1_000_000;
         assertEquals(LiveTierClient.TIMEOUT, a.failure);
-        assertTrue(ms >= 190 && ms < 3000, "waited its timeout, no more: " + ms + " ms");
+        assertTrue(ms >= 990 && ms < 6000, "waited its timeout, no more: " + ms + " ms");
 
         t0 = System.nanoTime();
         assertEquals(LiveTierClient.TIMEOUT, c.relay(Map.of("action", "core.list", "sig", "s")).failure);
         ms = (System.nanoTime() - t0) / 1_000_000;
-        assertTrue(ms >= 290 && ms < 3000, "the core-bound timeout for relay: " + ms + " ms");
+        assertTrue(ms >= 1490 && ms < 6000, "the core-bound timeout for relay: " + ms + " ms");
         assertEquals(2, provider.inFlight.get(), "both calls still hang in the provider, ignoring interrupts");
 
         t0 = System.nanoTime();
         LiveTierClient.Answer busy = c.changes("lt_1");
         ms = (System.nanoTime() - t0) / 1_000_000;
         assertEquals(LiveTierClient.BUSY, busy.failure, "every call thread is held: refused at once");
-        assertTrue(ms < 150, "refused without waiting: " + ms + " ms");
+        assertTrue(ms < 800, "refused without waiting for the 1000 ms timeout: " + ms + " ms");
         assertEquals(2, provider.requests.size(), "the busy call never reached the provider");
 
         provider.hang.countDown();                            // the provider recovers

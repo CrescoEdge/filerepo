@@ -252,18 +252,19 @@ class LiveRootGuardTest {
     @Test
     void aProviderWhoseRootCannotBeLearnedFailsClosedUntilOneCanBe() throws Exception {
         FakeProvider broken = new FakeProvider();
-        broken.fail = new IllegalStateException("broken");
+        broken.hang = new java.util.concurrent.CountDownLatch(1);           // registered, and never answers
         ServiceReference<?> ref = registerProvider(broken);
         onDemand();
         Path ordinary = Files.write(tmp.resolve("ordinary.txt"), "shareable".getBytes());
         MsgEvent r = rig.call(pushRemote(ordinary));
         assertEquals("live-root", r.getParam("refusal"), "fail closed: " + r.getParams());
         assertTrue(r.getParam("status_desc").contains("cannot be checked"), r.getParam("status_desc"));
-        long t0 = System.nanoTime();
         assertEquals("live-root", rig.call("getrepofilelist", "repo_name", "fr").getParam("refusal"));
-        assertTrue((System.nanoTime() - t0) / 1_000_000 < 400, "a failed learn is not retried on every call");
+        assertEquals("live-root", rig.call(pushRemote(ordinary)).getParam("refusal"));
+        assertEquals(1, broken.requests.size(), "a failed learn is retried after a pause, not on every call");
 
         registry.unregister(ref);
+        broken.hang.countDown();
         registerProvider(provider);                                         // a provider that answers
         assertEquals("10", rig.call("getrepofilelist", "repo_name", "fr").getParam("status"));
         assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));

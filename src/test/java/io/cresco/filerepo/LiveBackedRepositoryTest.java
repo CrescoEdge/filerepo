@@ -158,6 +158,24 @@ class LiveBackedRepositoryTest {
     }
 
     @Test
+    void theRepositoryFollowsItsProviderGoingAndComingBack() throws Exception {
+        provider.copy(COPY);
+        liveRig(COPY);
+        assertEquals("11", rig.call("repostate").getParam("status"), "filerepo started before the provider");
+        org.osgi.framework.ServiceReference<?> first =
+                registry.register(FakeProvider.props(), b -> "io.cresco.filerepo".equals(b.getSymbolicName()) ? provider : null);
+        assertEquals("LIVE", rig.call("repostate").getParam("state"));
+        registry.unregister(first);
+        assertEquals("11", rig.call("repostate").getParam("status"));
+        assertEquals("live-backed", rig.call("getfile", "file_path", "/x").getParam("refusal"), "and still refuses");
+        FakeProvider restarted = new FakeProvider();
+        restarted.copy(COPY);
+        registry.register(FakeProvider.props(), b -> "io.cresco.filerepo".equals(b.getSymbolicName()) ? restarted : null);
+        assertEquals("LIVE", rig.call("repostate").getParam("state"), "the provider that came back is asked");
+        assertFalse(restarted.requests.isEmpty());
+    }
+
+    @Test
     void aHungProviderAnswers11WithinItsTimeout() throws Exception {
         provider.copy(COPY);
         registerProvider();
