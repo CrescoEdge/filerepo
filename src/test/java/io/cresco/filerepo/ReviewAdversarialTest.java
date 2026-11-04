@@ -148,7 +148,9 @@ class ReviewAdversarialTest {
         for (int i = 0; i < 10; i++) Files.delete(scan.resolve("g" + i + ".dat"));
         assertTrue(producer.repo.scanOnce());
         assertEquals(10, producer.repo.getDeletesHeld(), "precondition: ten of twelve held");
-        MsgEvent rel = producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString()));
+        // (round 2: a release must name the held set it releases)
+        MsgEvent rel = producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString(),
+                "hold_id", producer.repo.getHoldId()));
         assertEquals("10", rel.getParam("released"));
 
         // the operator restores half of what was held before the next cycle: a non-mass cycle
@@ -328,6 +330,8 @@ class ReviewAdversarialTest {
 
     private String fromProducer(String tid, String files, String deletes) {
         MsgEvent in = subscriber.requestTo("repolistin", "transfer_id", tid);
+        // (round 2: an offer names the mirror's generation it is for)
+        in.setParam("sync_gen", subscriber.repo.getSyncGen());
         in.setParam(Callers.PARAM_CALLER, "plugin:" + Fabric.TENANT + "/" + TestRig.REGION + "/" + TestRig.AGENT + "/plugin-p");
         in.setParam("cresco_caller_tenant", Fabric.TENANT);
         in.setParam(Callers.PARAM_ROLES, "plugin");
