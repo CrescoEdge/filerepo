@@ -91,6 +91,12 @@ verifies it and moves it into place → consumer `repoconfirm`.
   the verified caller, never by a message's source fields; a producer takes a confirm only from a subscriber.
 - **Paged, not repeated.** A diff is sent in pages (`sync_diff_page` files, `sync_delete_page` deletes); a file that
   was offered and is still being fetched is not offered again until `sync_offer_timeout_ms`.
+- **Late subscribers and cleared mirrors refill.** Sync state is one `insync` flag per file, so a file any
+  subscriber confirmed is not offered again. Each subscriber therefore advertises a *sync generation* in its subscribe
+  (new when it starts and after a clear); for a generation it has not completed, the producer sends that subscriber
+  alone every confirmed file again, `sync_full_pages_per_cycle` pages (of `sync_diff_page` files) per cycle. Files the
+  subscriber already holds are skipped by size and hash. (Before, a mirror that subscribed late, or was cleared, never
+  received the files others had already confirmed.)
 - **Deletes.** A file gone from the scan dir (or removed with `removefile`) becomes a *tombstone*, offered until a
   subscriber confirms it and kept for `sync_tombstone_ttl_ms`. A consumer deletes its copy only if it holds exactly
   the deleted content: a file landed there directly, or newer, is kept.
@@ -367,6 +373,7 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_pending_per_peer` | `4` | Diffs waiting per producer. |
 | `sync_max_peers` | `256` | Producers syncing at once (and subscribers kept by a producer). |
 | `sync_diff_page` / `sync_delete_page` | `1000` / `1000` | Files / deletes per `repolistin` page. |
+| `sync_full_pages_per_cycle` | `8` | Pages of a full offer sent to a new (or cleared) subscriber per scan cycle. |
 | `sync_offer_timeout_ms` | `600000` | An offered file is not offered again for this long unless confirmed or failed. |
 | `sync_stream_buffer` | `262144` | Chunk size a consumer asks for (4 KB - 768 KB). |
 | `sync_stream_idle_ms` | `30000` | A transfer with no frame for this long is cancelled and retried. |

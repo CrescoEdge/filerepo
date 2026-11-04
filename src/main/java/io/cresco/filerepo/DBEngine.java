@@ -430,6 +430,58 @@ public class DBEngine {
         }
     }
 
+    /** A page of the rows some subscriber confirmed (insync=1), by path: what a full offer to a new subscriber sends. */
+    public List<Map<String,String>> getSyncedRows(int limit, int offset) {
+        List<Map<String,String>> out = new ArrayList<>();
+        String sql = "SELECT filepath, md5, lastmodified, filesize FROM filelist WHERE insync = 1 ORDER BY filepath " +
+                "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY";
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, Math.max(0, offset));
+            ps.setInt(2, Math.max(1, limit));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    Map<String,String> row = new HashMap<>();
+                    row.put("filepath", rs.getString(1));
+                    row.put("md5", rs.getString(2));
+                    row.put("lastmodified", rs.getString(3));
+                    row.put("filesize", rs.getString(4));
+                    out.add(row);
+                }
+            }
+        } catch (Exception ex) {
+            logger.error("getSyncedRows error", ex);
+        }
+        return out;
+    }
+
+    /** Offer these files again (insync=0): a subscriber failed them in a full offer. */
+    public int markUnsynced(java.util.Collection<String> paths) {
+        if (paths.isEmpty()) return 0;
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement("UPDATE filelist SET insync = 0 WHERE filepath = ?")) {
+                for (String p : paths) {
+                    ps.setString(1, p);
+                    ps.addBatch();
+                }
+                int n = 0;
+                for (int c : ps.executeBatch()) n += Math.max(0, c);
+                conn.commit();
+                return n;
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("markUnsynced failed: " + ex.getMessage());
+                return 0;
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("markUnsynced error", ex);
+            return 0;
+        }
+    }
+
     /** Every tombstone, for tests and diagnostics. */
     List<Tombstone> getTombstones() {
         List<Tombstone> out = new ArrayList<>();

@@ -93,6 +93,24 @@ public class RepoEngine {
     private final Map<String, Long> offeredAt = new ConcurrentHashMap<>();
     private final AtomicLong transferSeq = new AtomicLong();
 
+    // Sync state is one insync flag per file, so a file any subscriber confirmed is not offered again. A subscriber
+    // therefore advertises a sync generation (new when it starts, and after a clear) in its subscribe; for a
+    // generation it has not completed, the producer sends that subscriber alone every confirmed file again, paced
+    // (sync_full_pages_per_cycle). This is how a subscriber that joins late, or a mirror that was cleared, refills.
+    private volatile String syncGen = SyncReceiver.token();
+    private final Map<String, FullOffer> fullOffers = new ConcurrentHashMap<>();
+
+    /** A full offer to one subscriber: its generation, the next page, and whether it is done. */
+    static final class FullOffer {
+        final String gen;
+        volatile int offset;
+        volatile boolean done;
+
+        FullOffer(String gen) {
+            this.gen = gen;
+        }
+    }
+
     private final Object lockPeerUpdateStateMap = new Object();
     private final Map<String, Boolean> peerUpdateStateMap = new HashMap<>();
 
@@ -138,6 +156,7 @@ public class RepoEngine {
     private final long syncStreamIdleMs;
     private final int syncStreamRounds;
     private final long syncRpcTimeoutMs;
+    private final int fullPagesPerCycle;
 
     // Bounded, named, daemon pool for peer-sync updaters: one per producer at a time, at most sync_threads at once,
     // and at most sync_queue_max waiting (FR-D5). A diff that finds both full is refused as busy (status 11) and the
@@ -203,6 +222,7 @@ public class RepoEngine {
         syncStreamIdleMs = clamp(longParam("sync_stream_idle_ms", 30_000L), 100L, 3_600_000L);
         syncStreamRounds = (int) clamp(longParam("sync_stream_rounds", 3L), 1, 16);
         syncRpcTimeoutMs = clamp(longParam("sync_rpc_timeout_ms", 30_000L), 100L, 600_000L);
+        fullPagesPerCycle = (int) clamp(longParam("sync_full_pages_per_cycle", 8L), 1, 10_000);
 
         int syncThreads = (int) clamp(longParam("sync_threads", 8L), 1, 256);
         int syncQueue = (int) clamp(longParam("sync_queue_max", 64L), 1, 100_000);
@@ -418,10 +438,8 @@ public class RepoEngine {
             try {
                 logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " tid:" + transferId);
                 ScanResult result = scan();
-                if (!result.files.isEmpty() || !result.deletes.isEmpty()) {
-                    logger.debug("SYNC Files");
-                    syncRegionFiles(result);
-                }
+                // offers this cycle's changes, and continues any full offer to a subscriber
+                syncRegionFiles(result);
                 return true;
             } finally {
                 gate.readLock().unlock();
@@ -528,10 +546,17 @@ public class RepoEngine {
     static final class Offer {
         final Map<String, FileObject> files;
         final List<DeleteObject> deletes;
+        // a page of a full offer: its files were confirmed already; one that fails is offered again the usual way
+        final boolean full;
 
         Offer(Map<String, FileObject> files, List<DeleteObject> deletes) {
+            this(files, deletes, false);
+        }
+
+        Offer(Map<String, FileObject> files, List<DeleteObject> deletes, boolean full) {
             this.files = files;
             this.deletes = deletes;
+            this.full = full;
         }
     }
 
@@ -803,13 +828,84 @@ public class RepoEngine {
                         logger.error("Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " failed to respond!");
                         logger.error("Removing Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID);
                         removeSubscribe(sub);
+                        // offered again next cycle to whoever subscribes
+                        for (String p : pageFiles.keySet()) offeredAt.remove(p);
+                        for (DeleteObject d : pageDeletes) offeredAt.remove("del:" + d.filePath);
                     }
                 }
+            }
+
+            for (Map<String, String> sub : currentSubscriberList) {
+                FullOffer full = fullOffers.get(generateSubKey(sub));
+                if (full != null && !full.done) continueFullOffer(sub, full);
             }
 
         } catch (Exception ex) {
             logger.error("filerepo error", ex);
         }
+    }
+
+    /**
+     * Send one subscriber the files other subscribers already confirmed, a page at a time, at most
+     * sync_full_pages_per_cycle pages a cycle. A page it does not take is sent again next cycle.
+     */
+    private void continueFullOffer(Map<String, String> sub, FullOffer full) {
+        String region = sub.get("sub_region_id");
+        String agent = sub.get("sub_agent_id");
+        String pluginID = sub.get("sub_plugin_id");
+        Path root = Paths.get(scanDirString).toAbsolutePath();
+        boolean recursive = plugin.getConfig().getBooleanParam("scan_recursive", true);
+        for (int sent = 0; sent < fullPagesPerCycle && !full.done; sent++) {
+            List<Map<String, String>> rows = dbEngine.getSyncedRows(diffPageSize, full.offset);
+            if (rows.isEmpty()) {
+                full.done = true;
+                logger.info("full offer to " + pluginID + " (generation " + full.gen + ") complete");
+                return;
+            }
+            Map<String, FileObject> page = new LinkedHashMap<>();
+            for (Map<String, String> row : rows) {
+                Path p = Paths.get(row.get("filepath"));
+                if (!p.toAbsolutePath().startsWith(root) || !Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)
+                        || liveRootConflict(p) != null) continue;
+                try {
+                    String name = recursive ? root.relativize(p.toAbsolutePath()).toString() : p.getFileName().toString();
+                    page.put(row.get("filepath"), new FileObject(name, row.get("md5"), row.get("filepath"),
+                            Long.parseLong(row.get("lastmodified")), Long.parseLong(row.get("filesize"))));
+                } catch (Exception bad) {
+                    logger.error("full offer: malformed catalog row " + row.get("filepath"));
+                }
+            }
+            if (!page.isEmpty()) {
+                String tid = String.valueOf(transferSeq.incrementAndGet());
+                pendingTransferMap.put(tid, new Offer(page, Collections.emptyList(), true));
+                MsgEvent req = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginID);
+                req.setParam("action", "repolistin");
+                req.setCompressedParam("repolistin", gson.toJson(page));
+                req.setParam("transfer_id", tid);
+                MsgEvent reply = plugin.sendRPC(req, syncRpcTimeoutMs);
+                if (reply == null) {
+                    logger.error("full offer: " + pluginID + " failed to respond; removing it");
+                    removeSubscribe(sub);
+                    return;
+                }
+                if (!"10".equals(reply.getParam("status_code"))) {
+                    logger.debug("full offer: " + pluginID + " did not take a page (" + reply.getParam("status_code")
+                            + "); again next cycle");
+                    return;
+                }
+                logger.info("Offered " + page.size() + " confirmed file(s) to " + pluginID + " (full offer, transfer " + tid + ")");
+            }
+            full.offset += rows.size();
+            if (rows.size() < diffPageSize) {
+                full.done = true;
+                logger.info("full offer to " + pluginID + " (generation " + full.gen + ") complete");
+            }
+        }
+    }
+
+    /** This repository's sync generation, as its subscribe advertises it (tests). */
+    String getSyncGen() {
+        return syncGen;
     }
 
     private static String peerKey(String region, String agent, String pluginId) {
@@ -863,6 +959,12 @@ public class RepoEngine {
                 }
                 int files = dbEngine.confirmFiles(confirmed);
                 int dels = dbEngine.confirmTombstones(applied);
+                if (offered.full && !failedFiles.isEmpty()) {
+                    // they were confirmed by another subscriber: offer them again the usual way, to everyone
+                    Set<String> again = new HashSet<>(failedFiles);
+                    again.retainAll(offered.files.keySet());
+                    dbEngine.markUnsynced(again);
+                }
                 logger.info("Transfer " + incomingTransferId + " confirmed by " + repoId + ": "
                         + files + " in sync, " + failedFiles.size() + " failed, " + dels + " delete(s) applied, "
                         + failedDeletes.size() + " delete(s) failed"
@@ -1393,6 +1495,8 @@ public class RepoEngine {
                     }
                 }
             }
+            // a cleared subscriber asks its producer for everything again
+            syncGen = SyncReceiver.token();
             if (remaining == 0) {
                 // nothing landed is left: a mirror is a mirror again
                 clearLanded();
@@ -1705,6 +1809,7 @@ public class RepoEngine {
             update.put("sub_region_id", plugin.getRegion());
             update.put("sub_agent_id",plugin.getAgent());
             update.put("sub_plugin_id",plugin.getPluginID());
+            update.put("sync_gen", syncGen);
 
             TextMessage updateMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
             updateMessage.setText(gson.toJson(update));
@@ -1819,10 +1924,20 @@ public class RepoEngine {
                                 } else if (subscriberMap.size() >= syncMaxPeers) {
                                     logger.warn("subscriber " + subKey + " not added: already " + subscriberMap.size()
                                             + " subscribers (sync_max_peers)");
+                                    return;
                                 } else {
                                     Map<String, String> sub = new HashMap<>(incomingMap);
                                     sub.put("ts", String.valueOf(System.currentTimeMillis()));
                                     subscriberMap.put(subKey, sub);
+                                }
+                                String gen = incomingMap.get("sync_gen");
+                                FullOffer current = fullOffers.get(subKey);
+                                if (gen != null && gen.matches("[0-9a-f]{1,64}") && (current == null || !current.gen.equals(gen))) {
+                                    // a subscriber new to this producer (or cleared): everything again, to it; and
+                                    // what is in flight to others is offered again too, so it is not missed
+                                    fullOffers.put(subKey, new FullOffer(gen));
+                                    offeredAt.clear();
+                                    logger.info("subscriber " + subKey + " (generation " + gen + "): a full offer follows");
                                 }
                             }
                         }
@@ -1852,6 +1967,7 @@ public class RepoEngine {
                         synchronized (lockSubscriberMap) {
 
                             subscriberMap.remove(subKey);
+                            fullOffers.remove(subKey);
 
                         }
                     }

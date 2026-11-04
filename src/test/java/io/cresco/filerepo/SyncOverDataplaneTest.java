@@ -235,6 +235,65 @@ class SyncOverDataplaneTest {
         assertEquals(3, fabric.routed.stream().filter("repolistin"::equals).count());
     }
 
+    @Test
+    void aSubscriberThatJoinsLateReceivesWhatOthersAlreadyConfirmed() throws Exception {
+        producer("sync_diff_page", "2", "sync_full_pages_per_cycle", "1");
+        subscriber();
+        subscribe();
+        for (int i = 0; i < 5; i++) Files.write(scan.resolve("early" + i + ".txt"), ("early " + i).getBytes());
+        syncedAndConfirmed();
+
+        // a second mirror subscribes once everything is confirmed: the insync flags alone would never offer it again
+        Path mirror2 = Files.createDirectories(tmp.resolve("mirror2"));
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put("filerepo_name", "fr");
+        cfg.put("repo_dir", mirror2.toString());
+        TestRig late = new TestRig(tmp.resolve("agent"), cfg, null, "plugin-late", fabric);
+        extra.add(late);
+        late.repo.start();
+        producer.repo.repoBroadcast("fr", "discover", 0);
+        await(() -> producer.repo.isSubscriber(TestRig.REGION, TestRig.AGENT, "plugin-late"), "the late subscriber");
+
+        // paced: one page of two files per cycle
+        int cycles = 0;
+        while (cycles < 10 && !(Files.exists(mirror2.resolve("early4.txt")) && Files.exists(mirror2.resolve("early0.txt")))) {
+            assertTrue(producer.repo.scanOnce());
+            cycles++;
+            Thread.sleep(150);
+        }
+        for (int i = 0; i < 5; i++) {
+            Path f = mirror2.resolve("early" + i + ".txt");
+            await(() -> Files.exists(f), "early file at the late subscriber");
+            assertEquals("early " + i, Files.readString(f));
+        }
+        assertTrue(cycles >= 3, "five files in pages of two, one page a cycle: " + cycles);
+        // the first mirror was not sent them again
+        assertEquals(5, subscriber.repo.syncFetched.get());
+    }
+
+    @Test
+    void aClearedMirrorRefillsFromItsProducer() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        for (int i = 0; i < 3; i++) Files.write(scan.resolve("r" + i + ".txt"), ("refill " + i).getBytes());
+        syncedAndConfirmed();
+        String gen = subscriber.repo.getSyncGen();
+        MsgEvent c = subscriber.call(TestRig.as(subscriber.requestTo("clearrepo", "repo_name", "fr", "confirm", mirror.toString()), "admin"));
+        assertEquals("10", c.getParam("status"), c.getParams().toString());
+        assertFalse(Files.exists(mirror.resolve("r0.txt")));
+        assertNotEquals(gen, subscriber.repo.getSyncGen(), "a clear starts a new generation");
+        subscribe();
+        producer.repo.repoBroadcast("fr", "discover", 0);
+        Thread.sleep(100);
+        assertTrue(producer.repo.scanOnce());
+        for (int i = 0; i < 3; i++) {
+            Path f = mirror.resolve("r" + i + ".txt");
+            await(() -> Files.exists(f), "refilled");
+            assertEquals("refill " + i, Files.readString(f));
+        }
+    }
+
     // ------------------------------------------------------------------ deletes (FR-D4)
 
     @Test
