@@ -397,4 +397,156 @@ class SyncRound4Test {
         await(() -> "v2".equals(read(mirror.resolve("m.bin"))), "updated once adopted");
         assertEquals("keep", read(mirror.resolve("keep.txt")));
     }
+
+    // =================================================================== the guards' budgets: gross, persisted, monotonic
+
+    TestRig restart(TestRig p, String pluginId, Path dir, String... kv) throws Exception {
+        p.close();
+        rigs.remove(p);
+        return producer(pluginId, dir, kv);
+    }
+
+    @Test
+    void deletesReplacedByNewFilesAreHeldByTheDayBudgetAcrossRestarts() throws Exception {
+        String[] cfg = {"sync_delete_guard_window_ms", "1"};
+        TestRig p = producer("plugin-p", scan, cfg);
+        for (int i = 0; i < 40; i++) write(scan.resolve("doc" + i), "original " + i);
+        assertTrue(p.repo.scanOnce());
+        int deleted = 0, cycles = 0;
+        while (p.repo.getDeletesHeld() == 0 && deleted < 30) {
+            for (int i = 0; i < 2; i++) {
+                Files.delete(scan.resolve("doc" + deleted));
+                write(scan.resolve("doc" + deleted + ".locked"), "ENCRYPTED");
+                deleted++;
+            }
+            assertTrue(p.repo.scanOnce());
+            if (p.repo.getDeletesHeld() == 0) p = restart(p, "plugin-p", scan, cfg);   // every cycle: nothing is forgotten
+            cycles++;
+        }
+        assertTrue(p.repo.getDeletesHeld() > 0, deleted + " originals deleted and replaced over " + cycles + " restarts, never held");
+        assertTrue(deleted <= 12, "a day's budget is 25% of 40: held by the sixth pair, not " + deleted);
+        assertEquals(deleted - 2, p.repo.getTombstoneCount());
+    }
+
+    @Test
+    void aDrainOfReplacedFilesIsHeldByTheTotalSinceTheLastAcknowledgement() throws Exception {
+        TestRig p = producer("plugin-p", scan, "sync_delete_guard_window_ms", "1", "sync_delete_guard_day_fraction", "0");
+        for (int i = 0; i < 40; i++) write(scan.resolve("doc" + i), "original " + i);
+        assertTrue(p.repo.scanOnce());
+        int deleted = 0;
+        while (p.repo.getDeletesHeld() == 0 && deleted < 39) {
+            for (int i = 0; i < 3; i++) {
+                Files.delete(scan.resolve("doc" + deleted));
+                write(scan.resolve("doc" + deleted + ".locked"), "ENCRYPTED");
+                deleted++;
+            }
+            Thread.sleep(3);
+            assertTrue(p.repo.scanOnce());
+        }
+        assertTrue(p.repo.getDeletesHeld() > 0, "the catalog never shrank, and every original went");
+        assertTrue(p.repo.getTombstoneCount() <= 20, "unheld deletes are bounded by half of the 40: " + p.repo.getTombstoneCount());
+        // the release acknowledges the total: the next few are ordinary again
+        assertTrue(p.repo.releaseHeldDeletes(p.repo.getHoldId()) > 0);
+        assertTrue(p.repo.scanOnce());
+        assertEquals(0, p.repo.getDeletesHeld());
+        for (int i = 0; i < 3; i++) Files.delete(scan.resolve("doc" + (deleted++)));
+        Thread.sleep(3);
+        assertTrue(p.repo.scanOnce());
+        assertEquals(0, p.repo.getDeletesHeld(), "after the acknowledgement, three more deletes are ordinary " + p.log);
+    }
+
+    @Test
+    void aReleaseConsumesOnlyTheBudgetsThatHeldIt() throws Exception {
+        TestRig p = producer("plugin-p", scan, "sync_delete_guard_window_ms", "1");
+        for (int i = 0; i < 100; i++) write(scan.resolve("f" + i), "f" + i);
+        for (int i = 0; i < 10; i++) write(scan.resolve("sub/s" + i), "s" + i);
+        assertTrue(p.repo.scanOnce());
+        // a drip under the day's budget (25% of 110: 27.5)
+        int next = 0;
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < 8; i++) Files.delete(scan.resolve("f" + (next++)));
+            Thread.sleep(3);
+            assertTrue(p.repo.scanOnce());
+            assertEquals(0, p.repo.getDeletesHeld(), "cycle " + c);
+        }
+        // an unrelated hold (a whole subtree gone), released by an admin
+        for (int i = 0; i < 10; i++) Files.delete(scan.resolve("sub/s" + i));
+        assertTrue(p.repo.scanOnce());
+        assertEquals(10, p.repo.getDeletesHeld());
+        assertEquals(10, p.repo.releaseHeldDeletes(p.repo.getHoldId()));
+        assertTrue(p.repo.scanOnce());
+        assertEquals(0, p.repo.getDeletesHeld());
+        // the day's budget kept counting: 24 + 4 is over it
+        for (int i = 0; i < 4; i++) Files.delete(scan.resolve("f" + (next++)));
+        Thread.sleep(3);
+        assertTrue(p.repo.scanOnce());
+        assertEquals(4, p.repo.getDeletesHeld(), "a release of a subtree's hold reset the day's budget");
+    }
+
+    @Test
+    void rewritesAndDeletesShareTheBudgets() throws Exception {
+        TestRig p = producer("plugin-p", scan, "sync_delete_guard_window_ms", "1");
+        for (int i = 0; i < 40; i++) write(scan.resolve("doc" + i), "original " + i);
+        assertTrue(p.repo.scanOnce());
+        for (int i = 0; i < 6; i++) {
+            Path f = write(scan.resolve("doc" + i), "ENCRYPTED " + i);
+            Files.setLastModifiedTime(f, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() + 10_000));
+        }
+        assertTrue(p.repo.scanOnce());
+        assertEquals(0, p.repo.getRewritesHeld(), "six rewrites of forty: under every budget");
+        for (int i = 10; i < 15; i++) Files.delete(scan.resolve("doc" + i));
+        Thread.sleep(3);
+        assertTrue(p.repo.scanOnce());
+        assertEquals(5, p.repo.getDeletesHeld(), "six rewritten and five deleted in a day is over a quarter of forty");
+    }
+
+    @Test
+    void theRewriteGuardsDayIsKeptAcrossARestart() throws Exception {
+        String[] cfg = {"sync_rewrite_guard_total_fraction", "0"};
+        TestRig p = producer("plugin-p", scan, cfg);
+        for (int i = 0; i < 40; i++) write(scan.resolve("doc" + i), "original " + i);
+        assertTrue(p.repo.scanOnce());
+        int i = 0;
+        for (int c = 0; c < 2; c++) {
+            for (int k = 0; k < 6; k++, i++) {
+                Path f = write(scan.resolve("doc" + i), "ENCRYPTED " + i);
+                Files.setLastModifiedTime(f, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() + 10_000));
+            }
+            assertTrue(p.repo.scanOnce());
+            if (c == 0) {
+                assertEquals(0, p.repo.getRewritesHeld());
+                p = restart(p, "plugin-p", scan, cfg);
+            }
+        }
+        assertEquals(6, p.repo.getRewritesHeld(), "twelve of forty rewritten within a day, across a restart");
+    }
+
+    @Test
+    void aClockThatMovedWhileDownClearsNoBudget() throws Exception {
+        String[] cfg = {"sync_delete_guard_window_ms", "1"};
+        TestRig p = producer("plugin-p", scan, cfg);
+        for (int i = 0; i < 40; i++) write(scan.resolve("doc" + i), "original " + i);
+        assertTrue(p.repo.scanOnce());
+        int next = 0;
+        for (int c = 0; c < 4; c++) {
+            for (int i = 0; i < 2; i++) Files.delete(scan.resolve("doc" + (next++)));
+            Thread.sleep(3);
+            assertTrue(p.repo.scanOnce());
+        }
+        assertEquals(0, p.repo.getDeletesHeld());
+        // the wall clock jumps three days ahead while the producer is down (or it was down three days): only an hour of
+        // it counts, so the day's eight deletes still count
+        p.db.setMeta(GuardLedger.META_WALL, String.valueOf(System.currentTimeMillis() - 3L * 24 * 3600 * 1000));
+        p = restart(p, "plugin-p", scan, cfg);
+        assertTrue(p.log.stream().anyMatch(l -> l.contains("count only 60 min")), p.log.toString());
+        for (int i = 0; i < 3; i++) Files.delete(scan.resolve("doc" + (next++)));
+        assertTrue(p.repo.scanOnce());
+        assertEquals(3, p.repo.getDeletesHeld(), "a clock that moved three days cleared the day's budget");
+        // a clock behind the last record is said so, and ages nothing
+        p.db.setMeta(GuardLedger.META_WALL, String.valueOf(System.currentTimeMillis() + 24L * 3600 * 1000));
+        p = restart(p, "plugin-p", scan, cfg);
+        assertTrue(p.log.stream().anyMatch(l -> l.contains("behind the guards' last record")), p.log.toString());
+        assertTrue(p.repo.scanOnce());
+        assertEquals(3, p.repo.getDeletesHeld());
+    }
 }

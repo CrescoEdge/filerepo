@@ -197,4 +197,39 @@ class ReviewRound4Test {
                 + " producer and deleted a.bin and b.bin at the mirror (repolistin " + (took == null ? null : took.getParam("status_code")) + ")");
     }
 
+    // =================================================================== the cumulative delete guard
+
+    /**
+     * MED. The total budget ("never past 50% since the last acknowledgement") is a NET shrink from the catalog's high-water
+     * mark: deletes that are replaced by new files (ransomware that writes x.locked and deletes x) never shrink it. Only
+     * the rolling-day budget (25%) is left, and that one is kept in memory: a restart forgets it. Deleting originals
+     * just under the window budget, replacing each, and restarting once a "day" drains every original.
+     */
+    @Test
+    void replacedDeletesAreHeldBeforeHalfTheOriginalsAreGone() throws Exception {
+        String[] cfg = {"sync_delete_guard_window_ms", "300"};
+        TestRig p = producer("plugin-p", scan, cfg);
+        int n = 60;
+        for (int i = 0; i < n; i++) write(scan.resolve("orig" + i + ".doc"), "original " + i);
+        assertTrue(p.repo.scanOnce());
+        int deleted = 0, junk = 0, windows = 0;
+        while (deleted < 40 && p.repo.getDeletesHeld() == 0 && windows < 40) {
+            for (int i = 0; i < 5; i++) {
+                Files.delete(scan.resolve("orig" + (deleted++) + ".doc"));
+                write(scan.resolve("orig" + (junk++) + ".doc.locked"), "ENCRYPTED " + junk);
+            }
+            assertTrue(p.repo.scanOnce());
+            Thread.sleep(350);
+            windows++;
+            if (windows % 3 == 0 && p.repo.getDeletesHeld() == 0) {
+                // a restart (or a day) later: the rolling day is forgotten, the net shrink is still zero
+                p.close();
+                rigs.remove(p);
+                p = producer("plugin-p", scan, cfg);
+            }
+        }
+        assertTrue(p.repo.getDeletesHeld() > 0 || deleted <= n / 2, deleted + " of " + n + " originals deleted (each replaced"
+                + " by a .locked file) over " + windows + " windows with no hold");
+    }
+
 }

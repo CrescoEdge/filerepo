@@ -387,6 +387,15 @@ public class DBEngine {
                 if (!has) {
                     try (Statement stmt = conn.createStatement()) {
                         stmt.executeUpdate(t[1]);
+                        if ("GUARDLOG".equals(t[0])) {
+                            try (Statement st = conn.createStatement()) {
+                                st.executeUpdate("CREATE INDEX guardlog_at ON guardlog (atms)");
+                                st.executeUpdate("CREATE INDEX guardlog_kind_at ON guardlog (kind, atms)");
+                                // a catalog from before: the rewrites it recorded since the last acknowledgement count
+                                // toward the total (at the clock's start), as they did
+                                st.executeUpdate("INSERT INTO guardlog (kind, pathhash, atms, born) SELECT 'R', pathhash, 0, 0 FROM rewritten");
+                            }
+                        }
                         if ("HOLDERIDS".equals(t[0])) {
                             // a catalog from before: every producer whose claims it records (orphaned or not), unnamed
                             try (Statement st = conn.createStatement()) {
@@ -405,6 +414,18 @@ public class DBEngine {
                     } catch (Exception ex) {
                         logger.error("could not create " + t[0], ex);
                     }
+                }
+            }
+            // a catalog from before files' first cataloging was recorded: every row it holds is an original
+            boolean hasCataloged;
+            try (ResultSet rs = conn.getMetaData().getColumns(null, null, "FILELIST", "CATALOGED")) {
+                hasCataloged = rs.next();
+            }
+            if (!hasCataloged) {
+                try (Statement stmt = conn.createStatement()) {
+                    stmt.executeUpdate("ALTER TABLE filelist ADD COLUMN cataloged bigint NOT NULL DEFAULT 0");
+                } catch (Exception ex) {
+                    logger.error("could not add filelist.cataloged", ex);
                 }
             }
             // a mirrored table from before holdings had a kind: every claim it holds was fetched
@@ -468,6 +489,9 @@ public class DBEngine {
                     + " prevmd5 varchar(255), md5 varchar(255))"},
             {"REWRITTEN", "CREATE TABLE rewritten (pathhash varchar(200) primary key NOT NULL)"},
             {"HOLDERIDS", "CREATE TABLE holderids (holder varchar(256) primary key NOT NULL, ident varchar(2000))"},
+            {"GUARDLOG", "CREATE TABLE guardlog (kind char(1) NOT NULL, pathhash varchar(200) NOT NULL, atms bigint NOT NULL,"
+                    + " born bigint NOT NULL,"
+                    + " PRIMARY KEY (kind, pathhash))"},
     };
 
     /**
@@ -1121,59 +1145,108 @@ public class DBEngine {
         }
     }
 
-    /** Files rewritten (and offered) since the last acknowledgement: recorded, once each. */
-    public void noteRewritten(List<String> paths, int batchSize) {
+    // ---- the guards' ledger (GuardLedger): deletes recorded and rewrites offered, by path, on the guards' clock ----
+
+    /**
+     * Records of {@code kinds} ("D", "R" or "DR") made after {@code after}, of files first cataloged at or before
+     * {@code bornBy}. Fails closed: unreadable counts as over every budget.
+     */
+    public int guardCount(String kinds, long after, long bornBy) {
+        String sql = kinds.length() == 1 ? "SELECT COUNT(*) FROM guardlog WHERE kind = ? AND atms > ? AND born <= ?"
+                : "SELECT COUNT(*) FROM guardlog WHERE atms > ? AND born <= ?";
+        try (Connection conn = ds.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            int i = 1;
+            if (kinds.length() == 1) ps.setString(i++, kinds);
+            ps.setLong(i++, after);
+            ps.setLong(i, bornBy);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        } catch (Exception ex) {
+            logger.error("guardCount error (counted as over every budget)", ex);
+            return Integer.MAX_VALUE / 4;
+        }
+    }
+
+    /** Record {@code paths} (path -> when first cataloged) under {@code kind} at {@code at} (moved to this time if there). */
+    public void guardRecord(char kind, Map<String, Long> paths, long at) {
         if (paths.isEmpty()) return;
         try (Connection conn = ds.getConnection()) {
             conn.setAutoCommit(false);
-            try (PreparedStatement ps = conn.prepareStatement("INSERT INTO rewritten (pathhash) SELECT ? FROM SYSIBM.SYSDUMMY1"
-                    + " WHERE NOT EXISTS (SELECT 1 FROM rewritten WHERE pathhash = ?)")) {
+            try (PreparedStatement up = conn.prepareStatement("UPDATE guardlog SET atms = ?, born = ? WHERE kind = ? AND pathhash = ?");
+                 PreparedStatement in = conn.prepareStatement("INSERT INTO guardlog (kind, pathhash, atms, born) VALUES (?,?,?,?)")) {
                 int n = 0;
-                for (String p : paths) {
-                    String k = pathKey(p);
-                    ps.setString(1, k);
-                    ps.setString(2, k);
-                    ps.executeUpdate();
-                    if (++n % Math.max(1, batchSize) == 0) conn.commit();
+                for (Map.Entry<String, Long> p : paths.entrySet()) {
+                    String k = pathKey(p.getKey());
+                    long born = p.getValue() == null ? 0L : p.getValue();
+                    up.setLong(1, at);
+                    up.setLong(2, born);
+                    up.setString(3, String.valueOf(kind));
+                    up.setString(4, k);
+                    if (up.executeUpdate() == 0) {
+                        in.setString(1, String.valueOf(kind));
+                        in.setString(2, k);
+                        in.setLong(3, at);
+                        in.setLong(4, born);
+                        in.executeUpdate();
+                    }
+                    if (++n % 500 == 0) conn.commit();
                 }
                 conn.commit();
             } catch (SQLException ex) {
                 try { conn.rollback(); } catch (SQLException ignore) { }
-                logger.error("noteRewritten failed: " + ex.getMessage());
+                logger.error("guardRecord failed: " + ex.getMessage());
             } finally {
                 try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
             }
         } catch (Exception ex) {
-            logger.error("noteRewritten error", ex);
+            logger.error("guardRecord error", ex);
         }
     }
 
-    public boolean wasRewritten(String path) {
-        try (Connection conn = ds.getConnection();
-             PreparedStatement ps = conn.prepareStatement("SELECT 1 FROM rewritten WHERE pathhash = ?")) {
-            ps.setString(1, pathKey(path));
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
+    /** How many of {@code paths} are recorded under {@code kind} after {@code after} (chunked lookups by key). */
+    public int guardKnown(char kind, java.util.Collection<String> paths, long after) {
+        int n = 0;
+        List<String> keys = new ArrayList<>(paths.size());
+        for (String p : paths) keys.add(pathKey(p));
+        for (int from = 0; from < keys.size(); from += 500) {
+            List<String> chunk = keys.subList(from, Math.min(keys.size(), from + 500));
+            StringBuilder q = new StringBuilder("SELECT COUNT(*) FROM guardlog WHERE kind = ? AND atms > ? AND pathhash IN (");
+            for (int i = 0; i < chunk.size(); i++) q.append(i == 0 ? "?" : ",?");
+            q.append(')');
+            try (Connection conn = ds.getConnection(); PreparedStatement ps = conn.prepareStatement(q.toString())) {
+                ps.setString(1, String.valueOf(kind));
+                ps.setLong(2, after);
+                for (int i = 0; i < chunk.size(); i++) ps.setString(3 + i, chunk.get(i));
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) n += rs.getInt(1);
+                }
+            } catch (Exception ex) {
+                logger.error("guardKnown error", ex);
             }
-        } catch (Exception ex) {
-            return false;
         }
+        return n;
     }
 
-    public long rewrittenCount() {
+    /** The latest time any record was made (0 when none). */
+    public long guardMaxAt() {
         try (Connection conn = ds.getConnection(); Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM rewritten")) {
-            return rs.next() ? rs.getLong(1) : 0;
+             ResultSet rs = st.executeQuery("SELECT MAX(atms) FROM guardlog")) {
+            return rs.next() ? Math.max(0L, rs.getLong(1)) : 0L;
         } catch (Exception ex) {
-            return 0;
+            logger.error("guardMaxAt error", ex);
+            return 0L;
         }
     }
 
-    public void clearRewritten() {
-        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement()) {
-            st.executeUpdate("DELETE FROM rewritten");
+    /** Forget records made at or before {@code atOrBefore}. */
+    public void guardPrune(long atOrBefore) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM guardlog WHERE atms <= ?")) {
+            ps.setLong(1, atOrBefore);
+            ps.executeUpdate();
         } catch (Exception ex) {
-            logger.error("clearRewritten error", ex);
+            logger.error("guardPrune error", ex);
         }
     }
 
@@ -1252,12 +1325,19 @@ public class DBEngine {
         final String md5;
         final long lastmodified;
         final long filesize;
+        // when a scanner first cataloged it, on the guards' clock (0: before that was recorded)
+        final long cataloged;
 
         Row(String filepath, String md5, long lastmodified, long filesize) {
+            this(filepath, md5, lastmodified, filesize, 0L);
+        }
+
+        Row(String filepath, String md5, long lastmodified, long filesize, long cataloged) {
             this.filepath = filepath;
             this.md5 = md5;
             this.lastmodified = lastmodified;
             this.filesize = filesize;
+            this.cataloged = cataloged;
         }
     }
 
@@ -1297,7 +1377,7 @@ public class DBEngine {
     private int writeChunk(List<Row> rows, boolean insert) {
         if (rows.isEmpty()) return 0;
         String upsert = insert
-                ? "insert into filelist (filepath, md5, insync, lastmodified, filesize) values (?,?,?,?,?)"
+                ? "insert into filelist (filepath, md5, insync, lastmodified, filesize, cataloged) values (?,?,?,?,?,?)"
                 : "UPDATE filelist SET md5=?, insync=?, filesize=?, lastmodified=? WHERE filepath=?";
         try (Connection conn = ds.getConnection()) {
             conn.setAutoCommit(false);
@@ -1342,6 +1422,7 @@ public class DBEngine {
             ps.setInt(3, 0);
             ps.setString(4, String.valueOf(r.lastmodified));
             ps.setString(5, String.valueOf(r.filesize));
+            ps.setLong(6, r.cataloged);
         } else {
             ps.setString(1, r.md5);
             ps.setInt(2, 0);
@@ -1352,7 +1433,7 @@ public class DBEngine {
     }
 
     private boolean addFileRow(Row r) {
-        String sql = "insert into filelist (filepath, md5, insync, lastmodified, filesize) values (?,?,?,?,?)";
+        String sql = "insert into filelist (filepath, md5, insync, lastmodified, filesize, cataloged) values (?,?,?,?,?,?)";
         try (Connection conn = ds.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
             bindRow(ps, r, true);
             ps.executeUpdate();
@@ -1719,7 +1800,7 @@ public class DBEngine {
 
     public List<Map<String,String>> getRepoList() {
         List<Map<String,String>> repoFileList = new ArrayList<>();
-        String sql = "SELECT filepath, md5, lastmodified, filesize FROM filelist";
+        String sql = "SELECT filepath, md5, lastmodified, filesize, cataloged FROM filelist";
         try (Connection conn = ds.getConnection();
              Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
@@ -1729,6 +1810,7 @@ public class DBEngine {
                 fileMap.put("md5",rs.getString("md5"));
                 fileMap.put("lastmodified",rs.getString("lastmodified"));
                 fileMap.put("filesize",rs.getString("filesize"));
+                fileMap.put("cataloged", String.valueOf(rs.getLong("cataloged")));
                 repoFileList.add(fileMap);
             }
         } catch(Exception ex) {

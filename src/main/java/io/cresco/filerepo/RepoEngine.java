@@ -437,9 +437,10 @@ public class RepoEngine {
     private final int rewriteMin;
     private final double rewriteDayFraction;
     private final double rewriteTotalFraction;
-    // files rewritten (and offered) within the last 24 hours: path -> when (bounded: past the budget everything is held)
-    private final LinkedHashMap<String, Long> rewrittenToday = new LinkedHashMap<>();
-    static final String META_DELETE_BASELINE = "delete_baseline";
+    // what the guards let through (deletes recorded, rewrites offered), kept in the catalog on the guards' own clock
+    private final GuardLedger ledger;
+    // the budgets that hold the rewrites held now (consumed by their release), kept in the catalog
+    static final String META_REWRITE_HOLD_BUDGETS = "rewrite_hold_budgets";
 
     // Bounded, named, daemon pool for peer-sync updaters: one per producer at a time, at most sync_threads at once,
     // and at most sync_queue_max waiting (FR-D5). A diff that finds both full is refused as busy (status 11) and the
@@ -473,6 +474,7 @@ public class RepoEngine {
         insecure = Callers.insecureMode(plugin);
         this.dbEngine = dbEngine;
         this.liveTier = liveTier;
+        this.ledger = new GuardLedger(dbEngine, logger);
         gson = new Gson();
 
         this.repoListType = new TypeToken<Map<String,FileObject>>() {}.getType();
@@ -598,10 +600,6 @@ public class RepoEngine {
         }
         // this repository's sync generation survives a restart: a plain restart resumes where it left off
         syncGen = loadGen();
-        try {
-            String b = dbEngine.getMeta(META_DELETE_BASELINE);
-            if (b != null) guard.setBaseline(Long.parseLong(b));
-        } catch (Exception ignore) { }
         try {
             Identity recorded = Identity.parse(dbEngine.getMeta(META_PRODUCER_PIN));
             if (recorded != null && recorded.key == null) {
@@ -1349,6 +1347,8 @@ public class RepoEngine {
      * pending for every subscriber; files that are gone become tombstones (FR-D4) as the mass-delete guard allows.
      */
     ScanResult scan() {
+        // the guards' clock, recorded so a restart resumes it
+        ledger.tick();
 
         Map<String,FileObject> fileDiffMap = new LinkedHashMap<>();
         List<DeleteObject> deletes = new ArrayList<>();
@@ -1359,9 +1359,17 @@ public class RepoEngine {
             // Load the catalog once (path -> md5, lastmodified, filesize) so the per-file freshness check below is an
             // in-memory lookup instead of a DB round-trip per file on every scan cycle.
             Map<String,String[]> catalog = new HashMap<>();
+            // the files cataloged under the scan dir, with when each was first cataloged (the guards count originals)
+            Map<String, Long> born = new HashMap<>();
             for (Map<String,String> row : dbEngine.getRepoList()) {
                 catalog.put(row.get("filepath"), new String[]{row.get("md5"), row.get("lastmodified"), row.get("filesize")});
+                if (Paths.get(row.get("filepath")).toAbsolutePath().startsWith(root)) {
+                    long c = 0L;
+                    try { c = Long.parseLong(row.get("cataloged")); } catch (Exception ignore) { }
+                    born.put(row.get("filepath"), c);
+                }
             }
+            long catalogedNow = ledger.now();
 
             Walk walk = walk(root, scanRecursive);
 
@@ -1409,7 +1417,7 @@ public class RepoEngine {
                     continue;
                 }
                 String fileName = nameUnder(root, p, scanRecursive);
-                (add ? adds : updates).add(new DBEngine.Row(filePath, MD5hash, lastModified, filesize));
+                (add ? adds : updates).add(new DBEngine.Row(filePath, MD5hash, lastModified, filesize, catalogedNow));
                 if (add) {
                     fileDiffMap.put(filePath, new FileObject(fileName, MD5hash, filePath, lastModified, filesize));
                     changed.add(filePath);
@@ -1426,8 +1434,10 @@ public class RepoEngine {
                 transferId++;
             }
             dbEngine.applyScan(adds, updates, scanBatchSize);
+            // a repository's first scan (or its first in this build): what is cataloged now is what the guards protect
+            ledger.initAcks();
             // the rewrite guard: what it holds is offered to nobody until an admin releases exactly that set
-            Set<String> held = guardRewrites(rewrites, catalog.size());
+            Set<String> held = guardRewrites(rewrites, born);
             for (String[] r : rewrites) {
                 if (held.contains(r[0])) fileDiffMap.remove(r[0]);
                 else changed.add(r[0]);
@@ -1437,7 +1447,7 @@ public class RepoEngine {
 
             // the delete phase: catalog rows under the scan dir whose file is gone
             if (walk.complete) {
-                deletes.addAll(recordDeletes(root, scanRecursive, catalog, seen, walk));
+                deletes.addAll(recordDeletes(root, scanRecursive, catalog, born, seen, walk));
             } else {
                 logger.warn("scan of " + root + " was incomplete: no file is taken for deleted this cycle");
             }
@@ -1457,17 +1467,15 @@ public class RepoEngine {
      * mass-delete guard allows: what it holds stays cataloged and is offered to nobody until an admin releases exactly
      * that set, or the files come back. Remembers the tree's mount points, so a vanished one is told apart.
      */
-    private List<DeleteObject> recordDeletes(Path root, boolean recursive, Map<String, String[]> catalog, Set<String> seen,
-                                             Walk walk) {
+    private List<DeleteObject> recordDeletes(Path root, boolean recursive, Map<String, String[]> catalog,
+                                             Map<String, Long> underRoot, Set<String> seen, Walk walk) {
         long now = System.currentTimeMillis();
         List<DBEngine.Tombstone> gone = new ArrayList<>();
-        List<String> underRoot = new ArrayList<>();
         for (Map.Entry<String, String[]> e : catalog.entrySet()) {
             String path = e.getKey();
             Path p = Paths.get(path);
             // a stale row from elsewhere (an earlier scan_dir) is not this scanner's to delete
-            if (!p.toAbsolutePath().startsWith(root)) continue;
-            underRoot.add(path);
+            if (!underRoot.containsKey(path)) continue;
             if (seen.contains(path)) continue;
             // still there: a subdirectory file in a non-recursive scan, a link, an unreadable file
             if (Files.exists(p, LinkOption.NOFOLLOW_LINKS)) continue;
@@ -1485,15 +1493,8 @@ public class RepoEngine {
         String rootDevNow = walk.rootDev == null ? null : String.valueOf(walk.rootDev);
         if (rootDevBefore != null && rootDevNow != null && !rootDevBefore.equals(rootDevNow)) vanished.add(root.toString());
 
-        long baselineBefore = guard.baseline();
-        DeleteGuard.Decision d = guard.evaluate(root, underRoot, gone, seen.size(), vanished, now);
-        if (guard.baseline() != baselineBefore) {
-            try {
-                dbEngine.setMeta(META_DELETE_BASELINE, String.valueOf(guard.baseline()));
-            } catch (Exception ex) {
-                logger.error("the delete guard's acknowledged size could not be recorded: " + ex.getMessage());
-            }
-        }
+        DeleteGuard.Decision d = guard.evaluate(root, underRoot, gone, seen.size(), vanished, ledger);
+        ledger.prune(guard.totalOn(), rewriteTotalFraction > 0);
         if (d.released) logger.warn("releasing " + d.held.size() + " held delete(s) recorded now, as an admin asked");
         if (!d.held.isEmpty()) {
             if (!d.holdId.equals(lastHoldLogged)) {
@@ -1581,34 +1582,37 @@ public class RepoEngine {
      * changed back to the content the subscribers have is no longer held, and offered to nobody. Returns the paths held
      * now among {@code rewrites}.
      */
-    private Set<String> guardRewrites(List<String[]> rewrites, int catalogSize) {
+    private Set<String> guardRewrites(List<String[]> rewrites, Map<String, Long> born) {
         synchronized (rewriteLock) {
-            return guardRewritesLocked(rewrites, catalogSize);
+            return guardRewritesLocked(rewrites, born);
         }
     }
 
-    private Set<String> guardRewritesLocked(List<String[]> rewrites, int catalogSize) {
+    private Set<String> guardRewritesLocked(List<String[]> rewrites, Map<String, Long> born) {
         Set<String> heldNow = new HashSet<>();
         if (rewrites.isEmpty()) return heldNow;
-        long now = System.currentTimeMillis();
-        // the longer horizons: distinct files rewritten within a rolling day, and since the last acknowledgement
-        rewrittenToday.values().removeIf(t -> now - t > DeleteGuard.DAY_MS);
-        Set<String> today = new HashSet<>(rewrittenToday.keySet());
-        int cycleNew = 0;
-        for (String[] r : rewrites) if (today.add(r[0])) cycleNew++;
+        int catalogSize = born.size();
+        // the longer horizons, from the guards' ledger (kept across restarts, on a monotonic clock): originals (files
+        // first cataloged before the period began) rewritten, each once, or deleted, within a rolling day and since the
+        // last acknowledgement of each budget, against how many originals there were
         boolean cycleLarge = rewrites.size() >= rewriteMin && rewrites.size() > rewriteFraction * catalogSize;
-        boolean dayLarge = rewriteDayFraction > 0 && today.size() >= rewriteMin && today.size() > rewriteDayFraction * catalogSize;
-        long sinceAck = 0;
-        boolean totalLarge = false;
-        if (!cycleLarge && !dayLarge && rewriteTotalFraction > 0) {
-            // counted only up to the budget: one lookup per rewrite at most, and none once it is over
-            double budget = rewriteTotalFraction * catalogSize;
-            sinceAck = dbEngine.rewrittenCount();
-            for (String[] r : rewrites) {
-                if (sinceAck > budget && sinceAck >= rewriteMin) break;
-                if (!dbEngine.wasRewritten(r[0])) sinceAck++;
+        int today = 0, sinceAck = 0;
+        boolean dayLarge = false, totalLarge = false;
+        if (!cycleLarge && rewriteDayFraction > 0) {
+            long start = ledger.dayStart(GuardLedger.DAY_R);
+            List<String> originals = originalsOf(rewrites, born, start);
+            if (!originals.isEmpty()) {
+                today = ledger.count("DR", start, start) + originals.size() - ledger.known(GuardLedger.REWRITE, originals, start);
+                dayLarge = today >= rewriteMin && today > rewriteDayFraction * ledger.originals(born, start);
             }
-            totalLarge = sinceAck >= rewriteMin && sinceAck > budget;
+        }
+        if (!cycleLarge && !dayLarge && rewriteTotalFraction > 0) {
+            long start = ledger.ack(GuardLedger.TOT_R);
+            List<String> originals = originalsOf(rewrites, born, start);
+            if (!originals.isEmpty()) {
+                sinceAck = ledger.count("DR", start, start) + originals.size() - ledger.known(GuardLedger.REWRITE, originals, start);
+                totalLarge = sinceAck >= rewriteMin && sinceAck > rewriteTotalFraction * ledger.originals(born, start);
+            }
         }
         boolean mass = cycleLarge || dayLarge || totalLarge;
         List<String[]> hold = new ArrayList<>();
@@ -1624,26 +1628,53 @@ public class RepoEngine {
                 hold.add(r);
             }
         }
-        // what goes through counts toward the day and the acknowledged total
-        List<String> passed = new ArrayList<>();
-        for (String[] r : rewrites) {
-            if (heldNow.contains(r[0])) continue;
-            passed.add(r[0]);
-            rewrittenToday.put(r[0], now);
-        }
-        if (rewriteTotalFraction > 0) dbEngine.noteRewritten(passed, scanBatchSize);
+        // what goes through counts toward the day and the totals (each file once)
+        Map<String, Long> passed = new LinkedHashMap<>();
+        for (String[] r : rewrites) if (!heldNow.contains(r[0])) passed.put(r[0], born.getOrDefault(r[0], 0L));
+        ledger.record(GuardLedger.REWRITE, passed);
         if (hold.isEmpty() && restored.isEmpty()) return heldNow;
+        if (mass && !hold.isEmpty()) {
+            // which budgets hold this set: a release consumes those, and only those
+            Set<String> budgets = rewriteHoldBudgets();
+            if (cycleLarge) budgets.add("cycle");
+            if (dayLarge) budgets.add("day");
+            if (totalLarge) budgets.add("total");
+            try {
+                dbEngine.setMeta(META_REWRITE_HOLD_BUDGETS, String.join(",", budgets));
+            } catch (Exception ex) {
+                logger.error("the rewrite hold's budgets could not be recorded: " + ex.getMessage());
+            }
+        }
         dbEngine.holdChanges(hold, scanBatchSize);
         dbEngine.unholdChanges(restored);
         refreshRewriteHold();
         if (rewritesHeld > 0 && !String.valueOf(rewriteHoldId).equals(lastRewriteHoldLogged)) {
             logger.error("rewrite guard: " + rewritesHeld + " rewritten file(s) held, not offered to subscribers ("
-                    + rewrites.size() + " of " + catalogSize + " cataloged files rewritten this cycle, " + today.size()
-                    + " in the last 24 h, " + sinceAck + " since the last acknowledgement); hold "
+                    + rewrites.size() + " of " + catalogSize + " cataloged files rewritten this cycle, " + today
+                    + " deleted or rewritten in the last 24 h, " + sinceAck + " since the last acknowledgement); hold "
                     + rewriteHoldId + ". If intended, an admin releases them with releaserewrites");
             lastRewriteHoldLogged = rewriteHoldId;
         }
         return heldNow;
+    }
+
+    /** The rewritten paths that are originals of a period starting at {@code start}. */
+    private static List<String> originalsOf(List<String[]> rewrites, Map<String, Long> born, long start) {
+        List<String> out = new ArrayList<>();
+        for (String[] r : rewrites) if (born.getOrDefault(r[0], 0L) <= start) out.add(r[0]);
+        return out;
+    }
+
+    /** The budgets that hold the rewrites held now (the catalog's record; empty when unreadable). */
+    private Set<String> rewriteHoldBudgets() {
+        Set<String> out = new LinkedHashSet<>();
+        try {
+            String v = dbEngine.getMeta(META_REWRITE_HOLD_BUDGETS);
+            if (v != null) for (String b : v.split(",")) if (!b.isEmpty()) out.add(b);
+        } catch (Exception ex) {
+            logger.error("the rewrite hold's budgets are unreadable: " + ex.getMessage());
+        }
+        return out;
     }
 
     /** Recompute the held rewrite set's size and id (after it changed). */
@@ -1653,6 +1684,11 @@ public class RepoEngine {
         if (held.isEmpty()) {
             rewriteHoldId = null;
             lastRewriteHoldLogged = null;
+            try {
+                if (dbEngine.getMeta(META_REWRITE_HOLD_BUDGETS) != null) dbEngine.deleteMeta(META_REWRITE_HOLD_BUDGETS);
+            } catch (Exception ex) {
+                logger.error("the rewrite hold's budgets could not be cleared: " + ex.getMessage());
+            }
             return;
         }
         List<DBEngine.Tombstone> asSet = new ArrayList<>(held.size());
@@ -1681,13 +1717,22 @@ public class RepoEngine {
             if (!holdId.equals(rewriteHoldId)) return -1;
             List<String> paths = new ArrayList<>();
             for (String[] h : dbEngine.heldChanges()) paths.add(h[0]);
+            Set<String> budgets = rewriteHoldBudgets();
             dbEngine.markChanged(paths, scanBatchSize);
             dbEngine.unholdChanges(paths);
             refreshRewriteHold();
-            // the admin has seen them: the day and the acknowledged total start over
-            rewrittenToday.clear();
-            dbEngine.clearRewritten();
-            logger.warn("releasing " + paths.size() + " held rewrite(s): offered to every subscriber, as an admin asked");
+            // the admin has seen them: the budgets that held them start over, and only those (the released rewrites
+            // themselves count toward nothing); every other budget, the delete guard's included, keeps counting
+            long now = ledger.now();
+            if (budgets.contains("day")) ledger.acknowledge(GuardLedger.DAY_R, now);
+            if (budgets.contains("total")) ledger.acknowledge(GuardLedger.TOT_R, now);
+            try {
+                dbEngine.deleteMeta(META_REWRITE_HOLD_BUDGETS);
+            } catch (Exception ex) {
+                logger.error("the rewrite hold's budgets could not be cleared: " + ex.getMessage());
+            }
+            logger.warn("releasing " + paths.size() + " held rewrite(s): offered to every subscriber, as an admin asked"
+                    + (budgets.isEmpty() ? "" : " (acknowledging the " + String.join(", ", budgets) + " budget(s))"));
             return paths.size();
         }
     }
@@ -1777,7 +1822,7 @@ public class RepoEngine {
      */
     int releaseHeldDeletes(String holdId) {
         if (isMirror()) return releaseMirrorHeld(holdId);
-        return guard.release(holdId, System.currentTimeMillis());
+        return guard.release(holdId, ledger.now());
     }
 
     // =========================================================================== producer: offers
