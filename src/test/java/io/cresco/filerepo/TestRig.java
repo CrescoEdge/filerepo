@@ -50,6 +50,8 @@ final class TestRig implements AutoCloseable {
     final List<String> log = Collections.synchronizedList(new ArrayList<>());
     /** The agent's plugin-signing policy: the test CA's trust store unless a test says otherwise. */
     volatile boolean signingTrustConfigured = true;
+    /** The agent's security mode (AgentService.isSecurityEnabled): secured unless a test says otherwise. */
+    volatile boolean securityEnabled = true;
     volatile boolean signingRequired = true;
 
     /** filerepo with {@code config} (pluginID added), its catalog under {@code agentDir}, and {@code live} (may be null). */
@@ -176,6 +178,7 @@ final class TestRig implements AutoCloseable {
                         case "getAgentState": return state;
                         case "getCLogger": return log;
                         case "getAgentDataDirectory": return agentDir.toString();
+                        case "isSecurityEnabled": return securityEnabled;
                         case "getDataPlaneService": return dp;
                         case "getPluginSigningTrust": return signingTrustConfigured ? JarSigning.trustStore() : null;
                         case "isPluginSigningRequired": return signingRequired;

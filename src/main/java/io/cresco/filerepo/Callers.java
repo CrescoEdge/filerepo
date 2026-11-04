@@ -19,9 +19,15 @@ final class Callers {
     private Callers() {}
 
     /** True when the agent was started with {@code broker_security_enabled=false} (-D or CRESCO_ environment). */
-    static boolean insecureMode() {
-        return "false".equalsIgnoreCase(System.getProperty("broker_security_enabled"))
-                || "false".equalsIgnoreCase(System.getenv("CRESCO_broker_security_enabled"));
+    static boolean insecureMode(io.cresco.library.plugin.PluginBuilder plugin) {
+        // the agent's own decision (broker_security_enabled=false set explicitly); the property only on an agent whose
+        // library predates AgentService.isSecurityEnabled
+        try {
+            return !plugin.getAgentService().isSecurityEnabled();
+        } catch (NoSuchMethodError | AbstractMethodError olderLibrary) {
+            return "false".equalsIgnoreCase(System.getProperty("broker_security_enabled"))
+                    || "false".equalsIgnoreCase(System.getenv("CRESCO_broker_security_enabled"));
+        }
     }
 
     /** The verified caller; with no stamp, anonymous in insecure mode, otherwise null. */

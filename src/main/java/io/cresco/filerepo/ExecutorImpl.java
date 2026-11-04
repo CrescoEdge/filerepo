@@ -232,7 +232,7 @@ public class ExecutorImpl implements Executor {
     // a streamfile is refused as busy (11). Inline reads (getfile/getjar) are capped to keep them off the heap.
     private final TransferScheduler transfers;
     // explicit insecure development mode (broker_security_enabled=false on the agent): an unstamped caller is anonymous
-    private final boolean insecure = Callers.insecureMode();
+    private final boolean insecure;
     private final long liveLeaseMaxMs;
     private final AtomicLong transfersRejected = new AtomicLong();
     private final long maxInlineBytes;
@@ -258,6 +258,7 @@ public class ExecutorImpl implements Executor {
     public ExecutorImpl(PluginBuilder pluginBuilder, RepoEngine repoEngine, LiveTierClient liveTier) {
         this.plugin = pluginBuilder;
         logger = plugin.getLogger(ExecutorImpl.class.getName(), CLogger.Level.Info);
+        insecure = Callers.insecureMode(plugin);
         gson = new Gson();
         this.repoEngine = repoEngine;
         this.liveTier = liveTier;

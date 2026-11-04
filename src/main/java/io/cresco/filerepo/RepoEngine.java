@@ -95,7 +95,7 @@ public class RepoEngine {
     private volatile boolean warnedRepoDirConflict;
 
     // explicit insecure development mode (broker_security_enabled=false on the agent): an unstamped caller is anonymous
-    private final boolean insecure = Callers.insecureMode();
+    private final boolean insecure;
 
     // ---- producer side (sync protocol 2) ----
     // this producer instance: transfer ids are <epoch>.<n>, so a confirm from before a restart never settles a transfer
@@ -304,6 +304,7 @@ public class RepoEngine {
 
         this.plugin = pluginBuilder;
         logger = plugin.getLogger(RepoEngine.class.getName(), CLogger.Level.Info);
+        insecure = Callers.insecureMode(plugin);
         this.dbEngine = dbEngine;
         this.liveTier = liveTier;
         gson = new Gson();
