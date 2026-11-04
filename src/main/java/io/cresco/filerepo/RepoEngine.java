@@ -23,6 +23,7 @@ import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -32,6 +33,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 
 public class RepoEngine {
 
@@ -46,6 +48,10 @@ public class RepoEngine {
     /** Files filerepo is still writing (putjar, putfiles, sync) are staged under this name and never scanned or served. */
     static final String STAGING_PREFIX = ".filerepo-";
     static final String STAGING_SUFFIX = ".part";
+    /** The owner-only directory, inside the repository, where putjar and putfiles stage what they verify. */
+    static final String PRIVATE_STAGING = ".filerepo-staging";
+    /** The sync protocol this filerepo speaks: a producer and its subscribers must speak the same one. */
+    static final String SYNC_PROTO = "2";
 
     // one scan at a time (the scan timer's own re-entry guard)
     private AtomicBoolean inScan = new AtomicBoolean(false);
@@ -61,6 +67,8 @@ public class RepoEngine {
     volatile Runnable afterClearCheck;
     // test hook: runs as an updater starts on a diff
     volatile Runnable beforeApplyDiff;
+    // the device a path is on (mount tracking); null when it cannot be told. Tests replace it.
+    volatile Function<Path, Object> devOf = RepoEngine::unixDev;
 
     // Live-tier backing (config live_row): the repository is a live copy or a workspace held at this node, read only
     // through the filesystem. Read once, here; no verb can change it. A live-backed repository runs no scanner and no
@@ -80,36 +88,68 @@ public class RepoEngine {
     private final Object liveRootsLock = new Object();
     private volatile boolean warnedRepoDirConflict;
 
-    // transferId -> what that offer carried (files and deletes); consumed by confirmTransfer() so insync=1 is only
-    // recorded once a subscriber confirms verified downloads and applied deletes (bounded: oldest evicted)
+    // explicit insecure development mode (broker_security_enabled=false on the agent): an unstamped caller is anonymous
+    private final boolean insecure = Callers.insecureMode();
+
+    // ---- producer side (sync protocol 2) ----
+    // this producer instance: transfer ids are <epoch>.<n>, so a confirm from before a restart never settles a transfer
+    // of this instance
+    private final String epoch = SyncReceiver.token().substring(0, 16);
+    private final AtomicLong transferSeq = new AtomicLong();
+    // transferId -> what that offer carried and to whom; consumed by confirmTransfer() (bounded: oldest evicted)
     private final Map<String, Offer> pendingTransferMap =
             Collections.synchronizedMap(new LinkedHashMap<String, Offer>() {
                 protected boolean removeEldestEntry(Map.Entry<String, Offer> eldest) {
                     return size() > 4096;
                 }
             });
-    // producer side: catalog path (or "del:" + path) -> when it was last offered, so a file still being fetched is not
-    // offered again every cycle; cleared by the confirm, expired after sync_offer_timeout_ms
-    private final Map<String, Long> offeredAt = new ConcurrentHashMap<>();
-    private final AtomicLong transferSeq = new AtomicLong();
+    // subscriber|path (or subscriber|del|path) -> when it was offered: not offered again until confirmed, failed or timed out
+    private final Map<String, Long> inFlight = new ConcurrentHashMap<>();
+    // subscribers this producer knows (verified by their stamped caller on reposubscribe), with what each still needs
+    // kept in the catalog (DBEngine PENDING, PENDINGDEL)
+    private final Map<String, ActiveSub> subscribers = new ConcurrentHashMap<>();
+    private final DeleteGuard guard;
+    static final String META_MOUNTS = "mounts";
+    static final String META_ROOT_DEV = "root_dev";
+    private volatile String lastHoldLogged;
+    private final Map<String, Long> oldProtocolWarned = new ConcurrentHashMap<>();
 
-    // Sync state is one insync flag per file, so a file any subscriber confirmed is not offered again. A subscriber
-    // therefore advertises a sync generation (new when it starts, and after a clear) in its subscribe; for a
-    // generation it has not completed, the producer sends that subscriber alone every confirmed file again, paced
-    // (sync_full_pages_per_cycle). This is how a subscriber that joins late, or a mirror that was cleared, refills.
-    private volatile String syncGen = SyncReceiver.token();
-    private final Map<String, FullOffer> fullOffers = new ConcurrentHashMap<>();
+    /** A subscriber as the producer serves it. */
+    static final class ActiveSub {
+        final String key, region, agent, plugin;
+        volatile String gen;
+        volatile long lastSeen;
+        // false after an offer went unanswered: skipped until it subscribes again
+        volatile boolean reachable = true;
 
-    /** A full offer to one subscriber: its generation, the next page, and whether it is done. */
-    static final class FullOffer {
-        final String gen;
-        volatile int offset;
-        volatile boolean done;
-
-        FullOffer(String gen) {
+        ActiveSub(String key, String region, String agent, String plugin, String gen, long lastSeen) {
+            this.key = key;
+            this.region = region;
+            this.agent = agent;
+            this.plugin = plugin;
             this.gen = gen;
+            this.lastSeen = lastSeen;
         }
     }
+
+    // ---- subscriber side ----
+    // this repository's sync generation: new when it starts and when a clear starts; a producer that has not served it
+    // offers it everything again (paced), and it skips what it holds
+    private volatile String syncGen = SyncReceiver.token();
+    // producers an admin pinned (sync_producers: region/agent/plugin, comma-separated); null: any that verifies
+    private final Set<String> configuredProducers;
+    // producers this repository subscribed to and that answered, verified by their stamped caller, as producers of its
+    // filerepo_name speaking this sync protocol: producer key -> when last confirmed
+    private final Map<String, Long> knownProducers = new ConcurrentHashMap<>();
+    // subscribe attempts: producer key -> when sent (bounded); an answer is taken only from an attempted producer
+    private final Map<String, Long> attempts = Collections.synchronizedMap(new LinkedHashMap<String, Long>() {
+        protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            return size() > 1024;
+        }
+    });
+    // subscribe attempts allowed: a burst, then a steady rate (a flood of forged discovers sends no flood of messages)
+    private double attemptTokens = 512;
+    private long attemptRefilled = System.currentTimeMillis();
 
     private final Object lockPeerUpdateStateMap = new Object();
     private final Map<String, Boolean> peerUpdateStateMap = new HashMap<>();
@@ -117,9 +157,6 @@ public class RepoEngine {
     private final Object lockPeerUpdateQueueMap = new Object();
     // producer -> its diffs waiting for the updater (FR-D5: bounded per producer and in producers)
     private final Map<String, Deque<PendingDiff>> peerUpdateQueueMap = new HashMap<>();
-    // subscriber side: the producers this repository subscribed to (from their discover broadcasts); a diff from any
-    // other source is refused, so no caller can make this repository fetch from an agent it never chose
-    private final Set<String> knownProducers = ConcurrentHashMap.newKeySet();
 
     private Type mapType;
 
@@ -128,9 +165,6 @@ public class RepoEngine {
     private Timer repoBroadcastTimer;
 
     private String scanDirString;
-
-    private final Object lockSubscriberMap = new Object();
-    private Map<String,Map<String,String>> subscriberMap;
 
     private int transferId = -1;
 
@@ -148,15 +182,15 @@ public class RepoEngine {
     private final int syncMaxPeers;
     private final long offerTimeoutMs;
     private final long tombstoneTtlMs;
-    private final int deleteGuardMin;
-    private final double deleteGuardFraction;
     private final boolean followLinks;
     private final boolean requirePutHashes;
     private final int syncStreamBuffer;
     private final long syncStreamIdleMs;
     private final int syncStreamRounds;
     private final long syncRpcTimeoutMs;
-    private final int fullPagesPerCycle;
+    private final int pagesPerCycle;
+    private final long subscribeRetryMs;
+    private final long peerTtlMs;
 
     // Bounded, named, daemon pool for peer-sync updaters: one per producer at a time, at most sync_threads at once,
     // and at most sync_queue_max waiting (FR-D5). A diff that finds both full is refused as busy (status 11) and the
@@ -170,10 +204,8 @@ public class RepoEngine {
     final AtomicLong syncFetchFailed = new AtomicLong();
     final AtomicLong syncVerifyFailed = new AtomicLong();
     final AtomicLong syncDeleted = new AtomicLong();
+    final AtomicLong syncConflicts = new AtomicLong();
     final AtomicLong tombstonesRecorded = new AtomicLong();
-    // the deletes the last scan held back (the mass-delete guard), and how many an admin released
-    private volatile int deletesHeld;
-    private volatile int releaseUpTo;
 
     public RepoEngine(PluginBuilder pluginBuilder, DBEngine dbEngine) {
         this(pluginBuilder, dbEngine, null);
@@ -191,8 +223,6 @@ public class RepoEngine {
 
         this.mapType = new TypeToken<Map<String,String>>() {}.getType();
 
-        subscriberMap = Collections.synchronizedMap(new HashMap<>());
-
         scanDirString =  plugin.getConfig().getStringParam("scan_dir");
         fileRepoName =  plugin.getConfig().getStringParam("filerepo_name");
         repoDir =  plugin.getConfig().getStringParam("repo_dir");
@@ -209,20 +239,36 @@ public class RepoEngine {
         syncMaxPeers = (int) clamp(longParam("sync_max_peers", 256L), 1, 100_000);
         offerTimeoutMs = clamp(longParam("sync_offer_timeout_ms", 600_000L), 1_000L, Long.MAX_VALUE);
         tombstoneTtlMs = clamp(longParam("sync_tombstone_ttl_ms", 7L * 24 * 3600 * 1000), 0L, Long.MAX_VALUE);
-        deleteGuardMin = (int) clamp(longParam("sync_delete_guard_min", 100L), 1, Integer.MAX_VALUE);
-        double fraction = 0.25;
+        double fraction = 0.10;
         try {
             Double d = plugin.getConfig().getDoubleParam("sync_delete_guard_fraction");
             if (d != null && d > 0 && d <= 1) fraction = d;
         } catch (Exception ignore) { }
-        deleteGuardFraction = fraction;
+        guard = new DeleteGuard(fraction, (int) clamp(longParam("sync_delete_guard_subtree_min", 2L), 1, Integer.MAX_VALUE),
+                clamp(longParam("sync_release_ttl_ms", 600_000L), 1_000L, Long.MAX_VALUE));
         followLinks = plugin.getConfig().getBooleanParam("scan_follow_links", false);
         requirePutHashes = plugin.getConfig().getBooleanParam("putfiles_require_hashes", true);
         syncStreamBuffer = (int) clamp(longParam("sync_stream_buffer", 262144L), 4096, 786432);
         syncStreamIdleMs = clamp(longParam("sync_stream_idle_ms", 30_000L), 100L, 3_600_000L);
         syncStreamRounds = (int) clamp(longParam("sync_stream_rounds", 3L), 1, 16);
         syncRpcTimeoutMs = clamp(longParam("sync_rpc_timeout_ms", 30_000L), 100L, 600_000L);
-        fullPagesPerCycle = (int) clamp(longParam("sync_full_pages_per_cycle", 8L), 1, 10_000);
+        // sync_full_pages_per_cycle is the older name of the same pacing
+        pagesPerCycle = (int) clamp(longParam("sync_pages_per_cycle", longParam("sync_full_pages_per_cycle", 8L)), 1, 10_000);
+        subscribeRetryMs = clamp(longParam("sync_subscribe_retry_ms", 10_000L), 100L, 3_600_000L);
+        peerTtlMs = clamp(longParam("sync_peer_ttl_ms", 3_600_000L), 10_000L, Long.MAX_VALUE);
+
+        String pinned = plugin.getConfig().getStringParam("sync_producers");
+        if (pinned != null && !pinned.trim().isEmpty()) {
+            Set<String> s = new HashSet<>();
+            for (String p : pinned.split(",")) {
+                String[] parts = p.trim().split("/");
+                if (parts.length == 3) s.add(peerKey(parts[0], parts[1], parts[2]));
+                else logger.error("sync_producers: '" + p.trim() + "' is not region/agent/pluginid; ignored");
+            }
+            configuredProducers = Collections.unmodifiableSet(s);
+        } else {
+            configuredProducers = null;
+        }
 
         int syncThreads = (int) clamp(longParam("sync_threads", 8L), 1, 256);
         int syncQueue = (int) clamp(longParam("sync_queue_max", 64L), 1, 100_000);
@@ -245,6 +291,13 @@ public class RepoEngine {
                 logger.error("remembered live-tier roots unreadable: " + ex.getMessage());
             }
             liveTier.rememberRoots(known, this::rememberLiveRoot);
+        }
+
+        if (liveRow == null && scanDirString != null && fileRepoName != null) {
+            // a producer keeps serving the subscribers it knew before a restart, until they go quiet
+            for (DBEngine.Subscriber s : dbEngine.getSubscribers()) {
+                subscribers.put(s.key, new ActiveSub(s.key, s.region, s.agent, s.plugin, s.gen, s.lastSeen));
+            }
         }
 
         if (liveRow == null && scanDirString == null && repoDir == null) {
@@ -275,6 +328,14 @@ public class RepoEngine {
 
     private static long clamp(long v, long min, long max) {
         return Math.max(min, Math.min(max, v));
+    }
+
+    private static Object unixDev(Path p) {
+        try {
+            return Files.getAttribute(p, "unix:dev", LinkOption.NOFOLLOW_LINKS);
+        } catch (Exception ex) {
+            return null;
+        }
     }
 
     /** Keep a live-tier root in the catalog, so it is refused even while no provider is registered. */
@@ -325,6 +386,11 @@ public class RepoEngine {
         return fileRepoName;
     }
 
+    /** True when this repository is a producer (scan_dir and filerepo_name, not live-backed). */
+    boolean isProducer() {
+        return liveRow == null && scanDirString != null && fileRepoName != null;
+    }
+
     public void start() {
 
         if (liveRow != null) {
@@ -340,7 +406,8 @@ public class RepoEngine {
             logger.info("Starting file scan : " + scanDirString + " filerepo: " + fileRepoName);
             startScan(delay, period);
         } else if((scanDirString == null) && (fileRepoName != null) && (repoDir != null)) {
-            logger.info("Start listening for filerepo: " + fileRepoName);
+            logger.info("Start listening for filerepo: " + fileRepoName
+                    + (configuredProducers == null ? "" : " (producers pinned: " + configuredProducers + ")"));
             createSubListener(fileRepoName);
         }
 
@@ -406,8 +473,9 @@ public class RepoEngine {
     }
 
     /**
-     * One scan cycle: catalog what changed, record what was deleted, offer both to the subscribers. Returns false when
-     * the cycle was skipped (another scan running, the scan dir missing, the gate held, the dir over a live root).
+     * One scan cycle: catalog what changed, record what was deleted (as the guard allows), offer each subscriber what
+     * it still needs. Returns false when the cycle was skipped (another scan running, the scan dir missing, the gate
+     * held, the dir over a live root).
      */
     boolean scanOnce() {
         //check file location
@@ -436,10 +504,9 @@ public class RepoEngine {
                 return false;
             }
             try {
-                logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " tid:" + transferId);
                 ScanResult result = scan();
-                // offers this cycle's changes, and continues any full offer to a subscriber
-                syncRegionFiles(result);
+                offerAll(result);
+                pruneSubscribers();
                 return true;
             } finally {
                 gate.readLock().unlock();
@@ -488,7 +555,7 @@ public class RepoEngine {
     }
 
     static boolean isStaging(String name) {
-        return name != null && name.startsWith(STAGING_PREFIX) && name.endsWith(STAGING_SUFFIX);
+        return name != null && (PRIVATE_STAGING.equals(name) || (name.startsWith(STAGING_PREFIX) && name.endsWith(STAGING_SUFFIX)));
     }
 
     /** A fresh staging file beside {@code destination}: same directory, so the final move is an atomic rename. */
@@ -497,19 +564,92 @@ public class RepoEngine {
     }
 
     /**
-     * The regular files under {@code root} (recursively or not), skipping staging files and, unless scan_follow_links,
-     * every symbolic link. Returns false when part of the tree could not be read: then no file may be taken for deleted.
+     * The owner-only staging directory inside the repository (same filesystem as every destination in it, so the final
+     * move is an atomic rename): nobody but the agent's user can rename a file over one filerepo is verifying.
      */
-    private boolean walk(Path root, boolean recursive, List<Path> out) {
-        final boolean[] complete = {true};
+    Path privateStaging() throws IOException {
+        Path dir = getRepoDir().toPath().toAbsolutePath().resolve(PRIVATE_STAGING);
+        if (!Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
+            try {
+                Files.createDirectory(dir, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
+            } catch (UnsupportedOperationException noPosix) {
+                Files.createDirectory(dir);
+            } catch (java.nio.file.FileAlreadyExistsException race) {
+                // made meanwhile; checked below
+            }
+        }
+        if (Files.isSymbolicLink(dir) || !Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("the staging directory is not a directory");
+        }
         try {
-            Files.walkFileTree(root,
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
+        } catch (UnsupportedOperationException noPosix) {
+            // not a POSIX filesystem
+        }
+        return dir;
+    }
+
+    /** What a walk found: regular files (as paths under the configured root), directories' devices, completeness. */
+    private static final class Walk {
+        final List<Path> files = new ArrayList<>();
+        // mount points under the root: root-based path -> device
+        final Map<String, Object> mounts = new HashMap<>();
+        Object rootDev;
+        boolean complete = true;
+    }
+
+    /**
+     * The regular files under {@code root} (recursively or not), skipping staging files and, unless scan_follow_links,
+     * every symbolic link below the root. The root itself is followed if it is a link (a scan dir may be one). Records
+     * each directory's device, so a mount point under the root is known. An incomplete walk takes nothing for deleted.
+     */
+    private Walk walk(Path root, boolean recursive) {
+        Walk w = new Walk();
+        Path walkRoot;
+        try {
+            walkRoot = root.toRealPath();
+        } catch (IOException ex) {
+            w.complete = false;
+            logger.error("scan dir " + root + " cannot be resolved: " + ex.getMessage());
+            return w;
+        }
+        Function<Path, Object> dev = devOf;
+        w.rootDev = dev.apply(walkRoot);
+        Deque<Object> parentDevs = new ArrayDeque<>();
+        try {
+            Files.walkFileTree(walkRoot,
                     followLinks ? EnumSet.of(FileVisitOption.FOLLOW_LINKS) : EnumSet.noneOf(FileVisitOption.class),
                     recursive ? Integer.MAX_VALUE : 1,
                     new SimpleFileVisitor<Path>() {
                         @Override
+                        public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                            if (!dir.equals(walkRoot) && isStaging(dir.getFileName().toString())) {
+                                return FileVisitResult.SKIP_SUBTREE;
+                            }
+                            Object d = dev.apply(dir);
+                            Object parent = parentDevs.peek();
+                            if (parent != null && d != null && !d.equals(parent)) {
+                                w.mounts.put(root.resolve(walkRoot.relativize(dir)).toString(), d);
+                            }
+                            parentDevs.push(d == null ? (parent == null ? "" : parent) : d);
+                            return FileVisitResult.CONTINUE;
+                        }
+
+                        @Override
+                        public FileVisitResult postVisitDirectory(Path dir, IOException exc) {
+                            if (!parentDevs.isEmpty()) parentDevs.pop();
+                            if (exc != null) {
+                                w.complete = false;
+                                logger.warn("scan: could not read " + dir + ": " + exc.getMessage());
+                            }
+                            return FileVisitResult.CONTINUE;
+                        }
+
+                        @Override
                         public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                            if (attrs.isRegularFile() && !isStaging(file.getFileName().toString())) out.add(file);
+                            if (attrs.isRegularFile() && !isStaging(file.getFileName().toString())) {
+                                w.files.add(root.resolve(walkRoot.relativize(file)));
+                            }
                             return FileVisitResult.CONTINUE;
                         }
 
@@ -518,20 +658,20 @@ public class RepoEngine {
                             if (exc instanceof FileSystemLoopException) {
                                 logger.warn("scan: a directory loop at " + file + " was not followed");
                             } else {
-                                complete[0] = false;
+                                w.complete = false;
                                 logger.warn("scan: could not read " + file + ": " + exc.getMessage());
                             }
                             return FileVisitResult.CONTINUE;
                         }
                     });
         } catch (IOException ex) {
-            complete[0] = false;
+            w.complete = false;
             logger.error("scan walk failed: " + ex.getMessage());
         }
-        return complete[0];
+        return w;
     }
 
-    /** What one scan found to offer: new and changed files, and deletes. */
+    /** What one scan found: new and changed files, and the deletes it recorded. */
     static final class ScanResult {
         final Map<String, FileObject> files;
         final List<DeleteObject> deletes;
@@ -542,33 +682,58 @@ public class RepoEngine {
         }
     }
 
-    /** What one offer (a page of a scan) carried, to settle on its confirm. */
+    /** What one offer (a page) carried, to whom: settled by that subscriber's confirm. */
     static final class Offer {
+        final String subscriber;
         final Map<String, FileObject> files;
         final List<DeleteObject> deletes;
-        // a page of a full offer: its files were confirmed already; one that fails is offered again the usual way
-        final boolean full;
 
-        Offer(Map<String, FileObject> files, List<DeleteObject> deletes) {
-            this(files, deletes, false);
-        }
-
-        Offer(Map<String, FileObject> files, List<DeleteObject> deletes, boolean full) {
+        Offer(String subscriber, Map<String, FileObject> files, List<DeleteObject> deletes) {
+            this.subscriber = subscriber;
             this.files = files;
             this.deletes = deletes;
-            this.full = full;
         }
-    }
-
-    //build and sync (the scan's files to offer; deletes are recorded and kept in the catalog)
-    Map<String,FileObject> getFileRepoDiff() {
-        return scan().files;
     }
 
     /**
-     * Scan the scan dir against the catalog: new and changed files are hashed and cataloged in batches (FR-D8), files
-     * that are gone become tombstones (FR-D4), unless the mass-delete guard holds them, and unconfirmed rows and
-     * tombstones are offered again once their last offer has expired.
+     * Scan, then what a subscriber would be offered that no subscriber has confirmed yet (tests and diagnostics): the
+     * new and changed files, and every unconfirmed row that can be offered.
+     */
+    Map<String,FileObject> getFileRepoDiff() {
+        Map<String, FileObject> out = new LinkedHashMap<>(scan().files);
+        Path root = Paths.get(scanDirString).toAbsolutePath();
+        boolean recursive = plugin.getConfig().getBooleanParam("scan_recursive", true);
+        for (Map<String, String> row : dbEngine.getFilesNotInSync()) {
+            String path = row.get("filepath");
+            if (out.containsKey(path) || offerable(root, path) != null) continue;
+            try {
+                out.put(path, new FileObject(nameUnder(root, Paths.get(path), recursive), row.get("md5"), path,
+                        Long.parseLong(row.get("lastmodified")), Long.parseLong(row.get("filesize"))));
+            } catch (Exception ignore) { }
+        }
+        return out;
+    }
+
+    private static String nameUnder(Path root, Path p, boolean recursive) {
+        return recursive ? root.relativize(p.toAbsolutePath()).toString() : p.getFileName().toString();
+    }
+
+    /**
+     * Why the cataloged file {@code path} cannot be offered now, or null: outside the scan dir ("outside"), gone, or in
+     * a live-tier root ("live").
+     */
+    private String offerable(Path root, String path) {
+        Path p = Paths.get(path);
+        if (!p.toAbsolutePath().startsWith(root)) return "outside";
+        // a row cataloged before a live-tier root was known is never offered from it
+        if (liveRootConflict(p) != null) return "live";
+        if (!Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) return "gone";
+        return null;
+    }
+
+    /**
+     * Scan the scan dir against the catalog: new and changed files are hashed and cataloged in batches (FR-D8) and become
+     * pending for every subscriber; files that are gone become tombstones (FR-D4) as the mass-delete guard allows.
      */
     ScanResult scan() {
 
@@ -585,14 +750,14 @@ public class RepoEngine {
                 catalog.put(row.get("filepath"), new String[]{row.get("md5"), row.get("lastmodified"), row.get("filesize")});
             }
 
-            List<Path> found = new ArrayList<>();
-            boolean complete = walk(root, scanRecursive, found);
+            Walk walk = walk(root, scanRecursive);
 
             Set<String> seen = new HashSet<>();
             List<DBEngine.Row> adds = new ArrayList<>();
             List<DBEngine.Row> updates = new ArrayList<>();
-            for (Path p : found) {
-                String filePath = p.toFile().getAbsolutePath();
+            List<String> changed = new ArrayList<>();
+            for (Path p : walk.files) {
+                String filePath = p.toString();
                 seen.add(filePath);
                 long lastModified;
                 long filesize;
@@ -621,19 +786,17 @@ public class RepoEngine {
                     logger.warn("skipping a file that " + conflict);
                     continue;
                 }
-                String MD5hash = plugin.getMD5(filePath);
-                // Skip files we can't safely catalog: a null md5 means the file vanished mid-scan (getMD5 failed); a
-                // path longer than the catalog column would fail the insert. Skipping keeps one bad file from wedging
-                // the scan.
+                String MD5hash = Hashes.content(p);
+                // Skip files we can't safely catalog: a null hash means the file vanished mid-scan; a path longer than
+                // the catalog column would fail the insert. Skipping keeps one bad file from wedging the scan.
                 if (MD5hash == null || filePath.length() > 1000) {
-                    logger.warn("skipping uncatalogable file (null md5 or path>1000): " + filePath);
+                    logger.warn("skipping uncatalogable file (unreadable or path>1000): " + filePath);
                     continue;
                 }
-                // In recursive mode use the path RELATIVE to scan_dir so nested directory structure is preserved on the
-                // consumer (the consumer creates parent dirs); getName() alone would flatten and collide.
-                String fileName = scanRecursive ? root.relativize(p.toAbsolutePath()).toString() : p.getFileName().toString();
+                String fileName = nameUnder(root, p, scanRecursive);
                 fileDiffMap.put(filePath, new FileObject(fileName, MD5hash, filePath, lastModified, filesize));
                 (add ? adds : updates).add(new DBEngine.Row(filePath, MD5hash, lastModified, filesize));
+                changed.add(filePath);
                 if (adds.size() + updates.size() >= scanBatchSize) {
                     dbEngine.applyScan(adds, updates, scanBatchSize);
                     adds.clear();
@@ -642,46 +805,17 @@ public class RepoEngine {
                 transferId++;
             }
             dbEngine.applyScan(adds, updates, scanBatchSize);
+            // what changed is pending for every subscriber (and no longer a pending delete)
+            dbEngine.markChanged(changed, scanBatchSize);
 
             // the delete phase: catalog rows under the scan dir whose file is gone
-            if (complete) {
-                recordDeletes(root, scanRecursive, catalog, seen);
+            if (walk.complete) {
+                deletes.addAll(recordDeletes(root, scanRecursive, catalog, seen, walk));
             } else {
                 logger.warn("scan of " + root + " was incomplete: no file is taken for deleted this cycle");
             }
-
-            long now = System.currentTimeMillis();
-            // Re-offer catalog rows no subscriber has confirmed (insync=0): the FS-vs-DB diff above only sees NEW or
-            // MODIFIED files, so a failed download would otherwise become a permanent silent gap. A row offered less
-            // than sync_offer_timeout_ms ago is still being fetched and is not offered again.
-            for (Map<String,String> row : dbEngine.getFilesNotInSync()) {
-                String filePath = row.get("filepath");
-                if (fileDiffMap.containsKey(filePath) || inFlight(filePath, now)) {
-                    continue;
-                }
-                Path unsynced = Paths.get(filePath);
-                if (!unsynced.toAbsolutePath().startsWith(root) || !Files.isRegularFile(unsynced)) {
-                    continue;
-                }
-                // a row cataloged before a live-tier root was known is never offered from it
-                if (liveRootConflict(unsynced) != null) {
-                    continue;
-                }
-                String reofferName = scanRecursive ? root.relativize(unsynced.toAbsolutePath()).toString()
-                        : unsynced.getFileName().toString();
-                try {
-                    fileDiffMap.put(filePath, new FileObject(reofferName, row.get("md5"), filePath,
-                            Long.parseLong(row.get("lastmodified")), Long.parseLong(row.get("filesize"))));
-                } catch (Exception rex) {
-                    logger.error("re-offer skipped for malformed catalog row: " + filePath, rex);
-                }
-            }
-            for (DBEngine.Tombstone t : dbEngine.getTombstonesNotInSync(deletePageSize * 16)) {
-                if (inFlight("del:" + t.filepath, now)) continue;
-                deletes.add(new DeleteObject(t.filename, t.md5, t.filepath, t.deletedAt));
-            }
             if (tombstoneTtlMs > 0) {
-                int purged = dbEngine.purgeTombstones(now - tombstoneTtlMs);
+                int purged = dbEngine.purgeTombstones(System.currentTimeMillis() - tombstoneTtlMs);
                 if (purged > 0) logger.debug("purged " + purged + " confirmed tombstone(s)");
             }
 
@@ -691,222 +825,139 @@ public class RepoEngine {
         return new ScanResult(fileDiffMap, deletes);
     }
 
-    private boolean inFlight(String key, long now) {
-        Long at = offeredAt.get(key);
-        if (at == null) return false;
-        if (now - at < offerTimeoutMs) return true;
-        offeredAt.remove(key, at);
-        return false;
-    }
-
     /**
-     * Turn the catalog rows whose file is gone into tombstones, unless the mass-delete guard holds them: a scan dir that
-     * is suddenly empty (an unmounted volume, a removed directory) or loses more than sync_delete_guard_fraction of the
-     * catalog (and at least sync_delete_guard_min files) must not empty every subscriber. Held deletes are reported
-     * (repostate, getmetrics, health) until an admin releases them (releasedeletes) or the files come back.
+     * Turn the catalog rows whose file is gone into tombstones (pending deletes for every subscriber), as the
+     * mass-delete guard allows: what it holds stays cataloged and is offered to nobody until an admin releases exactly
+     * that set, or the files come back. Remembers the tree's mount points, so a vanished one is told apart.
      */
-    private void recordDeletes(Path root, boolean recursive, Map<String, String[]> catalog, Set<String> seen) {
-        List<DBEngine.Tombstone> gone = new ArrayList<>();
+    private List<DeleteObject> recordDeletes(Path root, boolean recursive, Map<String, String[]> catalog, Set<String> seen,
+                                             Walk walk) {
         long now = System.currentTimeMillis();
+        List<DBEngine.Tombstone> gone = new ArrayList<>();
+        List<String> underRoot = new ArrayList<>();
         for (Map.Entry<String, String[]> e : catalog.entrySet()) {
             String path = e.getKey();
-            if (seen.contains(path)) continue;
             Path p = Paths.get(path);
             // a stale row from elsewhere (an earlier scan_dir) is not this scanner's to delete
             if (!p.toAbsolutePath().startsWith(root)) continue;
+            underRoot.add(path);
+            if (seen.contains(path)) continue;
             // still there: a subdirectory file in a non-recursive scan, a link, an unreadable file
             if (Files.exists(p, LinkOption.NOFOLLOW_LINKS)) continue;
-            String name = recursive ? root.relativize(p.toAbsolutePath()).toString() : p.getFileName().toString();
-            gone.add(new DBEngine.Tombstone(path, name, e.getValue()[0], now));
+            gone.add(new DBEngine.Tombstone(path, nameUnder(root, p, recursive), e.getValue()[0], now));
         }
-        if (gone.isEmpty()) {
-            if (deletesHeld != 0) logger.info("the held deletes are gone (the files came back)");
-            deletesHeld = 0;
-            releaseUpTo = 0;
-            return;
+
+        // mount points: remembered ones that are no longer mount points (or gone) vanished; the scan dir itself too
+        Map<String, String> remembered = readMounts();
+        List<String> vanished = new ArrayList<>();
+        for (String m : remembered.keySet()) {
+            if (!walk.mounts.containsKey(m)) vanished.add(m);
         }
-        boolean mass = seen.isEmpty()
-                || (gone.size() >= deleteGuardMin && gone.size() > deleteGuardFraction * catalog.size());
-        if (mass) {
-            int released = releaseUpTo;
-            if (released > 0 && gone.size() <= released) {
-                logger.warn("releasing " + gone.size() + " held delete(s), as an admin asked");
-                releaseUpTo = 0;
-            } else {
-                if (deletesHeld != gone.size()) {
-                    logger.error("mass-delete guard: " + gone.size() + " of " + catalog.size() + " cataloged file(s) are"
-                            + " gone from " + root + (seen.isEmpty() ? " (the scan dir is empty)" : "")
-                            + "; the deletes are held, not offered to subscribers. If this is intended, an admin"
-                            + " releases them with releasedeletes");
+        String rootDevBefore = null;
+        try { rootDevBefore = dbEngine.getMeta(META_ROOT_DEV); } catch (Exception ignore) { }
+        String rootDevNow = walk.rootDev == null ? null : String.valueOf(walk.rootDev);
+        if (rootDevBefore != null && rootDevNow != null && !rootDevBefore.equals(rootDevNow)) vanished.add(root.toString());
+
+        DeleteGuard.Decision d = guard.evaluate(root, underRoot, gone, seen.size(), vanished, now);
+        if (d.released) logger.warn("releasing " + d.held.size() + " held delete(s) recorded now, as an admin asked");
+        if (!d.held.isEmpty()) {
+            if (!d.holdId.equals(lastHoldLogged)) {
+                logger.error("mass-delete guard: " + d.held.size() + " delete(s) held, not offered to subscribers ("
+                        + d.why + "); hold " + d.holdId + ". If intended, an admin releases them with releasedeletes");
+                lastHoldLogged = d.holdId;
+            }
+        } else {
+            lastHoldLogged = null;
+        }
+
+        // remember the mount points seen now, and the vanished ones while deletes under them are held
+        Map<String, String> keep = new TreeMap<>();
+        for (Map.Entry<String, Object> e : walk.mounts.entrySet()) keep.put(e.getKey(), String.valueOf(e.getValue()));
+        for (String m : vanished) {
+            if (m.equals(root.toString())) continue;
+            boolean holding = false;
+            for (DBEngine.Tombstone t : d.held) if (Paths.get(t.filepath).startsWith(Paths.get(m))) holding = true;
+            if (holding) keep.put(m, remembered.get(m));
+        }
+        writeMounts(keep);
+        boolean rootHeld = vanished.contains(root.toString()) && !d.held.isEmpty();
+        if (rootDevNow != null && !rootHeld) {
+            try { dbEngine.setMeta(META_ROOT_DEV, rootDevNow); } catch (Exception ex) { logger.error("root device not recorded: " + ex.getMessage()); }
+        }
+
+        List<DeleteObject> recorded = new ArrayList<>();
+        if (!d.record.isEmpty()) {
+            int n = dbEngine.tombstone(d.record, scanBatchSize);
+            List<String> paths = new ArrayList<>();
+            for (DBEngine.Tombstone t : d.record) {
+                paths.add(t.filepath);
+                recorded.add(new DeleteObject(t.filename, t.md5, t.filepath, t.deletedAt));
+            }
+            dbEngine.markDeleted(paths, scanBatchSize);
+            tombstonesRecorded.addAndGet(n);
+            if (n > 0) logger.info("recorded " + n + " deleted file(s) to offer to subscribers");
+        }
+        return recorded;
+    }
+
+    private Map<String, String> readMounts() {
+        Map<String, String> out = new HashMap<>();
+        try {
+            String v = dbEngine.getMeta(META_MOUNTS);
+            if (v != null) {
+                for (String line : v.split("\n")) {
+                    int tab = line.lastIndexOf('\t');
+                    if (tab > 0) out.put(line.substring(0, tab), line.substring(tab + 1));
                 }
-                deletesHeld = gone.size();
+            }
+        } catch (Exception ex) {
+            logger.error("remembered mount points unreadable: " + ex.getMessage());
+        }
+        return out;
+    }
+
+    private void writeMounts(Map<String, String> mounts) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String, String> e : mounts.entrySet()) {
+                if (sb.length() > 0) sb.append('\n');
+                sb.append(e.getKey()).append('\t').append(e.getValue());
+            }
+            if (sb.length() > 32000) {
+                logger.warn("too many mount points under the scan dir to remember; the guard falls back to subtrees and fractions");
                 return;
             }
+            if (mounts.isEmpty()) dbEngine.deleteMeta(META_MOUNTS);
+            else dbEngine.setMeta(META_MOUNTS, sb.toString());
+        } catch (Exception ex) {
+            logger.error("mount points not recorded: " + ex.getMessage());
         }
-        deletesHeld = 0;
-        int n = dbEngine.tombstone(gone, scanBatchSize);
-        tombstonesRecorded.addAndGet(n);
-        if (n > 0) logger.info("recorded " + n + " deleted file(s) to offer to subscribers");
     }
 
     /** How many deletes the mass-delete guard is holding. */
     int getDeletesHeld() {
-        return deletesHeld;
+        return guard.heldCount();
+    }
+
+    /** The id of the held set (what releasedeletes names), or null. */
+    String getHoldId() {
+        return guard.holdId();
     }
 
     /**
-     * Let the next scan record up to the deletes now held (an admin's releasedeletes). Returns how many were released,
-     * 0 when nothing is held.
+     * Release the deletes now held (an admin's releasedeletes), once: the next scan records them if, and only if, it
+     * finds exactly that set held. Returns how many were released, 0 when nothing is held, -1 when {@code holdId} names
+     * another set.
      */
+    int releaseHeldDeletes(String holdId) {
+        return guard.release(holdId, System.currentTimeMillis());
+    }
+
     int releaseHeldDeletes() {
-        int held = deletesHeld;
-        if (held > 0) releaseUpTo = held;
-        return held;
+        return releaseHeldDeletes(null);
     }
 
-    private void syncRegionFiles(ScanResult result) {
-        try {
-            List<Map<String,String>> currentSubscriberList;
-            synchronized (lockSubscriberMap) {
-                currentSubscriberList = new ArrayList<>(subscriberMap.values());
-            }
-            if (currentSubscriberList.isEmpty()) return;
-
-            // FR-D5/scale: one message per page, never the whole catalog in one control-plane message
-            List<FileObject> files = new ArrayList<>(result.files.values());
-            List<DeleteObject> deletes = result.deletes;
-            int pages = Math.max((files.size() + diffPageSize - 1) / diffPageSize,
-                    (deletes.size() + deletePageSize - 1) / deletePageSize);
-            long now = System.currentTimeMillis();
-            for (int page = 0; page < pages; page++) {
-                Map<String, FileObject> pageFiles = new LinkedHashMap<>();
-                for (FileObject f : files.subList(Math.min(files.size(), page * diffPageSize),
-                        Math.min(files.size(), (page + 1) * diffPageSize))) {
-                    pageFiles.put(f.filePath, f);
-                }
-                List<DeleteObject> pageDeletes = new ArrayList<>(deletes.subList(Math.min(deletes.size(), page * deletePageSize),
-                        Math.min(deletes.size(), (page + 1) * deletePageSize)));
-                String tid = String.valueOf(transferSeq.incrementAndGet());
-                //remember what this transfer offered; insync flips only on subscriber confirm
-                pendingTransferMap.put(tid, new Offer(pageFiles, pageDeletes));
-                for (String p : pageFiles.keySet()) offeredAt.put(p, now);
-                for (DeleteObject d : pageDeletes) offeredAt.put("del:" + d.filePath, now);
-
-                // the page is identical for every subscriber: serialize it once, not once per peer
-                String filesJson = gson.toJson(pageFiles);
-                String deletesJson = pageDeletes.isEmpty() ? null : gson.toJson(pageDeletes);
-
-                for (Map<String, String> sub : currentSubscriberList) {
-                    //This is another filerepo in my region, I need to send it data
-                    String region = sub.get("sub_region_id");
-                    String agent = sub.get("sub_agent_id");
-                    String pluginID = sub.get("sub_plugin_id");
-
-                    MsgEvent fileRepoRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginID);
-                    fileRepoRequest.setParam("action", "repolistin");
-                    fileRepoRequest.setCompressedParam("repolistin", filesJson);
-                    if (deletesJson != null) fileRepoRequest.setCompressedParam("repodeletes", deletesJson);
-                    fileRepoRequest.setParam("transfer_id", tid);
-
-                    MsgEvent fileRepoResponse = plugin.sendRPC(fileRepoRequest, syncRpcTimeoutMs);
-                    if (fileRepoResponse != null) {
-                        String code = fileRepoResponse.getParam("status_code");
-                        if ("10".equals(code)) {
-                            // do NOT mark insync here: status 10 only means the peer accepted the list; rows flip to
-                            // insync=1 in confirmTransfer() after the peer reports verified downloads
-                            logger.info("Offered " + pageFiles.size() + " file(s) and " + pageDeletes.size()
-                                    + " delete(s) to " + pluginID + " (transfer " + tid + ")");
-                        } else {
-                            logger.warn("Region: " + region + " Agent: " + agent + " pluginId:" + pluginID
-                                    + " did not take transfer " + tid + ": status_code " + code + " "
-                                    + fileRepoResponse.getParam("status_desc"));
-                            // busy or refused: offered again next cycle
-                            for (String p : pageFiles.keySet()) offeredAt.remove(p);
-                            for (DeleteObject d : pageDeletes) offeredAt.remove("del:" + d.filePath);
-                        }
-                    } else {
-                        logger.error("Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " failed to respond!");
-                        logger.error("Removing Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID);
-                        removeSubscribe(sub);
-                        // offered again next cycle to whoever subscribes
-                        for (String p : pageFiles.keySet()) offeredAt.remove(p);
-                        for (DeleteObject d : pageDeletes) offeredAt.remove("del:" + d.filePath);
-                    }
-                }
-            }
-
-            for (Map<String, String> sub : currentSubscriberList) {
-                FullOffer full = fullOffers.get(generateSubKey(sub));
-                if (full != null && !full.done) continueFullOffer(sub, full);
-            }
-
-        } catch (Exception ex) {
-            logger.error("filerepo error", ex);
-        }
-    }
-
-    /**
-     * Send one subscriber the files other subscribers already confirmed, a page at a time, at most
-     * sync_full_pages_per_cycle pages a cycle. A page it does not take is sent again next cycle.
-     */
-    private void continueFullOffer(Map<String, String> sub, FullOffer full) {
-        String region = sub.get("sub_region_id");
-        String agent = sub.get("sub_agent_id");
-        String pluginID = sub.get("sub_plugin_id");
-        Path root = Paths.get(scanDirString).toAbsolutePath();
-        boolean recursive = plugin.getConfig().getBooleanParam("scan_recursive", true);
-        for (int sent = 0; sent < fullPagesPerCycle && !full.done; sent++) {
-            List<Map<String, String>> rows = dbEngine.getSyncedRows(diffPageSize, full.offset);
-            if (rows.isEmpty()) {
-                full.done = true;
-                logger.info("full offer to " + pluginID + " (generation " + full.gen + ") complete");
-                return;
-            }
-            Map<String, FileObject> page = new LinkedHashMap<>();
-            for (Map<String, String> row : rows) {
-                Path p = Paths.get(row.get("filepath"));
-                if (!p.toAbsolutePath().startsWith(root) || !Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)
-                        || liveRootConflict(p) != null) continue;
-                try {
-                    String name = recursive ? root.relativize(p.toAbsolutePath()).toString() : p.getFileName().toString();
-                    page.put(row.get("filepath"), new FileObject(name, row.get("md5"), row.get("filepath"),
-                            Long.parseLong(row.get("lastmodified")), Long.parseLong(row.get("filesize"))));
-                } catch (Exception bad) {
-                    logger.error("full offer: malformed catalog row " + row.get("filepath"));
-                }
-            }
-            if (!page.isEmpty()) {
-                String tid = String.valueOf(transferSeq.incrementAndGet());
-                pendingTransferMap.put(tid, new Offer(page, Collections.emptyList(), true));
-                MsgEvent req = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginID);
-                req.setParam("action", "repolistin");
-                req.setCompressedParam("repolistin", gson.toJson(page));
-                req.setParam("transfer_id", tid);
-                MsgEvent reply = plugin.sendRPC(req, syncRpcTimeoutMs);
-                if (reply == null) {
-                    logger.error("full offer: " + pluginID + " failed to respond; removing it");
-                    removeSubscribe(sub);
-                    return;
-                }
-                if (!"10".equals(reply.getParam("status_code"))) {
-                    logger.debug("full offer: " + pluginID + " did not take a page (" + reply.getParam("status_code")
-                            + "); again next cycle");
-                    return;
-                }
-                logger.info("Offered " + page.size() + " confirmed file(s) to " + pluginID + " (full offer, transfer " + tid + ")");
-            }
-            full.offset += rows.size();
-            if (rows.size() < diffPageSize) {
-                full.done = true;
-                logger.info("full offer to " + pluginID + " (generation " + full.gen + ") complete");
-            }
-        }
-    }
-
-    /** This repository's sync generation, as its subscribe advertises it (tests). */
-    String getSyncGen() {
-        return syncGen;
-    }
+    // =========================================================================== producer: offers
 
     private static String peerKey(String region, String agent, String pluginId) {
         return region + "_" + agent + "_" + pluginId;
@@ -914,9 +965,217 @@ public class RepoEngine {
 
     /** True when {@code region/agent/pluginId} has subscribed to this repository. */
     boolean isSubscriber(String region, String agent, String pluginId) {
-        synchronized (lockSubscriberMap) {
-            return subscriberMap.containsKey(peerKey(region, agent, pluginId));
+        return subscribers.containsKey(peerKey(region, agent, pluginId));
+    }
+
+    private boolean inFlight(String key, long now) {
+        Long at = inFlight.get(key);
+        if (at == null) return false;
+        if (now - at < offerTimeoutMs) return true;
+        inFlight.remove(key, at);
+        return false;
+    }
+
+    /**
+     * Offer every reachable subscriber this cycle's changes and deletes, in full, then what else it still needs (a
+     * subscriber that is new, cleared or that failed a file), paced.
+     */
+    private void offerAll(ScanResult result) {
+        for (ActiveSub s : new ArrayList<>(subscribers.values())) {
+            if (!s.reachable) continue;
+            try {
+                if (offerFresh(s, result)) offerTo(s);
+            } catch (Exception ex) {
+                logger.error("offer to " + s.key + " failed", ex);
+            }
         }
+    }
+
+    /** This cycle's changes and deletes, every page, to one subscriber. False when it stopped taking pages. */
+    private boolean offerFresh(ActiveSub s, ScanResult result) {
+        if (result.files.isEmpty() && result.deletes.isEmpty()) return true;
+        long now = System.currentTimeMillis();
+        List<FileObject> files = new ArrayList<>();
+        for (FileObject f : result.files.values()) if (!inFlight(s.key + "|" + f.filePath, now)) files.add(f);
+        List<DeleteObject> dels = new ArrayList<>();
+        for (DeleteObject d : result.deletes) if (!inFlight(s.key + "|del|" + d.filePath, now)) dels.add(d);
+        int pages = Math.max((files.size() + diffPageSize - 1) / diffPageSize, (dels.size() + deletePageSize - 1) / deletePageSize);
+        for (int page = 0; page < pages; page++) {
+            Map<String, FileObject> pageFiles = new LinkedHashMap<>();
+            for (FileObject f : files.subList(Math.min(files.size(), page * diffPageSize), Math.min(files.size(), (page + 1) * diffPageSize))) {
+                pageFiles.put(f.filePath, f);
+            }
+            List<DeleteObject> pageDeletes = new ArrayList<>(dels.subList(Math.min(dels.size(), page * deletePageSize),
+                    Math.min(dels.size(), (page + 1) * deletePageSize)));
+            if (!sendPage(s, pageFiles, pageDeletes)) return false;
+        }
+        return true;
+    }
+
+    /** Send one page to one subscriber, bound to it and to this instance. False when it was not taken. */
+    private boolean sendPage(ActiveSub s, Map<String, FileObject> pageFiles, List<DeleteObject> pageDeletes) {
+        long now = System.currentTimeMillis();
+        String tid = epoch + "." + transferSeq.incrementAndGet();
+        pendingTransferMap.put(tid, new Offer(s.key, pageFiles, pageDeletes));
+        MsgEvent req = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, s.region, s.agent, s.plugin);
+        req.setParam("action", "repolistin");
+        req.setCompressedParam("repolistin", gson.toJson(pageFiles));
+        if (!pageDeletes.isEmpty()) req.setCompressedParam("repodeletes", gson.toJson(pageDeletes));
+        req.setParam("transfer_id", tid);
+        req.setParam("sync_proto", SYNC_PROTO);
+        MsgEvent reply = plugin.sendRPC(req, syncRpcTimeoutMs);
+        if (reply == null) {
+            logger.warn("subscriber " + s.key + " did not answer transfer " + tid + "; skipped until it subscribes again");
+            s.reachable = false;
+            pendingTransferMap.remove(tid);
+            return false;
+        }
+        String code = reply.getParam("status_code");
+        if (!"10".equals(code)) {
+            logger.warn("subscriber " + s.key + " did not take transfer " + tid + ": status_code " + code + " "
+                    + reply.getParam("status_desc"));
+            pendingTransferMap.remove(tid);
+            return false;
+        }
+        for (String p : pageFiles.keySet()) inFlight.put(s.key + "|" + p, now);
+        for (DeleteObject d : pageDeletes) inFlight.put(s.key + "|del|" + d.filePath, now);
+        logger.info("Offered " + pageFiles.size() + " file(s) and " + pageDeletes.size() + " delete(s) to "
+                + s.plugin + " (transfer " + tid + ")");
+        return true;
+    }
+
+    /**
+     * Offer one subscriber what it still needs (its pending files and deletes), in pages of sync_diff_page files and
+     * sync_delete_page deletes, at most sync_pages_per_cycle pages a cycle. Pages are read by a key cursor over what is
+     * pending, so nothing slides past while the catalog changes; what is in flight is skipped until it is confirmed,
+     * failed or times out.
+     */
+    private void offerTo(ActiveSub s) {
+        Path root = Paths.get(scanDirString).toAbsolutePath();
+        boolean recursive = plugin.getConfig().getBooleanParam("scan_recursive", true);
+        String fileCursor = "", delCursor = "";
+        boolean filesDone = false, delsDone = false;
+        for (int pages = 0; pages < pagesPerCycle && !(filesDone && delsDone); ) {
+            long now = System.currentTimeMillis();
+            Map<String, FileObject> pageFiles = new LinkedHashMap<>();
+            while (!filesDone && pageFiles.size() < diffPageSize) {
+                List<String[]> rows = dbEngine.pendingFiles(s.key, fileCursor, diffPageSize);
+                if (rows.isEmpty()) {
+                    filesDone = true;
+                    break;
+                }
+                for (String[] r : rows) {
+                    if (pageFiles.size() >= diffPageSize) break;   // the cursor stays before r: next page starts at it
+                    fileCursor = r[0];
+                    String path = r[1];
+                    if (inFlight(s.key + "|" + path, now)) continue;
+                    String why = offerable(root, path);
+                    if ("outside".equals(why) || "live".equals(why)) {
+                        dbEngine.dropPending(s.key, r[0]);
+                        continue;
+                    }
+                    if (why != null) continue;   // gone: its delete will follow
+                    try {
+                        pageFiles.put(path, new FileObject(nameUnder(root, Paths.get(path), recursive), r[2], path,
+                                Long.parseLong(r[3]), Long.parseLong(r[4])));
+                    } catch (Exception bad) {
+                        logger.error("malformed catalog row " + path);
+                    }
+                }
+                if (rows.size() < diffPageSize && fileCursor.equals(rows.get(rows.size() - 1)[0])) filesDone = true;
+            }
+            List<DeleteObject> pageDeletes = new ArrayList<>();
+            while (!delsDone && pageDeletes.size() < deletePageSize) {
+                List<String[]> rows = dbEngine.pendingDeletes(s.key, delCursor, deletePageSize);
+                if (rows.isEmpty()) {
+                    delsDone = true;
+                    break;
+                }
+                for (String[] r : rows) {
+                    if (pageDeletes.size() >= deletePageSize) break;
+                    delCursor = r[0];
+                    if (inFlight(s.key + "|del|" + r[1], now)) continue;
+                    pageDeletes.add(new DeleteObject(r[2], r[3], r[1], Long.parseLong(r[4])));
+                }
+                if (rows.size() < deletePageSize && delCursor.equals(rows.get(rows.size() - 1)[0])) delsDone = true;
+            }
+            if (pageFiles.isEmpty() && pageDeletes.isEmpty()) break;
+            if (!sendPage(s, pageFiles, pageDeletes)) return;
+            pages++;
+        }
+    }
+
+    /** Forget subscribers not heard from in sync_peer_ttl_ms, and what they had pending. */
+    private void pruneSubscribers() {
+        long now = System.currentTimeMillis();
+        for (ActiveSub s : new ArrayList<>(subscribers.values())) {
+            if (now - s.lastSeen > peerTtlMs) {
+                subscribers.remove(s.key);
+                dbEngine.deleteSubscriber(s.key);
+                inFlight.keySet().removeIf(k -> k.startsWith(s.key + "|"));
+                logger.info("subscriber " + s.key + " not heard from in " + peerTtlMs + " ms: forgotten");
+            }
+        }
+    }
+
+    /**
+     * reposubscribe (protocol 2): a subscriber, named by its stamped caller, asks to be served. Taken only by a
+     * producer of the same filerepo_name speaking the same protocol; a subscriber with a new sync generation (new, or
+     * cleared) is offered everything again. The answer (reposubscribed) goes to the verified caller, never to an
+     * address the message names.
+     */
+    void onSubscribe(MsgEvent m) {
+        String[] from = Callers.plugin(m, insecure);
+        if (from == null) {
+            logger.warn("reposubscribe ignored: no verified plugin caller");
+            return;
+        }
+        String key = peerKey(from[0], from[1], from[2]);
+        String name = m.getParam("filerepo_name");
+        String gen = m.getParam("sync_gen");
+        String proto = m.getParam("sync_proto");
+        String refusal = null;
+        if (!isProducer()) refusal = "not a producer";
+        else if (!fileRepoName.equals(name)) refusal = "a producer of another filerepo_name";
+        else if (!SYNC_PROTO.equals(proto)) refusal = "sync protocol " + proto + " is not " + SYNC_PROTO + ": upgrade the subscriber";
+        else if (gen == null || !gen.matches("[0-9a-f]{1,64}")) refusal = "no valid sync_gen";
+        else if (from[0].equals(plugin.getRegion()) && from[1].equals(plugin.getAgent()) && from[2].equals(plugin.getPluginID())) refusal = "itself";
+        long now = System.currentTimeMillis();
+        if (refusal == null) {
+            ActiveSub s = subscribers.get(key);
+            if (s == null) {
+                pruneSubscribers();
+                if (subscribers.size() >= syncMaxPeers) refusal = "full: " + subscribers.size() + " subscribers (sync_max_peers)";
+            }
+            if (refusal == null) {
+                if (s == null || !gen.equals(s.gen)) {
+                    // new to this producer, or cleared: everything is pending for it again
+                    if (!dbEngine.resetSubscriber(new DBEngine.Subscriber(key, from[0], from[1], from[2], gen, now), scanBatchSize)) {
+                        refusal = "the catalog could not record it";
+                    } else {
+                        inFlight.keySet().removeIf(k -> k.startsWith(key + "|"));
+                        subscribers.put(key, new ActiveSub(key, from[0], from[1], from[2], gen, now));
+                        logger.info("subscriber " + key + " (generation " + gen + "): everything is offered to it");
+                    }
+                } else {
+                    s.lastSeen = now;
+                    s.reachable = true;
+                    dbEngine.touchSubscriber(key, now);
+                }
+            }
+        }
+        MsgEvent reply = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, from[0], from[1], from[2]);
+        reply.setParam("action", "reposubscribed");
+        reply.setParam("filerepo_name", String.valueOf(fileRepoName));
+        reply.setParam("sync_proto", SYNC_PROTO);
+        reply.setParam("accepted", String.valueOf(refusal == null));
+        if (refusal != null) {
+            reply.setParam("refusal", refusal);
+            logger.info("reposubscribe from " + key + " refused: " + refusal);
+        } else {
+            reply.setParam("producer_epoch", epoch);
+        }
+        plugin.msgOut(reply);
     }
 
     //data transfer
@@ -925,54 +1184,47 @@ public class RepoEngine {
     }
 
     /**
-     * A subscriber's confirm: the files it now holds (all offered but {@code failedFiles}) flip to insync=1, where the
-     * catalog still holds the offered content, and so do the deletes it applied. Only a subscriber of this repository
-     * may confirm: any other caller could otherwise mark files synced that no subscriber holds.
+     * A subscriber's confirm: the files it now holds (all offered but {@code failedFiles}) are settled for it where the
+     * catalog still holds the offered version, and so are the deletes it applied. Only the subscriber the transfer was
+     * offered to settles it, and only a transfer of this producer instance (its epoch): a confirm from before a restart,
+     * or for another subscriber's transfer, settles nothing. What failed stays pending for that subscriber alone.
      */
     public void confirmTransfer(String incomingTransferId, String failedFilesJson, String failedDeletesJson,
                                 String region, String agent, String pluginId) {
         try {
-            String repoId = region + "-" + agent + "-" + pluginId;
-            if (!isSubscriber(region, agent, pluginId)) {
-                logger.warn("confirm of transfer " + incomingTransferId + " from " + repoId + " ignored: not a subscriber");
+            String key = peerKey(region, agent, pluginId);
+            Offer offered = incomingTransferId == null ? null : pendingTransferMap.get(incomingTransferId);
+            if (offered == null || !offered.subscriber.equals(key)) {
+                logger.debug("confirm of transfer " + incomingTransferId + " from " + key + " ignored: not its transfer"
+                        + " (another subscriber's, an earlier instance's, or expired)");
                 return;
             }
+            pendingTransferMap.remove(incomingTransferId);
+            Set<String> failedFiles = parseSet(failedFilesJson, key);
+            Set<String> failedDeletes = parseSet(failedDeletesJson, key);
 
-            Set<String> failedFiles = parseSet(failedFilesJson, repoId);
-            Set<String> failedDeletes = parseSet(failedDeletesJson, repoId);
-
-            Offer offered = incomingTransferId == null ? null : pendingTransferMap.get(incomingTransferId);
-            if (offered != null) {
-                List<DBEngine.Row> confirmed = new ArrayList<>();
-                for (FileObject fileObject : offered.files.values()) {
-                    offeredAt.remove(fileObject.filePath);
-                    if (!failedFiles.contains(fileObject.filePath)) {
-                        confirmed.add(new DBEngine.Row(fileObject.filePath, fileObject.MD5, fileObject.lastModified, fileObject.filesize));
-                    }
-                }
-                List<DBEngine.Tombstone> applied = new ArrayList<>();
-                for (DeleteObject d : offered.deletes) {
-                    offeredAt.remove("del:" + d.filePath);
-                    if (!failedDeletes.contains(d.filePath)) {
-                        applied.add(new DBEngine.Tombstone(d.filePath, d.fileName, d.MD5, d.deletedAt));
-                    }
-                }
-                int files = dbEngine.confirmFiles(confirmed);
-                int dels = dbEngine.confirmTombstones(applied);
-                if (offered.full && !failedFiles.isEmpty()) {
-                    // they were confirmed by another subscriber: offer them again the usual way, to everyone
-                    Set<String> again = new HashSet<>(failedFiles);
-                    again.retainAll(offered.files.keySet());
-                    dbEngine.markUnsynced(again);
-                }
-                logger.info("Transfer " + incomingTransferId + " confirmed by " + repoId + ": "
-                        + files + " in sync, " + failedFiles.size() + " failed, " + dels + " delete(s) applied, "
-                        + failedDeletes.size() + " delete(s) failed"
-                        + (failedFiles.isEmpty() && failedDeletes.isEmpty() ? "" : " (will re-offer)"));
-            } else {
-                logger.debug("confirmTransfer: unknown/expired transfer_id " + incomingTransferId + " from " + repoId);
+            List<DBEngine.Row> held = new ArrayList<>();
+            for (FileObject f : offered.files.values()) {
+                inFlight.remove(key + "|" + f.filePath);
+                if (!failedFiles.contains(f.filePath)) held.add(new DBEngine.Row(f.filePath, f.MD5, f.lastModified, f.filesize));
             }
-
+            List<DBEngine.Tombstone> applied = new ArrayList<>();
+            for (DeleteObject d : offered.deletes) {
+                inFlight.remove(key + "|del|" + d.filePath);
+                if (!failedDeletes.contains(d.filePath)) applied.add(new DBEngine.Tombstone(d.filePath, d.fileName, d.MD5, d.deletedAt));
+            }
+            int files = dbEngine.settleFiles(key, held);
+            dbEngine.confirmFiles(held);
+            int dels = dbEngine.settleDeletes(key, applied);
+            dbEngine.confirmTombstones(applied);
+            ActiveSub s = subscribers.get(key);
+            if (s != null) {
+                s.lastSeen = System.currentTimeMillis();
+                dbEngine.touchSubscriber(key, s.lastSeen);
+            }
+            logger.info("Transfer " + incomingTransferId + " confirmed by " + key + ": " + files + " held, "
+                    + failedFiles.size() + " failed, " + dels + " delete(s) applied, " + failedDeletes.size()
+                    + " delete(s) failed" + (failedFiles.isEmpty() && failedDeletes.isEmpty() ? "" : " (offered again)"));
         } catch (Exception ex) {
             logger.error("filerepo confirm error", ex);
         }
@@ -990,6 +1242,8 @@ public class RepoEngine {
         return out;
     }
 
+    // =========================================================================== subscriber
+
     /** One diff from a producer, waiting for its updater. */
     private static final class PendingDiff {
         final String transferId;
@@ -1003,7 +1257,7 @@ public class RepoEngine {
         }
     }
 
-    /** How a diff was taken: 10 queued, 9 refused (unknown producer), 11 busy (bounded queues full; offer again). */
+    /** How a diff was taken: 10 queued, 9 refused (not a verified producer), 11 busy (bounded queues full; offer again). */
     static final class Accepted {
         final String code;
         final String desc;
@@ -1014,36 +1268,109 @@ public class RepoEngine {
         }
     }
 
+    /** Remember a producer as verified (its answer to reposubscribe; tests). Bounded by sync_max_peers. */
+    void rememberProducer(String region, String agent, String pluginId) {
+        String key = peerKey(region, agent, pluginId);
+        long now = System.currentTimeMillis();
+        if (!knownProducers.containsKey(key) && knownProducers.size() >= syncMaxPeers) {
+            knownProducers.entrySet().removeIf(e -> now - e.getValue() > peerTtlMs);
+            if (knownProducers.size() >= syncMaxPeers) {
+                logger.warn("not taking producer " + key + ": already " + knownProducers.size() + " producers (sync_max_peers)");
+                return;
+            }
+        }
+        knownProducers.put(key, now);
+    }
+
+    boolean isKnownProducer(String region, String agent, String pluginId) {
+        Long at = knownProducers.get(peerKey(region, agent, pluginId));
+        return at != null && System.currentTimeMillis() - at <= peerTtlMs;
+    }
+
+    /** This repository's sync generation, as its subscribe advertises it (tests). */
+    String getSyncGen() {
+        return syncGen;
+    }
+
+    /**
+     * A producer's discover (dataplane, unverified): only an address to ask. A subscribe (reposubscribe, a MsgEvent)
+     * goes to it, rate limited per producer and overall; the producer is taken only when it answers, verified by its
+     * stamped caller, as a producer of this filerepo_name speaking this protocol. With sync_producers set, only those
+     * producers are asked.
+     */
+    private void onDiscover(Map<String, String> m) {
+        String region = m.get("repo_region_id"), agent = m.get("repo_agent_id"), pluginId = m.get("repo_plugin_id");
+        if (region == null || agent == null || pluginId == null) {
+            logger.error("discover without identification");
+            return;
+        }
+        if (region.equals(plugin.getRegion()) && agent.equals(plugin.getAgent()) && pluginId.equals(plugin.getPluginID())) return;
+        String key = peerKey(region, agent, pluginId);
+        if (!SYNC_PROTO.equals(m.get("sync_proto"))) {
+            Long warned = oldProtocolWarned.get(key);
+            if (warned == null || System.currentTimeMillis() - warned > 3_600_000L) {
+                oldProtocolWarned.put(key, System.currentTimeMillis());
+                logger.warn("producer " + key + " speaks sync protocol " + m.getOrDefault("sync_proto", "1") + ", not "
+                        + SYNC_PROTO + ": not syncing from it until it is upgraded");
+            }
+            return;
+        }
+        if (configuredProducers != null && !configuredProducers.contains(key)) return;
+        long now = System.currentTimeMillis();
+        synchronized (attempts) {
+            Long last = attempts.get(key);
+            if (last != null && now - last < subscribeRetryMs) return;
+            attemptTokens = Math.min(512, attemptTokens + (now - attemptRefilled) * 64.0 / 1000.0);
+            attemptRefilled = now;
+            if (attemptTokens < 1) return;
+            attemptTokens -= 1;
+            attempts.put(key, now);
+        }
+        MsgEvent sub = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginId);
+        sub.setParam("action", "reposubscribe");
+        sub.setParam("filerepo_name", fileRepoName);
+        sub.setParam("sync_gen", syncGen);
+        sub.setParam("sync_proto", SYNC_PROTO);
+        plugin.msgOut(sub);
+    }
+
+    /** reposubscribed: a producer's answer, from its stamped caller; taken only from a producer this repository asked. */
+    void onSubscribed(MsgEvent m) {
+        String[] from = Callers.plugin(m, insecure);
+        if (from == null) {
+            logger.warn("reposubscribed ignored: no verified plugin caller");
+            return;
+        }
+        String key = peerKey(from[0], from[1], from[2]);
+        if (!attempts.containsKey(key)) {
+            logger.warn("reposubscribed from " + key + " ignored: this repository did not ask it");
+            return;
+        }
+        if (configuredProducers != null && !configuredProducers.contains(key)) return;
+        if ("true".equals(m.getParam("accepted")) && fileRepoName != null && fileRepoName.equals(m.getParam("filerepo_name"))
+                && SYNC_PROTO.equals(m.getParam("sync_proto"))) {
+            rememberProducer(from[0], from[1], from[2]);
+        } else {
+            knownProducers.remove(key);
+            logger.info("producer " + key + " did not take this subscriber: " + m.getParam("refusal"));
+        }
+    }
+
     public void getFileRepoDiff(String repoDiffString, String transferId, String region, String agent, String pluginId) {
         acceptDiff(repoDiffString, null, transferId, region, agent, pluginId);
     }
 
-    /** Remember a producer this repository subscribed to (its discover broadcast). Bounded by sync_max_peers. */
-    void rememberProducer(String region, String agent, String pluginId) {
-        String key = peerKey(region, agent, pluginId);
-        if (knownProducers.contains(key)) return;
-        if (knownProducers.size() >= syncMaxPeers) {
-            logger.warn("not subscribing to " + key + ": already " + knownProducers.size() + " producers (sync_max_peers)");
-            return;
-        }
-        knownProducers.add(key);
-    }
-
-    boolean isKnownProducer(String region, String agent, String pluginId) {
-        return knownProducers.contains(peerKey(region, agent, pluginId));
-    }
-
     /**
-     * Take a producer's diff (FR-D5): only from a producer this repository subscribed to, at most
+     * Take a producer's diff (FR-D5): only from a verified producer this repository subscribed to, at most
      * sync_pending_per_peer waiting per producer and sync_max_peers producers at once, on a bounded pool. Anything over
      * a bound is refused as busy, and the producer offers it again next cycle.
      */
     Accepted acceptDiff(String filesJson, String deletesJson, String transferId, String region, String agent, String pluginId) {
         String repoId = peerKey(region, agent, pluginId);
-        if (!knownProducers.contains(repoId)) {
+        if (!isKnownProducer(region, agent, pluginId)) {
             syncRefused.incrementAndGet();
-            logger.warn("diff " + transferId + " from " + repoId + " refused: not a producer this repository subscribed to");
-            return new Accepted("9", "refused: not a producer this repository subscribed to");
+            logger.warn("diff " + transferId + " from " + repoId + " refused: not a verified producer this repository subscribed to");
+            return new Accepted("9", "refused: not a verified producer this repository subscribed to");
         }
         PendingDiff diff = new PendingDiff(transferId, filesJson, deletesJson);
         synchronized (lockPeerUpdateQueueMap) {
@@ -1120,6 +1447,49 @@ public class RepoEngine {
         }
     }
 
+    /** Where a name from a producer lands in this repository, and why it may not, if it may not. */
+    private static final class Target {
+        final Path path;
+        final String why;
+
+        Target(Path path, String why) {
+            this.path = path;
+            this.why = why;
+        }
+    }
+
+    /**
+     * The local path of {@code name} (a producer's relative name): contained in the repository directory, never a
+     * staging name, never in a live-tier root, and never a case-only collision (on a case-insensitive filesystem,
+     * "Model.bin" and "model.bin" are one file: a name whose existing file, or directory on the way, is spelled
+     * differently is refused rather than written or deleted).
+     */
+    private Target target(Path repoBase, Path realBase, String name) {
+        Path local = repoBase.resolve(name).normalize();
+        if (!local.startsWith(repoBase) || local.equals(repoBase)) return new Target(local, "escapes the repository directory");
+        for (Path part : repoBase.relativize(local)) {
+            if (isStaging(part.toString())) return new Target(local, "a staging name");
+        }
+        String conflict = liveRootConflict(local);
+        if (conflict != null) return new Target(local, "its destination " + conflict);
+        // the deepest part of the path that exists must be spelled, as it exists, exactly as asked
+        Path probe = local;
+        while (probe != null && !probe.equals(repoBase) && !Files.exists(probe, LinkOption.NOFOLLOW_LINKS)) probe = probe.getParent();
+        if (probe != null && !probe.equals(repoBase)) {
+            try {
+                Path real = probe.toRealPath(LinkOption.NOFOLLOW_LINKS);
+                Path expected = realBase.resolve(repoBase.relativize(probe));
+                if (!real.toString().equals(expected.toString())) {
+                    return new Target(local, "a case-only (or linked) name collision: it exists here as "
+                            + realBase.relativize(real));
+                }
+            } catch (IOException ex) {
+                return new Target(local, "unresolvable: " + ex.getMessage());
+            }
+        }
+        return new Target(local, null);
+    }
+
     private void applyDiff(PendingDiff pending, String repoId, String region, String agent, String pluginId) {
         Runnable hook = beforeApplyDiff;
         if (hook != null) hook.run();
@@ -1138,10 +1508,16 @@ public class RepoEngine {
         List<String> failedFiles = new ArrayList<>();
         List<String> failedDeletes = new ArrayList<>();
         Path repoBase = getRepoDir().toPath().toAbsolutePath().normalize();
+        Path realBase;
+        try {
+            realBase = repoBase.toRealPath();
+        } catch (IOException ex) {
+            realBase = repoBase;
+        }
 
         for (DeleteObject d : remoteDeletes) {
             if (d == null || d.filePath == null) continue;
-            if (!applyDelete(d, repoBase)) failedDeletes.add(d.filePath);
+            if (!applyDelete(d, repoId, repoBase, realBase)) failedDeletes.add(d.filePath);
         }
 
         SyncReceiver rx = null;
@@ -1159,31 +1535,53 @@ public class RepoEngine {
                     }
                     continue;
                 }
-
-                // CONTAINMENT: fileName comes from the peer's listing and may carry subdirs (recursive repos), but must
-                // never escape the repo dir via ".." or an absolute path (resolve() returns an absolute arg as-is)
-                Path localPath = repoBase.resolve(fileObject.fileName).normalize();
-                if (!localPath.startsWith(repoBase) || localPath.equals(repoBase)
-                        || isStaging(localPath.getFileName().toString())) {
-                    logger.error("rejecting peer file name escaping repo dir: [" + fileObject.fileName + "]");
+                String rel = fileObject.fileName;
+                Target t = target(repoBase, realBase, rel);
+                if (t.why != null) {
+                    logger.warn("not syncing [" + rel + "] from " + repoId + ": " + t.why);
+                    syncConflicts.incrementAndGet();
                     failedFiles.add(fileObject.filePath);
                     continue;
                 }
-                // nor may it lead, through a link, into a live-tier root
-                String conflict = liveRootConflict(localPath);
-                if (conflict != null) {
-                    logger.error("rejecting peer file: its destination " + conflict);
+                Path localPath = t.path;
+                // a file landed here directly (cataloged by this repository) is never overwritten by sync
+                if (dbEngine.getFileInfo(localPath.toFile().getAbsolutePath()) != null) {
+                    logger.warn("not syncing [" + rel + "] from " + repoId + ": a file landed here holds that name");
+                    syncConflicts.incrementAndGet();
                     failedFiles.add(fileObject.filePath);
                     continue;
                 }
-                //check that file exists
-                if (Files.isRegularFile(localPath, LinkOption.NOFOLLOW_LINKS)) {
-                    try {
-                        if (Files.size(localPath) == fileObject.filesize
-                                && fileObject.MD5.equals(plugin.getMD5(localPath.toString()))) {
-                            continue;   // already held, verified
+                Map<String, String> holders = dbEngine.mirroredBy(rel);
+                String mine = holders.remove(repoId);
+                if (Files.exists(localPath, LinkOption.NOFOLLOW_LINKS)) {
+                    String held = Files.isRegularFile(localPath, LinkOption.NOFOLLOW_LINKS) ? Hashes.content(localPath) : null;
+                    if (held != null && held.equals(fileObject.MD5)) {
+                        // already held, exactly: it is this producer's too
+                        dbEngine.recordMirrored(repoId, rel, fileObject.MD5);
+                        continue;
+                    }
+                    // other content: replaced only when it is this producer's own earlier version, held by no other
+                    boolean ours = held != null && held.equals(mine) && holders.isEmpty();
+                    if (!ours) {
+                        logger.warn("not syncing [" + rel + "] from " + repoId + ": the file here holds other content"
+                                + (holders.isEmpty() ? " (not this producer's)" : " (another producer's: " + holders.keySet() + ")"));
+                        syncConflicts.incrementAndGet();
+                        failedFiles.add(fileObject.filePath);
+                        continue;
+                    }
+                } else if (!holders.isEmpty()) {
+                    // another producer delivered this name and it is gone here: refetch it from this one is fine only
+                    // if they agree on the content
+                    for (String other : holders.values()) {
+                        if (!fileObject.MD5.equals(other)) {
+                            logger.warn("not syncing [" + rel + "] from " + repoId + ": another producer delivered other content under that name");
+                            syncConflicts.incrementAndGet();
+                            failedFiles.add(fileObject.filePath);
+                            localPath = null;
+                            break;
                         }
-                    } catch (IOException ignore) { }
+                    }
+                    if (localPath == null) continue;
                 }
 
                 // create parent dirs so nested (recursive) repo layouts sync, not just flat top-level files.
@@ -1202,6 +1600,7 @@ public class RepoEngine {
                 SyncReceiver.Result r = rx.fetch(fileObject.filePath, fileObject.filesize, fileObject.MD5, localPath);
                 if (r.ok) {
                     syncFetched.incrementAndGet();
+                    dbEngine.recordMirrored(repoId, rel, fileObject.MD5);
                     logger.debug("Synced " + localPath);
                 } else {
                     // one bad/slow file must not abort the batch: it is reported failed and offered again
@@ -1225,6 +1624,7 @@ public class RepoEngine {
         MsgEvent filesConfirm = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginId);
         filesConfirm.setParam("action", "repoconfirm");
         filesConfirm.setParam("transfer_id", pending.transferId);
+        filesConfirm.setParam("sync_proto", SYNC_PROTO);
         if (!failedFiles.isEmpty()) {
             filesConfirm.setCompressedParam("failedfiles", gson.toJson(failedFiles));
         }
@@ -1235,36 +1635,55 @@ public class RepoEngine {
     }
 
     /**
-     * Apply a producer's delete: remove the local copy only if it is exactly the content the producer deleted, never
-     * outside the repository directory or in a live-tier root. A copy that is absent, or holds other content (landed
-     * here, or newer), is left alone and counts as applied. False when the delete should be offered again.
+     * Apply a producer's delete: remove the local copy only if this producer delivered exactly that content under that
+     * name, no other producer still holds it here, it is not a file landed here, it is exactly the deleted content, and
+     * it is not a case-only collision; never outside the repository directory or in a live-tier root. Anything else is
+     * left alone and counts as applied (it is not that producer's to delete). False when the delete should be offered
+     * again.
      */
-    private boolean applyDelete(DeleteObject d, Path repoBase) {
+    private boolean applyDelete(DeleteObject d, String producer, Path repoBase, Path realBase) {
         if (d.fileName == null || d.MD5 == null) return false;
-        Path localPath = repoBase.resolve(d.fileName).normalize();
-        if (!localPath.startsWith(repoBase) || localPath.equals(repoBase)) {
-            logger.error("rejecting a delete escaping the repo dir: [" + d.fileName + "]");
-            return true;    // never applicable here: do not have it offered forever
-        }
-        String conflict = liveRootConflict(localPath);
-        if (conflict != null) {
-            logger.error("rejecting a delete: its target " + conflict);
+        Target t = target(repoBase, realBase, d.fileName);
+        if (t.why != null) {
+            logger.warn("not applying a delete of [" + d.fileName + "] from " + producer + ": " + t.why);
             return true;
         }
-        if (!Files.exists(localPath, LinkOption.NOFOLLOW_LINKS)) return true;
-        if (!Files.isRegularFile(localPath, LinkOption.NOFOLLOW_LINKS)) {
-            logger.warn("not deleting " + localPath + ": not a regular file");
+        Path localPath = t.path;
+        Map<String, String> holders = dbEngine.mirroredBy(d.fileName);
+        String mine = holders.remove(producer);
+        if (mine == null) {
+            // this producer never delivered that name here: not its to delete
             return true;
         }
-        String held = plugin.getMD5(localPath.toString());
+        if (!mine.equals(d.MD5)) {
+            // it delivered other content since: that is what it holds now
+            return true;
+        }
+        if (!holders.isEmpty()) {
+            // another producer still holds it here: only this producer's claim goes
+            dbEngine.forgetMirrored(producer, d.fileName);
+            return true;
+        }
+        if (!Files.exists(localPath, LinkOption.NOFOLLOW_LINKS)) {
+            dbEngine.forgetMirrored(producer, d.fileName);
+            return true;
+        }
+        if (!Files.isRegularFile(localPath, LinkOption.NOFOLLOW_LINKS)
+                || dbEngine.getFileInfo(localPath.toFile().getAbsolutePath()) != null) {
+            logger.warn("not deleting " + localPath + ": not a regular file, or landed here");
+            dbEngine.forgetMirrored(producer, d.fileName);
+            return true;
+        }
+        String held = Hashes.content(localPath);
         if (held == null) return false;
         if (!d.MD5.equals(held)) {
             logger.info("not deleting " + localPath + ": it holds other content than the producer deleted");
+            dbEngine.forgetMirrored(producer, d.fileName);
             return true;
         }
         try {
             Files.delete(localPath);
-            dbEngine.deleteFile(localPath.toFile().getAbsolutePath());
+            dbEngine.forgetMirrored(producer, d.fileName);
             syncDeleted.incrementAndGet();
             logger.debug("deleted " + localPath + " (deleted at the producer)");
             return true;
@@ -1320,6 +1739,14 @@ public class RepoEngine {
         return syncPool.getActiveCount();
     }
 
+    int getSubscriberCount() {
+        return subscribers.size();
+    }
+
+    int getKnownProducerCount() {
+        return knownProducers.size();
+    }
+
     /**
      * MIRROR or ONLY_COPY, from configuration and the catalog: a subscriber mirror is MIRROR until filerepo lands
      * files in it directly (putfiles, putjar), and every other repository is the origin of what it holds. Costs one
@@ -1331,7 +1758,10 @@ public class RepoEngine {
         facts.put("backing", "local");
         if (!subscriber) {
             facts.put("role", fileScanTimer != null ? "producer" : "on-demand");
-            if (deletesHeld > 0) facts.put("deletes_held", String.valueOf(deletesHeld));
+            if (getDeletesHeld() > 0) {
+                facts.put("deletes_held", String.valueOf(getDeletesHeld()));
+                facts.put("deletes_hold_id", String.valueOf(getHoldId()));
+            }
             return RepoState.of(RepoState.ONLY_COPY, facts,
                     "the origin of what it holds: no producer refills it");
         }
@@ -1427,8 +1857,10 @@ public class RepoEngine {
      * Wipe the repository: every cataloged file and every regular file under the repository directory (FR-D2). It must
      * be confirmed with the directory's exact name, is never done to a protected directory or one that is or holds a
      * live-tier root (force or not), and is refused for an only copy unless {@code force}. Correct for a mirror, whose
-     * producer holds the same files. The repository gate is taken exclusively BEFORE the only-copy check and held through
-     * the delete, and every landing takes its shared side, so no file filerepo lands can arrive between the two.
+     * producer holds the same files: a new sync generation is started before the first file goes, so whatever is
+     * deleted, even by a clear that fails partway, is offered again. The repository gate is taken exclusively BEFORE the
+     * only-copy check and held through the delete, and every landing takes its shared side, so no file filerepo lands
+     * can arrive between the two.
      */
     public Clear clearRepo(String confirm, boolean force) {
         if (!confirms(confirm)) {
@@ -1461,6 +1893,11 @@ public class RepoEngine {
                 return new Clear(Clear.ONLY_COPY, state, 0, state.desc);
             }
 
+            // decided: before anything else, a new generation, so a mirror is refilled whatever happens next (even a
+            // clear that fails partway), and the next discover subscribes again at once
+            syncGen = SyncReceiver.token();
+            attempts.clear();
+
             Runnable hook = afterClearCheck;
             if (hook != null) hook.run();
 
@@ -1482,31 +1919,39 @@ public class RepoEngine {
                     logger.warn("clearRepo: " + recorded + " not deleted: " + ex.getMessage());
                 }
             }
-            //delete any files not recorded in repo dir (close the walk stream); links are removed, never followed
-            long remaining = 0;
+            //delete any files not recorded in repo dir; links are removed, never followed; an unreadable directory is
+            //counted and skipped, never a reason to stop halfway
+            final long[] remaining = {0};
             if (dir.isDirectory()) {
-                try (java.util.stream.Stream<Path> walk = Files.walk(dir.toPath())) {
-                    for (Path p : (Iterable<Path>) walk::iterator) {
-                        if (Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(p)) {
+                Files.walkFileTree(dir.toPath(), new SimpleFileVisitor<Path>() {
+                    @Override
+                    public FileVisitResult visitFile(Path p, BasicFileAttributes attrs) {
+                        if (attrs.isRegularFile() || attrs.isSymbolicLink()) {
                             try {
                                 Files.delete(p);
                             } catch (IOException ex) {
-                                remaining++;
+                                remaining[0]++;
                             }
                         }
+                        return FileVisitResult.CONTINUE;
                     }
-                }
+
+                    @Override
+                    public FileVisitResult visitFileFailed(Path p, IOException exc) {
+                        remaining[0]++;
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
             }
-            // a cleared subscriber asks its producer for everything again
-            syncGen = SyncReceiver.token();
-            if (remaining == 0) {
+            dbEngine.clearMirrored();
+            if (remaining[0] == 0) {
                 // nothing landed is left: a mirror is a mirror again
                 clearLanded();
             } else {
-                logger.warn("clearRepo: " + remaining + " file(s) could not be deleted");
+                logger.warn("clearRepo: " + remaining[0] + " file(s) could not be deleted");
             }
-            return new Clear(Clear.CLEARED, state, remaining, remaining == 0 ? "cleared"
-                    : remaining + " file(s) could not be deleted");
+            return new Clear(Clear.CLEARED, state, remaining[0], remaining[0] == 0 ? "cleared"
+                    : remaining[0] + " file(s) could not be deleted");
 
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
@@ -1617,6 +2062,8 @@ public class RepoEngine {
                     : dbEngine.getFileInfo(target.toAbsolutePath().toString()) != null ? target.toAbsolutePath().toString() : null;
             Map<String, String> info = cataloged == null ? null : dbEngine.getFileInfo(cataloged);
             Files.delete(real);
+            // a mirror's record of what a producer delivered under that name goes with it
+            for (String producer : dbEngine.mirroredBy(fileName).keySet()) dbEngine.forgetMirrored(producer, fileName);
             if (cataloged != null) {
                 if (fileScanTimer != null && scanDirString != null && info != null) {
                     Path root = Paths.get(scanDirString).toAbsolutePath();
@@ -1624,6 +2071,7 @@ public class RepoEngine {
                     String name = p.startsWith(root) ? root.relativize(p).toString() : p.getFileName().toString();
                     tombstonesRecorded.addAndGet(dbEngine.tombstone(Collections.singletonList(
                             new DBEngine.Tombstone(cataloged, name, info.get("md5"), System.currentTimeMillis())), 1));
+                    dbEngine.markDeleted(Collections.singletonList(cataloged), 1);
                 } else {
                     dbEngine.deleteFile(cataloged);
                 }
@@ -1657,17 +2105,18 @@ public class RepoEngine {
 
     public Boolean putFiles(List<String> fileList, String repoName, boolean overwrite, boolean isLocal) {
         Map<String, String> hashes = new HashMap<>();
-        return putFiles(fileList, hashes, overwrite, isLocal, false).allStored();
+        return putFiles(fileList, hashes, overwrite, false).allStored();
     }
 
     /**
-     * Land pushed files (FR-D10). Each file is copied (local) or moved (remote) to a staging file beside its
-     * destination, its content hash checked against {@code expected} (required unless putfiles_require_hashes=false),
-     * then moved into place atomically: a partial or corrupt file is never visible under its name. A file that exists
-     * and is not to be overwritten is reported unchanged when it holds the expected content and skipped when it does
-     * not: never counted stored.
+     * Land pushed files (FR-D10). Each source is COPIED into the owner-only staging directory, its content hash checked
+     * against {@code expected} (required unless putfiles_require_hashes=false), and moved into place atomically, then
+     * checked once more in place: a partial, corrupt or swapped file is never left under its name. The source is never
+     * moved: it is deleted only after it landed, and only when it is a transfer file in the agent's dataplane journal
+     * (a fact checked here, never one the message states). A file that exists and is not to be overwritten is reported
+     * unchanged when it holds the expected content and skipped when it does not: never counted stored.
      */
-    Put putFiles(List<String> fileList, Map<String, String> expected, boolean overwrite, boolean isLocal, boolean requireHashes) {
+    Put putFiles(List<String> fileList, Map<String, String> expected, boolean overwrite, boolean requireHashes) {
         Put put = new Put();
         // the shared side of the repository gate: nothing lands between a clear's check and its delete
         if (!enterGate()) {
@@ -1676,6 +2125,7 @@ public class RepoEngine {
         }
         try {
             Path repo = getRepoDir().toPath().toAbsolutePath();
+            Path journal = journalDir();
             for (String incomingFileName : fileList) {
                 Path src = Paths.get(incomingFileName);
                 String name = src.getFileName() == null ? null : src.getFileName().toString();
@@ -1691,32 +2141,31 @@ public class RepoEngine {
                 logger.info("incoming file: " + src);
                 Path dest = repo.resolve(name);
                 if (Files.exists(dest, LinkOption.NOFOLLOW_LINKS) && !overwrite) {
-                    String held = Files.isRegularFile(dest, LinkOption.NOFOLLOW_LINKS) ? plugin.getMD5(dest.toString()) : null;
+                    String held = Files.isRegularFile(dest, LinkOption.NOFOLLOW_LINKS) ? Hashes.content(dest) : null;
                     if (want != null && want.equals(held)) put.unchanged.add(name);
                     else put.skipped.add(name);
                     continue;
                 }
-                // before the first byte lands: from here on, this repository holds files only it has
-                markLanded();
-                Path part = stagingFor(dest);
+                Path part = null;
                 try {
-                    //if local copy, if remote move temp to correct
-                    if (isLocal) {
-                        Files.copy(src, part);
-                    } else {
-                        try {
-                            Files.move(src, part);
-                        } catch (IOException crossDevice) {
-                            Files.copy(src, part);
-                            Files.deleteIfExists(src);
-                        }
-                    }
-                    String got = plugin.getMD5(part.toString());
+                    part = privateStaging().resolve(STAGING_PREFIX + UUID.randomUUID().toString().replace("-", "") + STAGING_SUFFIX);
+                    Files.copy(src, part);
+                    String got = Hashes.content(part);
                     if (got == null || (want != null && !want.equals(got))) {
                         put.failed.put(name, "content hash mismatch");
                         continue;
                     }
+                    // before the first byte lands: from here on, this repository holds files only it has
+                    markLanded();
                     Files.move(part, dest, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                    part = null;
+                    if (!got.equals(Hashes.content(dest))) {
+                        Files.deleteIfExists(dest);
+                        put.failed.put(name, "the file changed while it was moved into place");
+                        continue;
+                    }
+                    // landed content is this repository's own, no producer's
+                    for (String producer : dbEngine.mirroredBy(name).keySet()) dbEngine.forgetMirrored(producer, name);
                     // Catalog the landed file when no scanner will pick it up (landing-only repos never schedule the
                     // scan timer); a replaced file gets its new content recorded, not a stale row
                     if (fileScanTimer == null) {
@@ -1724,11 +2173,20 @@ public class RepoEngine {
                         dbEngine.upsertFile(saved.getAbsolutePath(), got, saved.lastModified(), saved.length());
                     }
                     put.stored.add(name);
+                    // a transfer file of the agent's journal has done its job; anything else is the caller's and stays
+                    if (journal != null) {
+                        try {
+                            Path realSrc = src.toRealPath();
+                            if (realSrc.startsWith(journal)) Files.deleteIfExists(realSrc);
+                        } catch (IOException ignore) { }
+                    }
                 } catch (Exception ex) {
                     logger.error("putfiles: " + name + " not landed", ex);
                     put.failed.put(name, ex.getClass().getSimpleName());
                 } finally {
-                    try { Files.deleteIfExists(part); } catch (Exception ignore) { }
+                    if (part != null) {
+                        try { Files.deleteIfExists(part); } catch (Exception ignore) { }
+                    }
                 }
             }
         } finally {
@@ -1737,32 +2195,20 @@ public class RepoEngine {
         return put;
     }
 
-
-    //sub functions
-    private void updateSubscribe(Map<String, String> incomingMap) {
-
+    /** The agent's dataplane journal (where pushed attachments are reassembled), resolved, or null. */
+    private Path journalDir() {
         try {
-            if ((incomingMap.containsKey("repo_region_id")) && (incomingMap.containsKey("repo_agent_id")) && (incomingMap.containsKey("repo_plugin_id"))) {
-
-                //don't include self
-                if (!((plugin.getRegion().equals(incomingMap.get("repo_region_id"))) && (plugin.getAgent().equals(incomingMap.get("repo_agent_id"))) && (plugin.getPluginID().equals(incomingMap.get("repo_plugin_id"))))) {
-                    rememberProducer(incomingMap.get("repo_region_id"), incomingMap.get("repo_agent_id"), incomingMap.get("repo_plugin_id"));
-                    if (isKnownProducer(incomingMap.get("repo_region_id"), incomingMap.get("repo_agent_id"), incomingMap.get("repo_plugin_id"))) {
-                        subMessage(fileRepoName, incomingMap.get("repo_region_id"), incomingMap.get("repo_agent_id"), incomingMap.get("repo_plugin_id"), "subscribe");
-                    }
-                }
-
-            } else {
-                logger.error("not agent identification provided");
-            }
+            Path j = plugin.getAgentService().getDataPlaneService().getJournalPath();
+            return j == null ? null : j.toRealPath();
         } catch (Exception ex) {
-            logger.error("Failed to subscribe");
-            logger.error(ex.getMessage());
+            return null;
         }
-
     }
 
-    /** Handle a subscriber-side dataplane message (the producer's discover broadcast). */
+
+    //sub functions
+
+    /** Handle a subscriber-side dataplane message (a producer's discover broadcast). */
     void onSubscriberMessage(Map<String, String> incomingMap) {
         if (incomingMap == null || !incomingMap.containsKey("action")) {
             logger.error("createSubListener no action in message");
@@ -1773,7 +2219,7 @@ public class RepoEngine {
             return;
         }
         if ("discover".equals(incomingMap.get("action"))) {
-            updateSubscribe(incomingMap);
+            if (fileRepoName != null && fileRepoName.equals(incomingMap.get("filerepo_name"))) onDiscover(incomingMap);
         } else {
             logger.error("unknown actionType: " + incomingMap.get("action"));
         }
@@ -1801,36 +2247,6 @@ public class RepoEngine {
 
     }
 
-    public void subMessage(String filerepoName, String regionId, String agentId, String pluginId, String action) {
-
-        try {
-
-            Map<String,String> update = new HashMap<>();
-            update.put("action",action);
-            update.put("filerepo_name",filerepoName);
-            update.put("sub_region_id", plugin.getRegion());
-            update.put("sub_agent_id",plugin.getAgent());
-            update.put("sub_plugin_id",plugin.getPluginID());
-            update.put("sync_gen", syncGen);
-
-            TextMessage updateMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
-            updateMessage.setText(gson.toJson(update));
-            updateMessage.setStringProperty("filerepo_name",filerepoName);
-            updateMessage.setStringProperty("region_id",regionId);
-            updateMessage.setStringProperty("agent_id",agentId);
-            updateMessage.setStringProperty("plugin_id",pluginId);
-
-            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL,updateMessage);
-
-
-        } catch (Exception ex) {
-            logger.error("failed to update subscribers");
-            logger.error(ex.getMessage());
-        }
-
-    }
-
-
     //repo functions
     public void repoBroadcast(String filerepoName, String action, int transferId) {
 
@@ -1843,6 +2259,7 @@ public class RepoEngine {
             update.put("repo_agent_id",plugin.getAgent());
             update.put("repo_plugin_id",plugin.getPluginID());
             update.put("transfer_id", String.valueOf(transferId));
+            update.put("sync_proto", SYNC_PROTO);
 
             TextMessage updateMessage = plugin.getAgentService().getDataPlaneService().createTextMessage();
             updateMessage.setText(gson.toJson(update));
@@ -1859,26 +2276,18 @@ public class RepoEngine {
 
     }
 
-    /** Handle a producer-side dataplane message (a subscriber's subscribe or unsubscribe). */
+    /**
+     * A producer-side dataplane message: only sync protocol 1 subscribers send these (subscribe and unsubscribe over the
+     * dataplane, where anyone can write them). They are never taken: the subscriber is told, in the log, to upgrade.
+     */
     void onRepoMessage(Map<String, String> incomingMap) {
-        if (incomingMap == null || !incomingMap.containsKey("action")) {
-            logger.error("createRepoSubListener no action in message");
-            return;
-        }
-        if (!incomingMap.containsKey("filerepo_name")) {
-            logger.error("action called without filerepo_name");
-            return;
-        }
-        switch (incomingMap.get("action")) {
-            case "subscribe":
-                addSubscribe(incomingMap);
-                break;
-            case "unsubscribe":
-                removeSubscribe(incomingMap);
-                break;
-            default:
-                logger.error("unknown actionType: " + incomingMap.get("action"));
-                break;
+        if (incomingMap == null) return;
+        String who = incomingMap.get("sub_region_id") + "/" + incomingMap.get("sub_agent_id") + "/" + incomingMap.get("sub_plugin_id");
+        Long warned = oldProtocolWarned.get(who);
+        if (warned == null || System.currentTimeMillis() - warned > 3_600_000L) {
+            if (oldProtocolWarned.size() < 1024) oldProtocolWarned.put(who, System.currentTimeMillis());
+            logger.warn("ignored a sync protocol 1 '" + incomingMap.get("action") + "' naming " + who
+                    + " over the dataplane: subscribers of protocol " + SYNC_PROTO + " subscribe with reposubscribe; upgrade it");
         }
     }
 
@@ -1888,7 +2297,6 @@ public class RepoEngine {
             public void onMessage(Message msg) {
                 try {
                     if (msg instanceof TextMessage) {
-                        logger.debug(" REPO REC MESSAGE:" + ((TextMessage) msg).getText());
                         onRepoMessage(gson.fromJson(((TextMessage) msg).getText(), mapType));
                     }
                 } catch(Exception ex) {
@@ -1901,88 +2309,6 @@ public class RepoEngine {
         String node_from_listner_id = plugin.getAgentService().getDataPlaneService().addMessageListener(TopicType.GLOBAL,ml,queryString);
 
         listenerList.add(node_from_listner_id);
-
-    }
-
-    private String generateSubKey(Map<String, String> incomingMap) {
-        if ((incomingMap.containsKey("sub_region_id")) && (incomingMap.containsKey("sub_agent_id")) && (incomingMap.containsKey("sub_plugin_id"))) {
-            return peerKey(incomingMap.get("sub_region_id"), incomingMap.get("sub_agent_id"), incomingMap.get("sub_plugin_id"));
-        }
-        return null;
-    }
-
-    private void addSubscribe(Map<String, String> incomingMap) {
-
-        try {
-            if ((incomingMap.containsKey("sub_region_id")) && (incomingMap.containsKey("sub_agent_id")) && (incomingMap.containsKey("sub_plugin_id"))) {
-
-                    //don't include self
-                    if (!((plugin.getRegion().equals(incomingMap.get("sub_region_id"))) && (plugin.getAgent().equals(incomingMap.get("sub_agent_id"))) && (plugin.getPluginID().equals(incomingMap.get("sub_plugin_id"))))) {
-                        String subKey = generateSubKey(incomingMap);
-                        if(subKey != null) {
-                            synchronized (lockSubscriberMap) {
-                                if (subscriberMap.containsKey(subKey)) {
-                                    subscriberMap.get(subKey).put("ts", String.valueOf(System.currentTimeMillis()));
-                                } else if (subscriberMap.size() >= syncMaxPeers) {
-                                    logger.warn("subscriber " + subKey + " not added: already " + subscriberMap.size()
-                                            + " subscribers (sync_max_peers)");
-                                    return;
-                                } else {
-                                    Map<String, String> sub = new HashMap<>(incomingMap);
-                                    sub.put("ts", String.valueOf(System.currentTimeMillis()));
-                                    subscriberMap.put(subKey, sub);
-                                }
-                                String gen = incomingMap.get("sync_gen");
-                                FullOffer current = fullOffers.get(subKey);
-                                if (gen != null && gen.matches("[0-9a-f]{1,64}") && (current == null || !current.gen.equals(gen))) {
-                                    // a subscriber new to this producer (or cleared): everything again, to it; and
-                                    // what is in flight to others is offered again too, so it is not missed
-                                    fullOffers.put(subKey, new FullOffer(gen));
-                                    offeredAt.clear();
-                                    logger.info("subscriber " + subKey + " (generation " + gen + "): a full offer follows");
-                                }
-                            }
-                        }
-                    }
-
-            } else {
-                logger.error("not agent identification provided");
-            }
-        } catch (Exception ex) {
-            logger.error("Failed to subscribe");
-            logger.error(ex.getMessage());
-        }
-
-
-    }
-
-    private void removeSubscribe(Map<String, String> incomingMap) {
-
-        try {
-
-            if ((incomingMap.containsKey("sub_region_id")) && (incomingMap.containsKey("sub_agent_id")) && (incomingMap.containsKey("sub_plugin_id"))) {
-
-                //don't include self
-                if (!((plugin.getRegion().equals(incomingMap.get("sub_region_id"))) && (plugin.getAgent().equals(incomingMap.get("sub_agent_id"))) && (plugin.getPluginID().equals(incomingMap.get("sub_plugin_id"))))) {
-                    String subKey = generateSubKey(incomingMap);
-                    if(subKey != null) {
-                        synchronized (lockSubscriberMap) {
-
-                            subscriberMap.remove(subKey);
-                            fullOffers.remove(subKey);
-
-                        }
-                    }
-                }
-
-            } else {
-                logger.error("not agent identification provided");
-            }
-
-        } catch (Exception ex) {
-            logger.error("Failed to unsubscribe");
-            logger.error(ex.getMessage());
-        }
 
     }
 

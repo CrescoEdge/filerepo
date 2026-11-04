@@ -97,10 +97,11 @@ class LiveRootGuardTest {
         assertTrue(Files.exists(dotted), "the filesystem reaches the secret through it");
         assertEquals("live-root", rig.call(pushRemote(dotted)).getParam("refusal"), ".. is resolved after the link, not before");
 
+        // putfilesremote is removed (1.3 hardening review): an ordinary file passes the live-root rule and is then
+        // refused as removed; nothing is ever pushed
         MsgEvent ok = rig.call(pushRemote(ordinary));
-        assertEquals("10", ok.getParam("status"), "an ordinary file is pushed as before");
-        assertEquals(1, rig.sent.size());
-        assertEquals("putfiles", rig.sent.get(0).getParam("action"));
+        assertEquals("removed", ok.getParam("refusal"), "an ordinary file is not a live-root refusal");
+        assertTrue(rig.sent.isEmpty(), "nothing was pushed");
     }
 
     @Test
@@ -220,6 +221,7 @@ class LiveRootGuardTest {
         diff.put("/remote/plain.txt", new FileObject("plain.txt", "def", "/remote/plain.txt", 1L, 3L));
         MsgEvent in = TestRig.request("repolistin", "transfer_id", "5");
         in.setCompressedParam("repolistin", gson.toJson(diff));
+        Fabric.stamp(in, "caller");      // the producer, as infrastructure names it (1.3 hardening: never the source fields)
         assertEquals("10", rig.call(in).getParam("status_code"));
 
         long deadline = System.currentTimeMillis() + 10_000;
@@ -253,7 +255,7 @@ class LiveRootGuardTest {
         assertFalse(client.present());
         assertEquals("live-root", rig.call(pushRemote(secret)).getParam("refusal"), "remembered in the catalog");
         Path ordinary = Files.write(tmp.resolve("ordinary.txt"), "shareable".getBytes());
-        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));
+        assertEquals("removed", rig.call(pushRemote(ordinary)).getParam("refusal"));
     }
 
     @Test
@@ -274,7 +276,7 @@ class LiveRootGuardTest {
         broken.hang.countDown();
         registerProvider(provider);                                         // a provider that answers
         assertEquals("10", rig.call("getrepofilelist", "repo_name", "fr").getParam("status"));
-        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));
+        assertEquals("removed", rig.call(pushRemote(ordinary)).getParam("refusal"));
         assertEquals("live-root", rig.call(pushRemote(secret)).getParam("refusal"));
     }
 
@@ -323,7 +325,7 @@ class LiveRootGuardTest {
         now.register(FakeProvider.props(), b -> answering);
         assertEquals("live-root", rig.call(pushRemote(secret)).getParam("refusal"), "its root, learned");
         assertEquals("live-root", rig.call(pushRemote(rootA.resolve("x"))).getParam("refusal"), "and root A, remembered");
-        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));
+        assertEquals("removed", rig.call(pushRemote(ordinary)).getParam("refusal"));
     }
 
     @Test
@@ -341,7 +343,7 @@ class LiveRootGuardTest {
         assertTrue(rig.sent.isEmpty(), "nothing was pushed");
 
         registry.unregister(ref);                                          // gone: no provider and no root known
-        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"), "as before, without a provider");
+        assertEquals("removed", rig.call(pushRemote(ordinary)).getParam("refusal"), "as before, without a provider");
     }
 
     @Test
@@ -357,7 +359,7 @@ class LiveRootGuardTest {
         assertEquals("live-root", rig.call(pushRemote(secretB)).getParam("refusal"), "and the second's");
         assertTrue(rig.sent.isEmpty(), "nothing was pushed");
         Path ordinary = Files.write(tmp.resolve("ordinary.txt"), "shareable".getBytes());
-        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));
+        assertEquals("removed", rig.call(pushRemote(ordinary)).getParam("refusal"));
     }
 
     @Test
@@ -369,6 +371,6 @@ class LiveRootGuardTest {
         assertFalse(client.present());
         assertEquals("live-root", rig.call(pushRemote(secret)).getParam("refusal"), "named in configuration");
         Path ordinary = Files.write(tmp.resolve("ordinary.txt"), "shareable".getBytes());
-        assertEquals("10", rig.call(pushRemote(ordinary)).getParam("status"));
+        assertEquals("removed", rig.call(pushRemote(ordinary)).getParam("refusal"));
     }
 }

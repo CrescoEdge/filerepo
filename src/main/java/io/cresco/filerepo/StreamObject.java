@@ -13,6 +13,22 @@ public class StreamObject {
 
     private volatile boolean isActive = true;
 
+    // the open file a transfer reads through, from the moment it is accepted until its streamer closes it
+    private volatile java.nio.channels.FileChannel channel;
+
+    void setChannel(java.nio.channels.FileChannel channel) {
+        this.channel = channel;
+    }
+
+    /** Close the transfer's file if its streamer never ran (shutdown). */
+    void closeChannel() {
+        java.nio.channels.FileChannel c = channel;
+        channel = null;
+        if (c != null) {
+            try { c.close(); } catch (java.io.IOException ignore) { }
+        }
+    }
+
     public StreamObject(String transferId, String filename, long startByte, long byteLength) {
         this.transferId = transferId;
         this.filename = filename;

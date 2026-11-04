@@ -69,7 +69,26 @@ class StreamFileTest {
         MsgEvent m = rig.requestTo("streamfile", "file_path", f.toString(), "start_byte", String.valueOf(start),
                 "byte_length", String.valueOf(len), "ident_key", "stream_name", "ident_id", "rx", "buffer_size", "4096");
         for (int i = 0; i + 1 < kv.length; i += 2) m.setParam(kv[i], kv[i + 1]);
-        return rig.call(m);
+        return rig.call(alice(m));
+    }
+
+    /** The default caller of these tests: an API user, as infrastructure stamps one. */
+    static MsgEvent alice(MsgEvent m) {
+        m.setParam(Callers.PARAM_CALLER, "api:tenant-a/alice");
+        m.setParam("cresco_caller_tenant", "tenant-a");
+        m.setParam(Callers.PARAM_ROLES, "user");
+        return m;
+    }
+
+    @Test
+    void aTransferWithNoVerifiedCallerIsRefused() throws Exception {
+        rig();
+        Path f = cataloged("anon.txt", "hello".getBytes());
+        MsgEvent unstamped = rig.requestTo("streamfile", "file_path", f.toString(), "start_byte", "0", "byte_length", "5",
+                "ident_key", "stream_name", "ident_id", "rx");
+        MsgEvent r = rig.call(unstamped);
+        assertEquals("9", r.getParam("status"));
+        assertEquals("no-caller", r.getParam("refusal"), "the source fields are never an identity");
     }
 
     Message terminal(String tid) throws Exception {
@@ -182,7 +201,7 @@ class StreamFileTest {
         // the other caller cannot cancel the first caller's transfer
         MsgEvent foreignCancel = TestRig.as(rig.requestTo("streamfilecancel", "transfer_id", "nothers"), "user");
         assertEquals("9", rig.call(foreignCancel).getParam("status_code"));
-        assertEquals("10", rig.call(rig.requestTo("streamfilecancel", "transfer_id", "mine")).getParam("status_code"));
+        assertEquals("10", rig.call(alice(rig.requestTo("streamfilecancel", "transfer_id", "mine"))).getParam("status_code"));
         hold.countDown();
         Message end = terminal("mine");
         // whichever of the two "mine" transfers ended first; the cancelled one says so
@@ -202,28 +221,52 @@ class StreamFileTest {
 
     @Test
     void aQueuedTransferCanBeCancelledAndTheBoundsRefuseAsBusy() throws Exception {
+        // two threads: one caller runs at most one at a time (half the pool), three in flight; one more waits in all
         rig("transfer_threads", "2", "transfer_queue_max", "1", "transfer_max_per_caller", "3");
         CountDownLatch hold = new CountDownLatch(1);
         rig.exec.beforeStream = () -> {
             try { hold.await(10, TimeUnit.SECONDS); } catch (InterruptedException ignored) { }
         };
         Path f = cataloged("z.bin", new byte[5000]);
-        assertEquals("10", stream(f, 0, 100, "transfer_id", "t1").getParam("status"));
-        assertEquals("10", stream(f, 0, 100, "transfer_id", "t2").getParam("status"));
-        Thread.sleep(100);
-        assertEquals("10", stream(f, 0, 100, "transfer_id", "t3").getParam("status"), "queued");
-        MsgEvent busy = stream(f, 0, 100, "transfer_id", "t4");
-        assertEquals("11", busy.getParam("status"), "per-caller cap: " + busy.getParams());
-        // another caller hits the pool's own bound: two running, one queued
+        assertEquals("10", stream(f, 0, 100, "transfer_id", "t1").getParam("status"), "runs");
+        assertEquals("10", stream(f, 0, 100, "transfer_id", "t2").getParam("status"), "waits: one running per caller");
+        // another caller is not held behind alice: it runs on the second thread
         MsgEvent other = TestRig.as(rig.requestTo("streamfile", "file_path", f.toString(), "start_byte", "0",
                 "byte_length", "10", "ident_key", "stream_name", "ident_id", "rx", "transfer_id", "o1"), "user");
-        assertEquals("11", rig.call(other).getParam("status"), "the transfer queue is full");
-        // the queued transfer is cancelled before it starts
-        assertEquals("10", rig.call(rig.requestTo("streamfilecancel", "transfer_id", "t3")).getParam("status_code"));
+        assertEquals("10", rig.call(other).getParam("status"));
+        // the bound in all (two threads + one waiting) is reached
+        MsgEvent busy = stream(f, 0, 100, "transfer_id", "t3");
+        assertEquals("11", busy.getParam("status"), busy.getParams().toString());
+        // the waiting transfer is cancelled before it starts
+        assertEquals("10", rig.call(alice(rig.requestTo("streamfilecancel", "transfer_id", "t2"))).getParam("status_code"));
         hold.countDown();
-        assertEquals("9", terminal("t3").getStringProperty("transfer_status"));
+        assertEquals("9", terminal("t2").getStringProperty("transfer_status"));
         assertEquals("10", terminal("t1").getStringProperty("transfer_status"));
+        assertEquals("10", terminal("o1").getStringProperty("transfer_status"));
         assertTrue(rig.call("getmetrics").getParam("metrics").contains("filerepo.transfer.rejected"));
+    }
+
+    @Test
+    void oneCallersTransfersBeyondItsShareWaitWithoutHoldingAThread() throws Exception {
+        rig("transfer_threads", "4", "transfer_max_per_caller", "6");
+        CountDownLatch hold = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger started = new java.util.concurrent.atomic.AtomicInteger();
+        rig.exec.beforeStream = () -> {
+            started.incrementAndGet();
+            try { hold.await(10, TimeUnit.SECONDS); } catch (InterruptedException ignored) { }
+        };
+        Path f = cataloged("w.bin", new byte[5000]);
+        for (int i = 0; i < 6; i++) assertEquals("10", stream(f, 0, 10, "transfer_id", "a" + i).getParam("status"));
+        assertEquals("11", stream(f, 0, 10, "transfer_id", "a6").getParam("status"), "transfer_max_per_caller");
+        Thread.sleep(200);
+        assertEquals(2, started.get(), "alice runs half the pool");
+        MsgEvent other = TestRig.as(rig.requestTo("streamfile", "file_path", f.toString(), "start_byte", "0",
+                "byte_length", "10", "ident_key", "stream_name", "ident_id", "rx", "transfer_id", "b0"), "user");
+        assertEquals("10", rig.call(other).getParam("status"));
+        Thread.sleep(200);
+        assertEquals(3, started.get(), "another caller starts at once");
+        hold.countDown();
+        for (int i = 0; i < 6; i++) assertEquals("10", terminal("a" + i).getStringProperty("transfer_status"), "a" + i);
     }
 
     @Test

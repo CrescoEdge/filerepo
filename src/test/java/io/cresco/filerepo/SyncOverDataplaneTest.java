@@ -417,6 +417,109 @@ class SyncOverDataplaneTest {
         assertEquals(1, producer.repo.getTombstoneCount(), "once readable, the delete is seen");
     }
 
+    @Test
+    void aVanishedMountIsHeldEvenForASingleFileAndAReleaseNamesExactlyTheHeldSet() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        // vol is a mount point: another device than its parent (simulated device ids)
+        java.util.concurrent.atomic.AtomicBoolean mounted = new java.util.concurrent.atomic.AtomicBoolean(true);
+        producer.repo.devOf = p -> p.getFileName() != null && p.getFileName().toString().equals("vol") && mounted.get() ? 99L : 1L;
+        for (int i = 0; i < 20; i++) Files.write(scan.resolve("keep" + i + ".txt"), ("keep " + i).getBytes());
+        Files.write(Files.createDirectories(scan.resolve("vol")).resolve("ckpt.bin"), "checkpoint".getBytes());
+        syncedAndConfirmed();
+        assertTrue(Files.exists(mirror.resolve("vol/ckpt.bin")));
+
+        // unmounted: the mount point is an ordinary directory again, its one file gone (1 of 21: no fraction, no subtree)
+        mounted.set(false);
+        Files.delete(scan.resolve("vol/ckpt.bin"));
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(1, producer.repo.getDeletesHeld(), "a delete under a vanished mount is held");
+        Thread.sleep(300);
+        assertTrue(Files.exists(mirror.resolve("vol/ckpt.bin")), "never propagated");
+        String holdId = producer.call("repostate").getParam("deletes_hold_id");
+        assertNotNull(holdId);
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(1, producer.repo.getDeletesHeld(), "held every cycle");
+
+        // a release names exactly that set: a stale id is refused, the right one releases it once
+        assertEquals("hold-changed", producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString(),
+                "hold_id", "0123456789abcdef0123456789abcdef")).getParam("refusal"));
+        assertEquals("1", producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString(), "hold_id", holdId))
+                .getParam("released"));
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(0, producer.repo.getDeletesHeld());
+        await(() -> !Files.exists(mirror.resolve("vol/ckpt.bin")), "released and applied");
+    }
+
+    @Test
+    void theScanDirLeavingItsDeviceHoldsEverythingGone() throws Exception {
+        producer();
+        java.util.concurrent.atomic.AtomicLong rootDev = new java.util.concurrent.atomic.AtomicLong(7);
+        producer.repo.devOf = p -> p.equals(scan) || p.equals(scanReal()) ? rootDev.get() : 7L;
+        for (int i = 0; i < 30; i++) Files.write(scan.resolve("f" + i + ".txt"), ("f" + i).getBytes());
+        assertTrue(producer.repo.scanOnce());
+        // the volume under the scan dir is replaced by another (a remount of the wrong device), one file missing
+        rootDev.set(8);
+        Files.delete(scan.resolve("f0.txt"));
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(1, producer.repo.getDeletesHeld(), "anything gone from a scan dir that changed device is held");
+        assertEquals(0, producer.repo.getTombstoneCount());
+    }
+
+    private Path scanReal() {
+        try {
+            return scan.toRealPath();
+        } catch (Exception e) {
+            return scan;
+        }
+    }
+
+    @Test
+    void peersOfAnotherSyncProtocolAreRefusedAndToldWhy() throws Exception {
+        producer();
+        subscriber();
+        // an old producer's discover (no sync_proto): the subscriber does not subscribe to it
+        Map<String, String> old = new HashMap<>();
+        old.put("action", "discover");
+        old.put("filerepo_name", "fr");
+        old.put("repo_region_id", TestRig.REGION);
+        old.put("repo_agent_id", TestRig.AGENT);
+        old.put("repo_plugin_id", "plugin-p");
+        subscriber.repo.onSubscriberMessage(old);
+        Thread.sleep(200);
+        assertFalse(producer.repo.isSubscriber(TestRig.REGION, TestRig.AGENT, "plugin-s"));
+        assertTrue(subscriber.log.stream().anyMatch(l -> l.contains("speaks sync protocol 1")), subscriber.log.toString());
+        // an old subscriber's reposubscribe (sync_proto 1): refused, with the reason in the answer
+        MsgEvent sub = new MsgEvent(MsgEvent.Type.EXEC, TestRig.REGION, TestRig.AGENT, "plugin-old", TestRig.REGION,
+                TestRig.AGENT, "plugin-p", false, false);
+        sub.setParam("action", "reposubscribe");
+        sub.setParam("filerepo_name", "fr");
+        sub.setParam("sync_gen", "abc");
+        sub.setParam("sync_proto", "1");
+        Fabric.stamp(sub, "plugin-old");
+        producer.call(sub);
+        assertFalse(producer.repo.isSubscriber(TestRig.REGION, TestRig.AGENT, "plugin-old"));
+        MsgEvent answer = producer.sent.stream().filter(m -> "reposubscribed".equals(m.getParam("action"))).reduce((a, b) -> b).orElse(null);
+        assertNotNull(answer);
+        assertEquals("false", answer.getParam("accepted"));
+        assertTrue(answer.getParam("refusal").contains("sync protocol 1"), answer.getParam("refusal"));
+        // a protocol 1 subscribe over the dataplane is never taken
+        producer.repo.onRepoMessage(Map.of("action", "subscribe", "filerepo_name", "fr", "sub_region_id", TestRig.REGION,
+                "sub_agent_id", TestRig.AGENT, "sub_plugin_id", "plugin-old"));
+        assertFalse(producer.repo.isSubscriber(TestRig.REGION, TestRig.AGENT, "plugin-old"));
+        assertTrue(producer.log.stream().anyMatch(l -> l.contains("sync protocol 1")), producer.log.toString());
+    }
+
+    @Test
+    void aMirrorPinnedToItsProducersSubscribesToNoOther() throws Exception {
+        producer();
+        subscriber("sync_producers", TestRig.REGION + "/" + TestRig.AGENT + "/plugin-elsewhere");
+        producer.repo.repoBroadcast("fr", "discover", 0);
+        Thread.sleep(300);
+        assertFalse(producer.repo.isSubscriber(TestRig.REGION, TestRig.AGENT, "plugin-s"), "plugin-p is not a pinned producer");
+    }
+
     // ------------------------------------------------------------------ sources and bounds (FR-D5)
 
     @Test
@@ -424,7 +527,11 @@ class SyncOverDataplaneTest {
         subscriber();
         MsgEvent in = subscriber.requestTo("repolistin", "transfer_id", "1");
         in.setCompressedParam("repolistin", "{\"/etc/passwd\":{\"fileName\":\"x\",\"MD5\":\"a\",\"filePath\":\"/etc/passwd\",\"lastModified\":1,\"filesize\":3}}");
-        MsgEvent r = subscriber.call(in);
+        assertEquals("9", subscriber.call(in).getParam("status_code"), "no verified caller at all");
+        MsgEvent in2 = subscriber.requestTo("repolistin", "transfer_id", "2");
+        in2.setCompressedParam("repolistin", "{}");
+        Fabric.stamp(in2, "plugin-x");      // a verified plugin, but not a producer this mirror subscribed to
+        MsgEvent r = subscriber.call(in2);
         assertEquals("9", r.getParam("status_code"));
         Thread.sleep(200);
         assertTrue(subscriber.sent.isEmpty(), "nothing fetched, nothing confirmed");
@@ -484,6 +591,7 @@ class SyncOverDataplaneTest {
         in.setParam("action", "repolistin");
         in.setParam("transfer_id", tid);
         in.setCompressedParam("repolistin", "{}");
+        Fabric.stamp(in, producerId);
         return subscriber.call(in).getParam("status_code");
     }
 
@@ -508,7 +616,9 @@ class SyncOverDataplaneTest {
 
     static void assertNoStaging(Path dir) throws Exception {
         try (java.util.stream.Stream<Path> s = Files.walk(dir)) {
-            assertTrue(s.noneMatch(p -> RepoEngine.isStaging(p.getFileName().toString())), "no staging file is left");
+            // the owner-only staging directory may stay; no staging file may, in it or anywhere
+            assertTrue(s.noneMatch(p -> !p.getFileName().toString().equals(RepoEngine.PRIVATE_STAGING)
+                    && RepoEngine.isStaging(p.getFileName().toString())), "no staging file is left");
         }
     }
 }

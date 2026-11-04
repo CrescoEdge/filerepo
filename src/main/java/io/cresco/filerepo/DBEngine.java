@@ -125,6 +125,19 @@ public class DBEngine {
             if (!tombExists) {
                 initTombstones();
             }
+            for (String[] t : SYNC_TABLES) {
+                boolean has;
+                try (ResultSet rs = conn.getMetaData().getTables(null, null, t[0], null)) {
+                    has = rs.next();
+                }
+                if (!has) {
+                    try (Statement stmt = conn.createStatement()) {
+                        stmt.executeUpdate(t[1]);
+                    } catch (Exception ex) {
+                        logger.error("could not create " + t[0], ex);
+                    }
+                }
+            }
         } catch (Exception ex) {
             logger.error("ensureSchema error", ex);
         }
@@ -149,6 +162,434 @@ public class DBEngine {
             stmt.executeUpdate(create);
         } catch (Exception ex) {
             logger.error("initTombstones error", ex);
+        }
+    }
+
+    /**
+     * Sync state (protocol 2). A producer keeps, per subscriber, what that subscriber still needs: SUBSCRIBERS (who, its
+     * sync generation, when last seen), PENDING (a file version it has not confirmed) and PENDINGDEL (a delete it has
+     * not applied). A subscriber keeps MIRRORED: which producer delivered which content under which name, so it never
+     * overwrites or deletes content that is not that producer's. Paths are keyed by their SHA-256, so index keys stay
+     * small whatever a path's length.
+     */
+    private static final String[][] SYNC_TABLES = {
+            {"SUBSCRIBERS", "CREATE TABLE subscribers (subkey varchar(256) primary key NOT NULL, region varchar(128),"
+                    + " agent varchar(128), plugin varchar(128), gen varchar(128), last_seen bigint)"},
+            {"PENDING", "CREATE TABLE pending (subkey varchar(256) NOT NULL, pathhash varchar(200) NOT NULL,"
+                    + " filepath varchar(1000) NOT NULL, PRIMARY KEY (subkey, pathhash))"},
+            {"PENDINGDEL", "CREATE TABLE pendingdel (subkey varchar(256) NOT NULL, pathhash varchar(200) NOT NULL,"
+                    + " filepath varchar(1000) NOT NULL, PRIMARY KEY (subkey, pathhash))"},
+            {"MIRRORED", "CREATE TABLE mirrored (producer varchar(256) NOT NULL, relhash char(64) NOT NULL,"
+                    + " relpath varchar(1000) NOT NULL, md5 varchar(255), PRIMARY KEY (producer, relhash))"},
+    };
+
+    /**
+     * The key of a path in the pending tables: its first 120 characters, a separator below every printable character,
+     * and its SHA-256. Unique, small enough for an index whatever the path's length, and ordered as the paths are (for
+     * paths that differ in their first 120 characters), so pages of what is pending come in path order.
+     */
+    static String pathKey(String path) {
+        return (path.length() > 120 ? path.substring(0, 120) : path) + "\u0001" + sha256(path);
+    }
+
+    /** SHA-256 of a path (UTF-8), lowercase hex: the key of a name in the mirrored table. */
+    static String sha256(String path) {
+        try {
+            return Hashes.hex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(path.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** A subscriber as a producer remembers it. */
+    static final class Subscriber {
+        final String key, region, agent, plugin, gen;
+        final long lastSeen;
+
+        Subscriber(String key, String region, String agent, String plugin, String gen, long lastSeen) {
+            this.key = key;
+            this.region = region;
+            this.agent = agent;
+            this.plugin = plugin;
+            this.gen = gen;
+            this.lastSeen = lastSeen;
+        }
+    }
+
+    public List<Subscriber> getSubscribers() {
+        List<Subscriber> out = new ArrayList<>();
+        try (Connection conn = ds.getConnection();
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT subkey, region, agent, plugin, gen, last_seen FROM subscribers")) {
+            while (rs.next()) {
+                out.add(new Subscriber(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4),
+                        rs.getString(5), rs.getLong(6)));
+            }
+        } catch (Exception ex) {
+            logger.error("getSubscribers error", ex);
+        }
+        return out;
+    }
+
+    public Subscriber getSubscriber(String key) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT subkey, region, agent, plugin, gen, last_seen FROM subscribers WHERE subkey = ?")) {
+            ps.setString(1, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new Subscriber(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4),
+                            rs.getString(5), rs.getLong(6));
+                }
+            }
+        } catch (Exception ex) {
+            logger.error("getSubscriber error", ex);
+        }
+        return null;
+    }
+
+    public void touchSubscriber(String key, long now) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("UPDATE subscribers SET last_seen = ? WHERE subkey = ?")) {
+            ps.setLong(1, now);
+            ps.setString(2, key);
+            ps.executeUpdate();
+        } catch (Exception ex) {
+            logger.error("touchSubscriber error", ex);
+        }
+    }
+
+    /**
+     * Record a subscriber with a new generation: forget what it had, and mark every cataloged file and every tombstone
+     * pending for it (it will be offered everything, paced, and skip what it already holds). Returns true when done.
+     */
+    public boolean resetSubscriber(Subscriber s, int batchSize) {
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                for (String sql : new String[]{"DELETE FROM pending WHERE subkey = ?", "DELETE FROM pendingdel WHERE subkey = ?",
+                        "DELETE FROM subscribers WHERE subkey = ?"}) {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, s.key);
+                        ps.executeUpdate();
+                    }
+                }
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO subscribers (subkey, region, agent, plugin, gen, last_seen) VALUES (?,?,?,?,?,?)")) {
+                    ps.setString(1, s.key);
+                    ps.setString(2, s.region);
+                    ps.setString(3, s.agent);
+                    ps.setString(4, s.plugin);
+                    ps.setString(5, s.gen);
+                    ps.setLong(6, s.lastSeen);
+                    ps.executeUpdate();
+                }
+                fillPending(conn, s.key, "SELECT filepath FROM filelist", "INSERT INTO pending (subkey, pathhash, filepath) VALUES (?,?,?)", batchSize);
+                fillPending(conn, s.key, "SELECT filepath FROM tombstone", "INSERT INTO pendingdel (subkey, pathhash, filepath) VALUES (?,?,?)", batchSize);
+                conn.commit();
+                return true;
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("resetSubscriber failed: " + ex.getMessage());
+                return false;
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("resetSubscriber error", ex);
+            return false;
+        }
+    }
+
+    private static void fillPending(Connection conn, String key, String select, String insert, int batchSize) throws SQLException {
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(select);
+             PreparedStatement ins = conn.prepareStatement(insert)) {
+            int n = 0;
+            while (rs.next()) {
+                String path = rs.getString(1);
+                ins.setString(1, key);
+                ins.setString(2, pathKey(path));
+                ins.setString(3, path);
+                ins.addBatch();
+                if (++n % Math.max(1, batchSize) == 0) ins.executeBatch();
+            }
+            ins.executeBatch();
+        }
+    }
+
+    /** Forget a subscriber and everything it had pending. */
+    public void deleteSubscriber(String key) {
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                for (String sql : new String[]{"DELETE FROM pending WHERE subkey = ?", "DELETE FROM pendingdel WHERE subkey = ?",
+                        "DELETE FROM subscribers WHERE subkey = ?"}) {
+                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                        ps.setString(1, key);
+                        ps.executeUpdate();
+                    }
+                }
+                conn.commit();
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("deleteSubscriber failed: " + ex.getMessage());
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("deleteSubscriber error", ex);
+        }
+    }
+
+    /**
+     * New or changed files: pending for every known subscriber (a changed file is offered again to everyone), and no
+     * longer a pending delete. One transaction per {@code batchSize} paths.
+     */
+    public void markChanged(List<String> paths, int batchSize) {
+        markPending(paths, batchSize, "pending", "pendingdel");
+    }
+
+    /** Deleted files: a pending delete for every known subscriber, and no longer a pending file. */
+    public void markDeleted(List<String> paths, int batchSize) {
+        markPending(paths, batchSize, "pendingdel", "pending");
+    }
+
+    private void markPending(List<String> paths, int batchSize, String into, String outOf) {
+        if (paths.isEmpty()) return;
+        List<String> subs = new ArrayList<>();
+        for (Subscriber s : getSubscribers()) subs.add(s.key);
+        int size = Math.max(1, batchSize);
+        for (int from = 0; from < paths.size(); from += size) {
+            List<String> chunk = paths.subList(from, Math.min(paths.size(), from + size));
+            try (Connection conn = ds.getConnection()) {
+                conn.setAutoCommit(false);
+                try (PreparedStatement drop = conn.prepareStatement("DELETE FROM " + outOf + " WHERE pathhash = ?");
+                     PreparedStatement clear = conn.prepareStatement("DELETE FROM " + into + " WHERE subkey = ? AND pathhash = ?");
+                     PreparedStatement add = conn.prepareStatement("INSERT INTO " + into + " (subkey, pathhash, filepath) VALUES (?,?,?)")) {
+                    for (String path : chunk) {
+                        String h = pathKey(path);
+                        drop.setString(1, h);
+                        drop.addBatch();
+                        for (String sub : subs) {
+                            clear.setString(1, sub);
+                            clear.setString(2, h);
+                            clear.addBatch();
+                            add.setString(1, sub);
+                            add.setString(2, h);
+                            add.setString(3, path);
+                            add.addBatch();
+                        }
+                    }
+                    drop.executeBatch();
+                    clear.executeBatch();
+                    add.executeBatch();
+                    conn.commit();
+                } catch (SQLException ex) {
+                    try { conn.rollback(); } catch (SQLException ignore) { }
+                    logger.error("could not record " + into + " for " + chunk.size() + " path(s): " + ex.getMessage());
+                } finally {
+                    try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+                }
+            } catch (Exception ex) {
+                logger.error("markPending error", ex);
+            }
+        }
+    }
+
+    /** A pending file for a subscriber: its key and the catalog row (path, md5, lastmodified, filesize). */
+    public List<String[]> pendingFiles(String subkey, String afterKey, int limit) {
+        List<String[]> out = new ArrayList<>();
+        String sql = "SELECT p.pathhash, f.filepath, f.md5, f.lastmodified, f.filesize FROM pending p"
+                + " JOIN filelist f ON f.filepath = p.filepath WHERE p.subkey = ? AND p.pathhash > ?"
+                + " ORDER BY p.pathhash FETCH FIRST ? ROWS ONLY";
+        try (Connection conn = ds.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, subkey);
+            ps.setString(2, afterKey);
+            ps.setInt(3, Math.max(1, limit));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(new String[]{rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4), rs.getString(5)});
+            }
+        } catch (Exception ex) {
+            logger.error("pendingFiles error", ex);
+        }
+        return out;
+    }
+
+    /** A pending delete for a subscriber: its key and the tombstone (path, name, md5, deleted_at). */
+    public List<String[]> pendingDeletes(String subkey, String afterKey, int limit) {
+        List<String[]> out = new ArrayList<>();
+        String sql = "SELECT d.pathhash, t.filepath, t.filename, t.md5, t.deleted_at FROM pendingdel d"
+                + " JOIN tombstone t ON t.filepath = d.filepath WHERE d.subkey = ? AND d.pathhash > ?"
+                + " ORDER BY d.pathhash FETCH FIRST ? ROWS ONLY";
+        try (Connection conn = ds.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, subkey);
+            ps.setString(2, afterKey);
+            ps.setInt(3, Math.max(1, limit));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(new String[]{rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4),
+                        String.valueOf(rs.getLong(5))});
+            }
+        } catch (Exception ex) {
+            logger.error("pendingDeletes error", ex);
+        }
+        return out;
+    }
+
+    /** Drop a pending row that can never be offered (outside the scan dir, in a live root). */
+    public void dropPending(String subkey, String pathHash) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM pending WHERE subkey = ? AND pathhash = ?")) {
+            ps.setString(1, subkey);
+            ps.setString(2, pathHash);
+            ps.executeUpdate();
+        } catch (Exception ex) {
+            logger.error("dropPending error", ex);
+        }
+    }
+
+    /** A subscriber holds these file versions: no longer pending for it (only where the catalog still has that version). */
+    public int settleFiles(String subkey, List<Row> held) {
+        return settle(held.size(), "DELETE FROM pending WHERE subkey = ? AND pathhash = ?"
+                + " AND EXISTS (SELECT 1 FROM filelist f WHERE f.filepath = ? AND f.md5 = ?)", (ps, i) -> {
+            Row r = held.get(i);
+            ps.setString(1, subkey);
+            ps.setString(2, pathKey(r.filepath));
+            ps.setString(3, r.filepath);
+            ps.setString(4, r.md5);
+        });
+    }
+
+    /** A subscriber applied these deletes: no longer pending for it (only the same tombstone). */
+    public int settleDeletes(String subkey, List<Tombstone> applied) {
+        return settle(applied.size(), "DELETE FROM pendingdel WHERE subkey = ? AND pathhash = ?"
+                + " AND EXISTS (SELECT 1 FROM tombstone t WHERE t.filepath = ? AND t.deleted_at = ?)", (ps, i) -> {
+            Tombstone t = applied.get(i);
+            ps.setString(1, subkey);
+            ps.setString(2, pathKey(t.filepath));
+            ps.setString(3, t.filepath);
+            ps.setLong(4, t.deletedAt);
+        });
+    }
+
+    private interface Binder {
+        void bind(PreparedStatement ps, int i) throws SQLException;
+    }
+
+    private int settle(int count, String sql, Binder binder) {
+        if (count == 0) return 0;
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (int i = 0; i < count; i++) {
+                    binder.bind(ps, i);
+                    ps.addBatch();
+                }
+                int n = 0;
+                for (int c : ps.executeBatch()) n += Math.max(0, c);
+                conn.commit();
+                return n;
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("settle failed: " + ex.getMessage());
+                return 0;
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("settle error", ex);
+            return 0;
+        }
+    }
+
+    /** Files and deletes a subscriber still has pending (tests, metrics). */
+    public long pendingCount(String subkey) {
+        long n = 0;
+        for (String table : new String[]{"pending", "pendingdel"}) {
+            try (Connection conn = ds.getConnection();
+                 PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM " + table + " WHERE subkey = ?")) {
+                ps.setString(1, subkey);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) n += rs.getLong(1);
+                }
+            } catch (Exception ex) {
+                logger.error("pendingCount error", ex);
+            }
+        }
+        return n;
+    }
+
+    // ---- subscriber side: which producer delivered which content under which name ----
+
+    /** The content producer {@code producer} delivered under {@code relpath}, or null. */
+    public String mirroredMd5(String producer, String relpath) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT md5 FROM mirrored WHERE producer = ? AND relhash = ?")) {
+            ps.setString(1, producer);
+            ps.setString(2, sha256(relpath));
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        } catch (Exception ex) {
+            logger.error("mirroredMd5 error", ex);
+            return null;
+        }
+    }
+
+    /** Every producer that delivered content under {@code relpath}, with that content: producer -> md5. */
+    public Map<String, String> mirroredBy(String relpath) {
+        Map<String, String> out = new HashMap<>();
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT producer, md5 FROM mirrored WHERE relhash = ?")) {
+            ps.setString(1, sha256(relpath));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.put(rs.getString(1), rs.getString(2));
+            }
+        } catch (Exception ex) {
+            logger.error("mirroredBy error", ex);
+        }
+        return out;
+    }
+
+    public void recordMirrored(String producer, String relpath, String md5) {
+        try (Connection conn = ds.getConnection()) {
+            try (PreparedStatement up = conn.prepareStatement("UPDATE mirrored SET md5 = ?, relpath = ? WHERE producer = ? AND relhash = ?")) {
+                up.setString(1, md5);
+                up.setString(2, relpath);
+                up.setString(3, producer);
+                up.setString(4, sha256(relpath));
+                if (up.executeUpdate() > 0) return;
+            }
+            try (PreparedStatement in = conn.prepareStatement("INSERT INTO mirrored (producer, relhash, relpath, md5) VALUES (?,?,?,?)")) {
+                in.setString(1, producer);
+                in.setString(2, sha256(relpath));
+                in.setString(3, relpath);
+                in.setString(4, md5);
+                in.executeUpdate();
+            }
+        } catch (Exception ex) {
+            logger.error("recordMirrored error", ex);
+        }
+    }
+
+    public void forgetMirrored(String producer, String relpath) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM mirrored WHERE producer = ? AND relhash = ?")) {
+            ps.setString(1, producer);
+            ps.setString(2, sha256(relpath));
+            ps.executeUpdate();
+        } catch (Exception ex) {
+            logger.error("forgetMirrored error", ex);
+        }
+    }
+
+    /** Forget every mirrored record (a clear removed the files). */
+    public void clearMirrored() {
+        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement()) {
+            st.executeUpdate("DELETE FROM mirrored");
+        } catch (Exception ex) {
+            logger.error("clearMirrored error", ex);
         }
     }
 
@@ -376,8 +817,10 @@ public class DBEngine {
 
     /** Forget confirmed tombstones deleted before {@code before} (epoch ms). Returns how many went. */
     public int purgeTombstones(long before) {
+        // never while a subscriber still has the delete pending
         try (Connection conn = ds.getConnection();
-             PreparedStatement ps = conn.prepareStatement("DELETE FROM tombstone WHERE insync = 1 AND deleted_at < ?")) {
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM tombstone WHERE insync = 1 AND deleted_at < ?"
+                     + " AND NOT EXISTS (SELECT 1 FROM pendingdel d WHERE d.filepath = tombstone.filepath)")) {
             ps.setLong(1, before);
             return ps.executeUpdate();
         } catch (Exception ex) {

@@ -59,7 +59,8 @@ public class FileRepoHealthCheck implements HealthCheck {
             int held = repoEngine.getDeletesHeld();
             if (held > 0) {
                 return new Result(Result.Status.WARN, "filerepo WARN: the mass-delete guard holds " + held
-                        + " delete(s) back from subscribers; an admin releases them with releasedeletes if intended");
+                        + " delete(s) back from subscribers (hold " + repoEngine.getHoldId()
+                        + "); an admin releases exactly them with releasedeletes if intended");
             }
             return new Result(Result.Status.OK,
                     "filerepo OK: " + files + " file(s) cataloged, repo dir=" + repoDir.getName());

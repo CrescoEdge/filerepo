@@ -79,6 +79,16 @@ final class Fabric {
         return true;
     }
 
+    /** Infrastructure's stamp: whatever a message carried, its caller is the plugin that sent it. */
+    static void stamp(MsgEvent m, String pluginId) {
+        m.removeParam(Callers.PARAM_CALLER);
+        m.removeParam(Callers.PARAM_ROLES);
+        m.removeParam("cresco_caller_tenant");
+        m.setParam(Callers.PARAM_CALLER, "plugin:" + TENANT + "/" + TestRig.REGION + "/" + TestRig.AGENT + "/" + pluginId);
+        m.setParam("cresco_caller_tenant", TENANT);
+        m.setParam(Callers.PARAM_ROLES, "plugin");
+    }
+
     /** Deliver {@code msg} from {@code from} to the plugin it names; return an RPC's reply to the caller. */
     void route(TestRig from, MsgEvent msg) {
         routed.add(String.valueOf(msg.getParam("action")));
@@ -87,16 +97,15 @@ final class Fabric {
         if (to == null) return;
         MsgEvent copy = gson.fromJson(gson.toJson(msg), MsgEvent.class);
         // infrastructure's stamp: whatever the sender wrote, the caller is the sending plugin
-        copy.removeParam(Callers.PARAM_CALLER);
-        copy.removeParam(Callers.PARAM_ROLES);
-        copy.removeParam("cresco_caller_tenant");
-        copy.setParam(Callers.PARAM_CALLER, "plugin:" + TENANT + "/" + TestRig.REGION + "/" + TestRig.AGENT + "/" + from.pluginId);
-        copy.setParam("cresco_caller_tenant", TENANT);
-        copy.setParam(Callers.PARAM_ROLES, "plugin");
+        stamp(copy, from.pluginId);
         MsgEvent reply = to.exec.executeEXEC(copy);
         String callId = msg.getParam("callId-" + TestRig.REGION + "-" + TestRig.AGENT + "-" + from.pluginId);
         if (reply != null && callId != null && msg.getParams().containsKey("is_rpc")) {
-            from.plugin.receiveRPC(callId, reply);
+            // the reply travels back as the callee's message: infrastructure stamps the callee as its caller (the RPC
+            // layer takes a reply only from the plugin it called)
+            MsgEvent back = gson.fromJson(gson.toJson(reply), MsgEvent.class);
+            stamp(back, to.pluginId);
+            from.plugin.receiveRPC(callId, back);
         }
     }
 }

@@ -77,9 +77,14 @@ Every verb uses **one repository directory**: `scan_dir`, else `repo_dir`, else 
 1.3 hardening `putjar` used `repo_dir` with the relative default `filerepo`, so on a producer a jar landed in a stray
 `./filerepo` that was never scanned or served; filerepo logs a WARNING at start if such a directory exists.)
 
-Sync handshake: producer `discover` → consumer `subscribe` → producer sends `repolistin` (a page of the file diff,
-plus `repodeletes`) → consumer pulls each changed file with the producer's own `streamfile` **over the dataplane**,
-verifies it and moves it into place → consumer `repoconfirm`.
+**Sync protocol 2.** A producer broadcasts `discover` on the dataplane (anyone can write a dataplane message, so it is
+only an address); a consumer answers with `reposubscribe`, a MsgEvent to that address; the producer takes it only as
+a producer of the same `filerepo_name` speaking protocol 2 and answers `reposubscribed`; a consumer takes a producer
+only from that answer, and **both sides know each other by their stamped caller (`cresco_caller`), never by a
+message's source fields**. With `sync_producers` (an admin's comma list of `region/agent/pluginid`) a consumer
+subscribes to those producers only. Then the producer sends `repolistin` pages (files, plus `repodeletes`) → the
+consumer pulls each changed file with the producer's own `streamfile` **over the dataplane**, verifies it and moves it
+into place → `repoconfirm`.
 
 - **Over the dataplane, verified.** Only one small `streamfile` request per file crosses the control plane; the bytes
   ride the dataplane. Chunks are written at their `offset`; a range lost in transit is asked for again
@@ -87,25 +92,30 @@ verifies it and moves it into place → consumer `repoconfirm`.
   atomic rename from a `.filerepo-*.part` staging file) only when its SHA-384 equals the sender's terminal frame and
   its content hash equals the producer's offer; otherwise it is reported failed and offered again. The old path
   (controller `getfiledata` RPCs) is no longer used.
-- **Only from its producer.** A consumer takes a diff only from a producer it subscribed to (its `discover`), named by
-  the verified caller, never by a message's source fields; a producer takes a confirm only from a subscriber.
-- **Paged, not repeated.** A diff is sent in pages (`sync_diff_page` files, `sync_delete_page` deletes); a file that
-  was offered and is still being fetched is not offered again until `sync_offer_timeout_ms`.
-- **Late subscribers and cleared mirrors refill.** Sync state is one `insync` flag per file, so a file any
-  subscriber confirmed is not offered again. Each subscriber therefore advertises a *sync generation* in its subscribe
-  (new when it starts and after a clear); for a generation it has not completed, the producer sends that subscriber
-  alone every confirmed file again, `sync_full_pages_per_cycle` pages (of `sync_diff_page` files) per cycle. Files the
-  subscriber already holds are skipped by size and hash. (Before, a mirror that subscribed late, or was cleared, never
-  received the files others had already confirmed.)
-- **Deletes.** A file gone from the scan dir (or removed with `removefile`) becomes a *tombstone*, offered until a
-  subscriber confirms it and kept for `sync_tombstone_ttl_ms`. A consumer deletes its copy only if it holds exactly
-  the deleted content: a file landed there directly, or newer, is kept.
-- **Mass-delete guard.** A scan that finds the scan dir empty while the catalog is not (an unmounted volume looks like
-  this), or that would delete more than `sync_delete_guard_fraction` of the catalog and at least
-  `sync_delete_guard_min` files, holds the deletes: nothing is offered, the rows stay, `repostate` reports
-  `deletes_held`, the health check WARNs and `filerepo.sync.deletes.held` counts them, every cycle, until the files
-  return or an admin sends `releasedeletes` with `confirm=<the repository directory>`. A scan that could not read part
-  of the tree takes nothing for deleted.
+- **Per subscriber.** The producer keeps, for each subscriber, what it still needs (the catalog's `pending` and
+  `pendingdel` tables): this cycle's changes go to every subscriber at once, and what one subscriber failed, or a
+  subscriber that is new or was cleared (it advertises a new *sync generation*), is offered to that subscriber alone
+  until it confirms, `sync_pages_per_cycle` pages a cycle, read by a key cursor in path order so nothing slides past
+  while the catalog changes. A confirm settles only its own transfer: transfer ids carry the producer instance's
+  random epoch, and a transfer is bound to the subscriber it was offered to and to the file versions it offered.
+- **A mirror's own content is safe.** A consumer records which producer delivered which content under which name
+  (the catalog's `mirrored` table). Sync never overwrites a file landed there (`putfiles`, `putjar`), nor content that
+  is not that producer's, nor another producer's; it never deletes a file another producer still holds there; and a
+  name that collides with an existing one in case only (on a case-insensitive filesystem) is refused, never written or
+  deleted. A refusal is reported as a failed file and logged; `filerepo.sync.conflicts` counts them.
+- **Deletes.** A file gone from the scan dir (or removed with `removefile`) becomes a *tombstone*, pending for every
+  subscriber until it applies it, and kept for `sync_tombstone_ttl_ms` after. A consumer deletes its copy only if that
+  producer delivered exactly the deleted content and no other producer holds it.
+- **Mass-delete guard.** Held, never offered: every delete under a **mount point that vanished** (the scanner records
+  which directories of the tree sit on another device than their parent; one that is gone, or no longer a mount point,
+  was unmounted), everything gone when the scan dir itself changed device, every delete of a **whole subtree** that lost
+  all of its cataloged files (at least `sync_delete_guard_subtree_min`), and everything when the scan dir is empty or
+  the remaining loss is more than one file and more than `sync_delete_guard_fraction` (10%) of the catalog, however
+  small. The rows stay; `repostate` reports `deletes_held` and `deletes_hold_id`, the health check WARNs and
+  `filerepo.sync.deletes.held` counts them, every cycle, until the files return or an admin sends `releasedeletes`
+  with `confirm=<the repository directory>` (and, best, `hold_id`). A release is bound to the digest of exactly the
+  held set, spent by the next scan whatever that finds, and expires after `sync_release_ttl_ms`: it never releases a
+  later loss. A scan that could not read part of the tree takes nothing for deleted.
 - **Bounded.** A consumer keeps at most `sync_pending_per_peer` diffs per producer and `sync_max_peers` producers,
   on `sync_threads` threads with `sync_queue_max` waiting; past any bound a diff is refused as busy
   (`status_code 11`) and the producer offers it again next cycle.
@@ -301,9 +311,12 @@ are base64 in the reply. A refusal of the live-tier and clear rules is `status 9
 `realise`. `status 11` means the live-tier provider did not answer (absent, timed out or saturated): retry later.
 
 Roles (`@CrescoAction(roles=...)`, enforced by the agent before filerepo runs; see the controller's
-`docs/caller-authorization.md`): **`clearrepo`, `putjar`, `removefile`, `putfiles`, `putfilesremote` and
-`releasedeletes` need `infra` or `admin`**; `repolistin` and `repoconfirm` need `plugin` (another filerepo); every
-other action is open to callers of this agent's tenant and to `infra`. A refused call answers `status_code=403`.
+`docs/caller-authorization.md`): **`clearrepo`, `putjar`, `removefile`, `putfiles`, `putfilesremote`,
+`releasedeletes` and `liverealise` need `infra` or `admin`**; `repolistin`, `repoconfirm`, `reposubscribe` and
+`reposubscribed` need `plugin` (another filerepo); every other action is open to callers of this agent's tenant and to
+`infra`. Wherever filerepo itself needs to know who called (the owner of a transfer, an admin's `force`, a sync peer)
+it reads only the stamped caller; a message without one is anonymous only in explicit insecure development mode
+(`broker_security_enabled=false` given to the agent), and otherwise refused. A refused call answers `status_code=403`.
 
 | Action | Params | Returns | Purpose |
 |---|---|---|---|
@@ -313,17 +326,19 @@ other action is open to callers of this agent's tenant and to `infra`. A refused
 | `getjar` | `action_pluginname`, `action_pluginmd5` | `jardata` (bytes), `status` | Return a plugin jar by name + content hash (size-guarded). The bytes sent are rechecked against the hash. |
 | `putjar` *(infra/admin)* | `pluginname`, `jarfile`, `jardata` (bytes); optional `md5`, `version` | `uploaded`, `md5-confirm`, `sha384` | Store a plugin jar. **Accepted only if signed** by a signer chaining to `plugin_signing_truststore` (`refusal=signature` otherwise); the repo computes SHA-384 and the content hash itself; a supplied `md5` that differs is refused; `pluginname` must be the jar's `Bundle-SymbolicName`; `jarfile` is a plain name. Staged, then moved into place. |
 | `putfiles` *(infra/admin)* | `repo_name`, `file_hashes` (json: name → content hash, req), `overwrite` (bool) | `stored`, `unchanged`, `skipped`, `failed` (json) | Land pushed files (MsgEvent attachments), each verified before an atomic rename. `10` only when every file was stored or already held. |
-| `putfilesremote` *(infra/admin)* | `file_list` (json, req), `dst_region`, `dst_agent`, `dst_plugin`, `repo_name` | `status` | Push local files to another agent's repo, with their content hashes. |
+| `putfilesremote` *(infra/admin)* | — | `status 9`, `refusal=removed` | **Removed**: always refused (a path in a live-tier root is still refused as such first). An admin sends `putfiles` to the target repository directly. |
 | `streamfile` | `file_path`, `start_byte` (long), `byte_length` (long), `ident_key`, `ident_id`; optional `transfer_id`, `buffer_size` | `status`, `transfer_id` | Stream a byte-range over the dataplane in chunks, ending with a terminal frame. Any size. |
 | `streamfilecancel` | `transfer_id` | `status_code` | Cancel one of the caller's own transfers. |
 | `getscandir` | — | `scan_dir` | Report the configured scan directory. Refused on a live-backed repository. |
 | `removefile` *(infra/admin)* | `file_name`; optional `repo_name` | `status` | Remove a file (disk + catalog row), contained to the repository directory; on a producer, a delete for its subscribers. |
 | `clearrepo` *(infra/admin)* | `confirm` *(req)*; optional `repo_name`, `force` | `status`, `state`, `refusal` | Delete every file in the repository directory. An only copy needs `force=true` (admin). |
-| `releasedeletes` *(infra/admin)* | `confirm` *(req)* | `released` | Let the next scan offer the deletes the mass-delete guard holds. |
+| `releasedeletes` *(infra/admin)* | `confirm` *(req)*, optional `hold_id` | `released`, `hold_id` | Let the next scan record exactly the deletes the mass-delete guard holds (refused if `hold_id` names another set). |
 | `repostate` | — | `state`, `backing`, facts | What the repo is: `LIVE`, `WORKSPACE_CLEAN`, `WORKSPACE_DIRTY`, `MIRROR` or `ONLY_COPY`. |
 | `liverelay` | `request` (json, req) | `reply` (json), `reply_status` | Relay a request signed by its end user, unchanged, through the live-tier provider. |
-| `liverealise` | optional `lease_ms`, `request_id` | `job_id`, `reply_status` | Realise a live-backed repo's copy again, as the node (keeps it live). |
+| `liverealise` *(infra/admin)* | optional `lease_ms` (at most `live_lease_max_ms`), `request_id` | `job_id`, `reply_status` | Realise a live-backed repo's copy again, as the node (keeps it live). |
 | `repolistin` *(plugin)* | `repolistin` (json diff), optional `repodeletes` (json), `transfer_id` | `status_code` | Sync consumer side: `10` accepted, `9` not a subscribed producer, `11` busy. |
+| `reposubscribe` *(plugin)* | `filerepo_name`, `sync_gen`, `sync_proto` | — (answered with `reposubscribed`) | Sync protocol 2: a consumer asks a producer to serve it. |
+| `reposubscribed` *(plugin)* | `accepted`, `filerepo_name`, `sync_proto`, `refusal` | — | Sync protocol 2: a producer's answer. |
 | `repoconfirm` *(plugin)* | `transfer_id`, optional `failedfiles`, `faileddeletes` | — | Sync handshake ack (from a subscriber only). |
 | `getmetrics` | — | `metrics` (json) | Central metrics — `MeasurementEngine` gauges (see below). Folded into the controller's `getmetricinventory`. |
 | `getcapabilities` | — | `capabilities` (json) | Self-describing capability document (LLM tool specs). |
@@ -337,7 +352,8 @@ other plugin uses** (sysinfo is the reference), so metrics and health are consis
   `filerepo.active.transfers` (in-flight `streamfile` count, running and queued), `filerepo.transfer.queued`,
   `filerepo.transfer.rejected`, `filerepo.sync.queued`, `filerepo.sync.active`, `filerepo.sync.rejected`,
   `filerepo.sync.refused`, `filerepo.sync.fetched`, `filerepo.sync.failed`, `filerepo.sync.verify.failed`,
-  `filerepo.sync.deleted`, `filerepo.sync.tombstones` and `filerepo.sync.deletes.held` as gauges. The `getmetrics` action
+  `filerepo.sync.deleted`, `filerepo.sync.tombstones`, `filerepo.sync.deletes.held`, `filerepo.sync.conflicts` and
+  `filerepo.sync.subscribers` as gauges. The `getmetrics` action
   returns the standard `getAllMetrics()` JSON, which the controller's `getmetricinventory` fan-out
   aggregates across the mesh. Query one node with `getmetrics`, or the whole fabric with
   `getmetricinventory` (`action_scope=node|region|global`).
@@ -364,7 +380,8 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `instance_id` | *(unset)* | Optional repo instance identifier surfaced in listings. |
 | `max_inline_bytes` | `524288` (512 KB) | Max file size returned inline by `getfile`/`getjar`. Keep under the wss frame limit. |
 | `stream_buffer_size` | `262144` (256 KB) | Default streamfile chunk size (hard-capped at 768 KB). |
-| `transfer_threads` | `8` | Max concurrent streamfile transfers (bounded pool). |
+| `transfer_threads` | `16` | Max concurrent streamfile transfers (bounded pool). |
+| `transfer_caller_fraction` | `0.5` | The share of `transfer_threads` one caller's transfers may run on at once; its others wait, holding no thread. |
 | `transfer_queue_max` | `64` | Streamfile transfers waiting for a thread; beyond it, busy (`11`). |
 | `transfer_max_per_caller` | `16` | Streamfile transfers in flight (running or queued) per caller. |
 | `scan_batch_size` | `500` | Catalog rows written per transaction during a scan. |
@@ -373,14 +390,20 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_pending_per_peer` | `4` | Diffs waiting per producer. |
 | `sync_max_peers` | `256` | Producers syncing at once (and subscribers kept by a producer). |
 | `sync_diff_page` / `sync_delete_page` | `1000` / `1000` | Files / deletes per `repolistin` page. |
-| `sync_full_pages_per_cycle` | `8` | Pages of a full offer sent to a new (or cleared) subscriber per scan cycle. |
+| `sync_pages_per_cycle` | `8` | Pages a subscriber is offered per cycle beyond this cycle's changes (catch-up after a failure, a new or a cleared subscriber). `sync_full_pages_per_cycle` is the older name. |
+| `sync_producers` | *(unset)* | A consumer's pinned producers (`region/agent/pluginid`, comma-separated): it subscribes to no other. Unset: any plugin that answers as a producer of its `filerepo_name`. |
+| `sync_subscribe_retry_ms` | `10000` | A consumer asks one producer at most this often. |
+| `sync_peer_ttl_ms` | `3600000` | A subscriber (at a producer) or producer (at a consumer) not heard from for this long is forgotten, with what it had pending. |
 | `sync_offer_timeout_ms` | `600000` | An offered file is not offered again for this long unless confirmed or failed. |
 | `sync_stream_buffer` | `262144` | Chunk size a consumer asks for (4 KB - 768 KB). |
 | `sync_stream_idle_ms` | `30000` | A transfer with no frame for this long is cancelled and retried. |
 | `sync_stream_rounds` | `3` | Attempts per file, and rounds of re-requesting lost ranges. |
 | `sync_rpc_timeout_ms` | `30000` | Bound on a sync request (`repolistin`, `streamfile`). |
 | `sync_tombstone_ttl_ms` | `604800000` (7 days) | How long a confirmed delete is kept. |
-| `sync_delete_guard_min` / `sync_delete_guard_fraction` | `100` / `0.25` | The mass-delete guard (see Operating modes). |
+| `sync_delete_guard_fraction` | `0.10` | The mass-delete guard: a loss of more than one file and more than this fraction of the catalog is held. |
+| `sync_delete_guard_subtree_min` | `2` | A whole subtree that lost all its cataloged files, at least this many, is held. |
+| `sync_release_ttl_ms` | `600000` | How long an admin's release waits for the scan that applies it. |
+| `live_lease_max_ms` | `86400000` | The longest lease `liverealise` may ask for. |
 | `putfiles_require_hashes` | `true` | `putfiles` refuses a file without an expected hash. |
 | `plugin_signing_truststore` | *(agent setting)* | The trust store `putjar` jars must chain to (the agent's plugin-signing policy; without one every jar is refused). |
 | `plugin_signing_required` | `true` *(agent setting)* | `false` lets unsigned jars through — development only, logged as a WARNING at start. |
@@ -401,6 +424,11 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
   are bound parameters, so a path containing a quote can neither corrupt a query nor inject.
 - **Path traversal** — `putjar`, `getjar`, and `removefile` resolve names through a canonical-path
   containment check; a `../..` name that escapes the repo dir is refused.
+- **Descriptor-relative opens** — where the platform has them (`SecureDirectoryStream`: Linux), `getfile` and
+  `streamfile` open every directory from the repository root down, and the file, by descriptor without following a
+  link; elsewhere the file is opened without following a final link and checked by path around the open.
+- **Only verified jars** — `repolist` and `getjar` consider only `*.jar` files, and list and serve only those that
+  pass the agent's signing policy, however they reached the directory (verified once per size, mtime and file key).
 - **Arbitrary-read protection** — `getfile` only serves files present in the catalog (i.e. under the
   configured scan/repo dir); it cannot be used to read arbitrary files on the host.
 - **Memory safety** — inline `getfile`/`getjar` are size-capped (`max_inline_bytes`); large files
@@ -495,9 +523,17 @@ What an operator sees change, and what to do:
 - **Roles.** `clearrepo`, `putjar`, `removefile`, `putfiles`, `putfilesremote` and `releasedeletes` now need the
   `infra` or `admin` role; `repolistin` and `repoconfirm` need `plugin`. A refused call answers `status_code=403`.
   With security explicitly off (development) the caller is `anonymous` with every role and nothing changes.
-- **`putfilesremote` across agents.** The push arrives at the remote filerepo as `putfiles` from a *plugin* caller,
-  which the contract does not allow to land files. Until the controller carries the originating admin across, push
-  with `putfiles` directly as an admin, or use watched-directory sync.
+- **`putfilesremote` is removed** (it read any file on the agent and relayed it): it is always refused. An admin
+  sends `putfiles` to the target repository directly.
+- **Sync protocol 2.** Producers and consumers must both be this version: a consumer refuses a producer whose
+  `discover` carries no `sync_proto=2`, and a producer refuses (and logs) a protocol 1 subscribe, each saying why.
+  Upgrade every filerepo of a `filerepo_name` together. Sync identities come from the stamped caller only: on an agent
+  whose controller does not stamp callers yet, sync works only in explicit insecure mode
+  (`broker_security_enabled=false`). Pin producers with `sync_producers` where possible.
+- **A mirror's existing files.** A consumer adopts a file it already holds when the producer offers exactly that
+  content; a file it holds with other content and no record of the producer delivering it is never overwritten (a
+  sync conflict, logged and counted): move or remove such files once after upgrading.
+- **`streamfile`, `streamfilecancel` and `clearrepo force`** need a verified caller (or insecure mode).
 - **`clearrepo`** needs `confirm=<the repository directory>` exactly (its `scan_dir`, or `repo_dir` when it has
   none); `repo_name` must name this repository if given; `force=true` needs `admin`; protected directories and live
   roots are never cleared. Scripts that cleared with just `repo_name` must add `confirm`.
@@ -508,21 +544,24 @@ What an operator sees change, and what to do:
 - **Repository directory.** With neither `scan_dir` nor `repo_dir` configured the repository is
   `<plugin data dir>/repo`, no longer the relative `./filerepo`. Move anything landed there before (filerepo logs a
   WARNING naming both paths). On a producer, `putjar` now lands in `scan_dir`, so the jar is scanned and synced.
-- **`putfiles`** requires `file_hashes` (file name → content hash); `putfilesremote` sends it. A file that already
+- **`putfiles`** requires `file_hashes` (file name → content hash). The source is copied, never moved, and deleted only after it landed and only when it is a transfer file of the agent's dataplane journal. A file that already
   exists with other content and `overwrite=false` is reported `skipped` with `status 9` (it used to be `10`).
   `putfiles_require_hashes=false` restores landing without hashes.
 - **Sync** now moves file bytes over the dataplane with the producer's `streamfile`; the controller's `getfiledata`
   is no longer used (and no longer needs `file_access_roots` for filerepo). Producer and consumer must both be this
   version: an older consumer asks for `getfiledata`, an older producer sends no terminal frame.
 - **Deletes now propagate.** A file removed from a producer's scan dir (or with `removefile`) is deleted on its
-  subscribers if they still hold that exact content. The mass-delete guard holds an emptied scan dir or a large
-  fraction of deletes; release it with `releasedeletes` once intended. Check `repostate` (`deletes_held`) after an
-  upgrade if the scan dir changed while filerepo was down.
+  subscribers if they still hold that exact content from that producer. The mass-delete guard holds a vanished mount,
+  a whole lost subtree, an emptied scan dir and any loss over 10% of the catalog; release it with `releasedeletes`
+  (`hold_id` from `repostate`) once intended. Check `repostate` (`deletes_held`) after an upgrade if the scan dir changed
+  while filerepo was down.
 - **`streamfile`**: `transfer_id` is optional and validated; `ident_key` must be a property name; chunks carry
   `offset`; every transfer ends with an empty terminal frame (`transfer_end=true`, `sha384` on success). A client that
   counts frames should skip the terminal one (it carries no payload). Busy is `status 11`.
-- **Symbolic links in a scan dir are no longer followed** (`scan_follow_links=true` restores it), and a file is
-  served only from inside the repository directory.
+- **Symbolic links in a scan dir are no longer followed** (`scan_follow_links=true` restores it); a scan dir that is
+  itself a link is followed. A file is served only from inside the repository directory.
+- **`liverealise`** needs `infra` or `admin`, and `lease_ms` at most `live_lease_max_ms`.
+- **`repolist`/`getjar`** list and serve only signature-verified `*.jar` files.
 - **New metrics** (`filerepo.transfer.*`, `filerepo.sync.*`) and a health WARN while deletes are held.
 
 ## Testing

@@ -206,7 +206,7 @@ class RepositoryHardeningTest {
         assertEquals("9", stale.getParam("status"), "never served under its old hash");
         assertNull(stale.getDataParam("jardata"));
         String relisted = rig.call("repolist").getCompressedParam("repolist");
-        assertTrue(relisted.contains(Hashes.content(changed)), "listed again under the hash of what it now holds");
+        assertFalse(relisted.contains("example.jar"), "changed in place, it no longer verifies: it is listed no more");
     }
 
     // ------------------------------------------------------------------ putfiles (FR-D10)
@@ -254,21 +254,17 @@ class RepositoryHardeningTest {
     }
 
     @Test
-    void putfilesremoteSendsTheHashesAndRefusesTwoFilesOfOneName() throws Exception {
+    void putfilesremoteIsRemovedAndReadsNothing() throws Exception {
         onDemand();
         Path a = Files.write(tmp.resolve("a.txt"), "alpha".getBytes());
-        Path other = Files.write(Files.createDirectories(tmp.resolve("x")).resolve("a.txt"), "other".getBytes());
-        MsgEvent m = TestRig.request("putfilesremote", "dst_region", "r2", "dst_agent", "a2", "dst_plugin", "p2", "repo_name", "fr");
+        MsgEvent m = TestRig.as(TestRig.request("putfilesremote", "dst_region", "r2", "dst_agent", "a2", "dst_plugin", "p2",
+                "repo_name", "fr"), "admin");
         m.setCompressedParam("file_list", gson.toJson(List.of(a.toString())));
-        assertEquals("10", rig.call(m).getParam("status"));
-        MsgEvent sent = rig.sent.get(0);
-        assertEquals("putfiles", sent.getParam("action"));
-        assertEquals(gson.toJson(Map.of("a.txt", Hashes.content("alpha".getBytes()))), sent.getCompressedParam("file_hashes"));
-
-        MsgEvent dup = TestRig.request("putfilesremote", "dst_region", "r2", "dst_agent", "a2", "dst_plugin", "p2", "repo_name", "fr");
-        dup.setCompressedParam("file_list", gson.toJson(List.of(a.toString(), other.toString())));
-        assertEquals("8", rig.call(dup).getParam("status"));
-        assertEquals(1, rig.sent.size());
+        MsgEvent r = rig.call(m);
+        assertEquals("9", r.getParam("status"));
+        assertEquals("removed", r.getParam("refusal"));
+        assertTrue(r.getParam("status_desc").contains("putfiles"), "the caller is told where to go: " + r.getParam("status_desc"));
+        assertTrue(rig.sent.isEmpty(), "nothing is relayed");
     }
 
     // ------------------------------------------------------------------ clearrepo (FR-D2)
@@ -365,6 +361,38 @@ class RepositoryHardeningTest {
         MsgEvent r = clear("confirm", tmp.resolve("not-yet").toString());
         assertEquals("10", r.getParam("status"), r.getParams().toString());
         assertFalse(r.getParam("status_desc").contains(tmp.toString()), "no path in the reply");
+    }
+
+    @Test
+    void aClearThatCannotDeleteEverythingRenewsTheGenerationFirstAndGoesOn() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put("filerepo_name", "fr");
+        cfg.put("repo_dir", Files.createDirectories(repo).toString());
+        rig = new TestRig(tmp.resolve("agent"), cfg, null);     // a mirror
+        for (int i = 0; i < 10; i++) Files.write(repo.resolve("m" + i + ".txt"), ("m" + i).getBytes());
+        Path locked = Files.createDirectories(repo.resolve("locked"));
+        Files.write(locked.resolve("inside.txt"), "x".getBytes());
+        String gen = rig.repo.getSyncGen();
+        MsgEvent r;
+        try {
+            assertTrue(locked.toFile().setReadable(false) && locked.toFile().setExecutable(false));
+            r = clear("confirm", repo.toString());
+        } finally {
+            locked.toFile().setReadable(true);
+            locked.toFile().setExecutable(true);
+        }
+        assertEquals("10", r.getParam("status"), r.getParams().toString());
+        assertTrue(r.getParam("status_desc").contains("could not be deleted"), r.getParam("status_desc"));
+        for (int i = 0; i < 10; i++) assertFalse(Files.exists(repo.resolve("m" + i + ".txt")), "it went on past the unreadable directory");
+        assertNotEquals(gen, rig.repo.getSyncGen(), "a new generation: whatever was deleted is offered again");
+        // and when it throws partway, the generation was renewed before the first delete
+        Files.write(repo.resolve("again.txt"), "again".getBytes());
+        String gen2 = rig.repo.getSyncGen();
+        rig.repo.afterClearCheck = () -> { throw new IllegalStateException("simulated failure partway"); };
+        MsgEvent failed = clear("confirm", repo.toString());
+        rig.repo.afterClearCheck = null;
+        assertNotEquals("10", failed.getParam("status"));
+        assertNotEquals(gen2, rig.repo.getSyncGen(), "renewed before anything was deleted, even by a clear that fails");
     }
 
     // ------------------------------------------------------------------ batched catalog writes (FR-D8)

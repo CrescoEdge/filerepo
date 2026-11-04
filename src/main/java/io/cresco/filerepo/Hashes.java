@@ -51,6 +51,37 @@ final class Hashes {
         return new String[]{hex(c.digest()), hex(s.digest())};
     }
 
+    /**
+     * The content hash of a file (the catalog's "md5"), lowercase hex; null when it cannot be read. filerepo's own:
+     * the library's getMD5 takes a path containing '!' for a classpath resource and never hashes such a file.
+     */
+    static String content(Path file) {
+        MessageDigest c = content();
+        byte[] buf = new byte[1 << 16];
+        try (InputStream in = Files.newInputStream(file)) {
+            int n;
+            while ((n = in.read(buf)) != -1) c.update(buf, 0, n);
+            return hex(c.digest());
+        } catch (IOException | RuntimeException ex) {
+            return null;
+        }
+    }
+
+    /** SHA-384 of a file, lowercase hex. */
+    static String sha384(Path file) throws IOException {
+        MessageDigest s = sha384();
+        byte[] buf = new byte[1 << 16];
+        try (InputStream in = Files.newInputStream(file)) {
+            int n;
+            while ((n = in.read(buf)) != -1) s.update(buf, 0, n);
+        }
+        return hex(s.digest());
+    }
+
+    static String sha384(byte[] data) {
+        return hex(sha384().digest(data));
+    }
+
     /** The content hash of bytes in memory, lowercase hex. */
     static String content(byte[] data) {
         return hex(content().digest(data));

@@ -105,10 +105,11 @@ class NonLiveRepositoryTest {
 
         // streamfile: range checks as before (the transfer itself runs on the dataplane, not here)
         String lp = landed.toAbsolutePath().toString();
-        assertEquals("8", rig.call("streamfile", "file_path", lp, "start_byte", "0", "byte_length", "999",
-                "transfer_id", "t", "ident_key", "k", "ident_id", "i").getParam("status"));
-        assertEquals("10", rig.call("streamfile", "file_path", lp, "start_byte", "0", "byte_length", "4",
-                "transfer_id", "t", "ident_key", "k", "ident_id", "i").getParam("status"));
+        // (1.3 hardening: a transfer belongs to its verified caller, so the requests carry an infrastructure stamp)
+        assertEquals("8", rig.call(TestRig.as(TestRig.request("streamfile", "file_path", lp, "start_byte", "0", "byte_length", "999",
+                "transfer_id", "t", "ident_key", "k", "ident_id", "i"), "user")).getParam("status"));
+        assertEquals("10", rig.call(TestRig.as(TestRig.request("streamfile", "file_path", lp, "start_byte", "0", "byte_length", "4",
+                "transfer_id", "t", "ident_key", "k", "ident_id", "i"), "user")).getParam("status"));
 
         // getrepofilelist: the catalog, paged
         MsgEvent list = rig.call("getrepofilelist", "repo_name", "fr", "limit", "1", "offset", "0");

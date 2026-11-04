@@ -51,15 +51,18 @@ class AuthorizationTest {
         // added by filerepo: pushing local files anywhere, and releasing held deletes
         assertEquals(privileged, roles.get("putfilesremote"));
         assertEquals(privileged, roles.get("releasedeletes"));
+        // a lease extension as the node itself
+        assertEquals(privileged, roles.get("liverealise"));
         // sync messages come from another filerepo
-        assertEquals(Set.of("plugin"), roles.get("repolistin"));
-        assertEquals(Set.of("plugin"), roles.get("repoconfirm"));
+        for (String sync : new String[]{"repolistin", "repoconfirm", "reposubscribe", "reposubscribed"}) {
+            assertEquals(Set.of("plugin"), roles.get(sync), sync);
+        }
         // everything else: the default (same tenant, and infra)
         for (String open : new String[]{"repolist", "getrepofilelist", "getfile", "getjar", "streamfile",
-                "streamfilecancel", "getscandir", "repostate", "liverelay", "liverealise", "getmetrics", "getcapabilities"}) {
+                "streamfilecancel", "getscandir", "repostate", "liverelay", "getmetrics", "getcapabilities"}) {
             assertEquals(Set.of(), roles.get(open), open);
         }
-        assertEquals(20, roles.size(), "every action is declared: " + roles.keySet());
+        assertEquals(22, roles.size(), "every action is declared: " + roles.keySet());
     }
 
     @Test
@@ -86,7 +89,7 @@ class AuthorizationTest {
         api.setCompressedParam("repolistin", "{}");
         MsgEvent r = rig.call(api);
         assertEquals("9", r.getParam("status_code"));
-        assertTrue(r.getParam("status_desc").contains("not api:"), r.getParam("status_desc"));
+        assertTrue(r.getParam("status_desc").contains("verified filerepo plugin caller"), r.getParam("status_desc"));
 
         // the real producer, verified, is accepted
         MsgEvent real = new MsgEvent(MsgEvent.Type.EXEC, TestRig.REGION, TestRig.AGENT, "anything",
@@ -107,11 +110,17 @@ class AuthorizationTest {
         rig = new TestRig(tmp.resolve("agent"), cfg, null);
         MsgEvent a = TestRig.as(TestRig.request("x"), "user");
         MsgEvent b = TestRig.request("x");
-        assertEquals("api:tenant-a/operator", Callers.key(a));
-        assertEquals("src:" + TestRig.REGION + "/" + TestRig.AGENT + "/caller", Callers.key(b), "no stamp: the source");
+        assertEquals("api:tenant-a/operator", Callers.key(a, false));
+        assertNull(Callers.key(b, false), "no stamp, secure: no caller (the source fields are never an identity)");
+        assertNull(Callers.plugin(b, false));
+        assertEquals("anonymous:" + TestRig.REGION + "/" + TestRig.AGENT + "/caller", Callers.key(b, true),
+                "no stamp in explicit insecure mode: anonymous");
+        assertTrue(Callers.hasRole(b, "admin", true), "insecure mode: every role");
+        assertFalse(Callers.hasRole(b, "admin", false));
         MsgEvent forged = TestRig.request("x");
         forged.setParam(Callers.PARAM_CALLER, "not a principal");
         forged.setParam(Callers.PARAM_ROLES, "admin");
-        assertFalse(Callers.hasRole(forged, "admin"), "a malformed stamp grants nothing");
+        assertFalse(Callers.hasRole(forged, "admin", false), "a malformed stamp grants nothing");
+        assertFalse(Callers.hasRole(forged, "admin", true), "not even in insecure mode: a malformed stamp is never trusted");
     }
 }
