@@ -28,6 +28,8 @@ public class DBEngine {
     private ObjectPool<PoolableConnection> connectionPool;
     private PoolingDataSource<PoolableConnection> dataSource;
     private File dbsource;
+    /** Transactions committed by the batched writers (tests: FR-D8 writes a scan in few commits, not one per file). */
+    final java.util.concurrent.atomic.AtomicLong batchCommits = new java.util.concurrent.atomic.AtomicLong();
 
     public DBEngine(PluginBuilder plugin) {
 
@@ -116,9 +118,331 @@ public class DBEngine {
             if (!metaExists) {
                 initMeta();
             }
+            boolean tombExists;
+            try (ResultSet rs = conn.getMetaData().getTables(null, null, "TOMBSTONE", null)) {
+                tombExists = rs.next();
+            }
+            if (!tombExists) {
+                initTombstones();
+            }
         } catch (Exception ex) {
             logger.error("ensureSchema error", ex);
         }
+    }
+
+    /**
+     * TOMBSTONE holds the files a producer's scanner found deleted (FR-D4): each is offered to the subscribers as a
+     * delete until one confirms it (insync=1), then kept until it ages out, so the delete is not lost while a subscriber
+     * is away. Its own table, so the FILELIST of an existing catalog needs no migration.
+     */
+    private void initTombstones() {
+        String create = "CREATE TABLE tombstone" +
+                "(" +
+                "   filepath varchar(1000) primary key NOT NULL," +
+                "   filename varchar(1000) NOT NULL," +
+                "   md5 varchar(255)," +
+                "   deleted_at bigint NOT NULL," +
+                "   insync int NOT NULL" +
+                ")";
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate(create);
+        } catch (Exception ex) {
+            logger.error("initTombstones error", ex);
+        }
+    }
+
+    /** A catalog row as the scanner writes it. */
+    static final class Row {
+        final String filepath;
+        final String md5;
+        final long lastmodified;
+        final long filesize;
+
+        Row(String filepath, String md5, long lastmodified, long filesize) {
+            this.filepath = filepath;
+            this.md5 = md5;
+            this.lastmodified = lastmodified;
+            this.filesize = filesize;
+        }
+    }
+
+    /** A deleted file: its catalog path, the name a subscriber holds it under, and the content it had. */
+    static final class Tombstone {
+        final String filepath;
+        final String filename;
+        final String md5;
+        final long deletedAt;
+
+        Tombstone(String filepath, String filename, String md5, long deletedAt) {
+            this.filepath = filepath;
+            this.filename = filename;
+            this.md5 = md5;
+            this.deletedAt = deletedAt;
+        }
+    }
+
+    /**
+     * Write a scan's new and changed rows (FR-D8): batched statements, one commit per {@code batchSize} rows, instead
+     * of one forced log write per file. A new or changed file is no longer deleted, so its tombstone (if any) goes in
+     * the same transaction. A batch that fails is rolled back and written row by row, so one bad row costs only itself.
+     * Returns the number of rows written.
+     */
+    public int applyScan(List<Row> adds, List<Row> updates, int batchSize) {
+        int written = 0;
+        int size = Math.max(1, batchSize);
+        for (int from = 0; from < adds.size(); from += size) {
+            written += writeChunk(adds.subList(from, Math.min(adds.size(), from + size)), true);
+        }
+        for (int from = 0; from < updates.size(); from += size) {
+            written += writeChunk(updates.subList(from, Math.min(updates.size(), from + size)), false);
+        }
+        return written;
+    }
+
+    private int writeChunk(List<Row> rows, boolean insert) {
+        if (rows.isEmpty()) return 0;
+        String upsert = insert
+                ? "insert into filelist (filepath, md5, insync, lastmodified, filesize) values (?,?,?,?,?)"
+                : "UPDATE filelist SET md5=?, insync=?, filesize=?, lastmodified=? WHERE filepath=?";
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(upsert);
+                 PreparedStatement untomb = conn.prepareStatement("DELETE FROM tombstone WHERE filepath=?")) {
+                for (Row r : rows) {
+                    bindRow(ps, r, insert);
+                    ps.addBatch();
+                    untomb.setString(1, r.filepath);
+                    untomb.addBatch();
+                }
+                ps.executeBatch();
+                untomb.executeBatch();
+                conn.commit();
+                batchCommits.incrementAndGet();
+                return rows.size();
+            } catch (SQLException batchFailed) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.warn("catalog batch of " + rows.size() + " failed (" + batchFailed.getMessage() + "); writing row by row");
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("catalog batch error", ex);
+        }
+        int written = 0;
+        for (Row r : rows) {
+            if (insert) {
+                if (addFileRow(r)) written++;
+            } else if (updateFile(r.filepath, r.md5, 0, r.lastmodified, r.filesize) > 0) {
+                deleteTombstone(r.filepath);
+                written++;
+            }
+        }
+        return written;
+    }
+
+    private static void bindRow(PreparedStatement ps, Row r, boolean insert) throws SQLException {
+        if (insert) {
+            ps.setString(1, r.filepath);
+            ps.setString(2, r.md5);
+            ps.setInt(3, 0);
+            ps.setString(4, String.valueOf(r.lastmodified));
+            ps.setString(5, String.valueOf(r.filesize));
+        } else {
+            ps.setString(1, r.md5);
+            ps.setInt(2, 0);
+            ps.setString(3, String.valueOf(r.filesize));
+            ps.setString(4, String.valueOf(r.lastmodified));
+            ps.setString(5, r.filepath);
+        }
+    }
+
+    private boolean addFileRow(Row r) {
+        String sql = "insert into filelist (filepath, md5, insync, lastmodified, filesize) values (?,?,?,?,?)";
+        try (Connection conn = ds.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            bindRow(ps, r, true);
+            ps.executeUpdate();
+            deleteTombstone(r.filepath);
+            return true;
+        } catch (Exception ex) {
+            logger.error("addFile error for " + r.filepath, ex);
+            return false;
+        }
+    }
+
+    /**
+     * Record deleted files (FR-D4): each catalog row goes and a tombstone takes its place (insync=0, to be offered), in
+     * one transaction per {@code batchSize}. Returns the number recorded.
+     */
+    public int tombstone(List<Tombstone> deleted, int batchSize) {
+        int done = 0;
+        int size = Math.max(1, batchSize);
+        for (int from = 0; from < deleted.size(); from += size) {
+            List<Tombstone> chunk = deleted.subList(from, Math.min(deleted.size(), from + size));
+            try (Connection conn = ds.getConnection()) {
+                conn.setAutoCommit(false);
+                try (PreparedStatement drop = conn.prepareStatement("DELETE FROM filelist WHERE filepath=?");
+                     PreparedStatement clear = conn.prepareStatement("DELETE FROM tombstone WHERE filepath=?");
+                     PreparedStatement add = conn.prepareStatement(
+                             "INSERT INTO tombstone (filepath, filename, md5, deleted_at, insync) VALUES (?,?,?,?,0)")) {
+                    for (Tombstone t : chunk) {
+                        drop.setString(1, t.filepath);
+                        drop.addBatch();
+                        clear.setString(1, t.filepath);
+                        clear.addBatch();
+                        add.setString(1, t.filepath);
+                        add.setString(2, t.filename);
+                        add.setString(3, t.md5);
+                        add.setLong(4, t.deletedAt);
+                        add.addBatch();
+                    }
+                    drop.executeBatch();
+                    clear.executeBatch();
+                    add.executeBatch();
+                    conn.commit();
+                    batchCommits.incrementAndGet();
+                    done += chunk.size();
+                } catch (SQLException ex) {
+                    try { conn.rollback(); } catch (SQLException ignore) { }
+                    logger.error("tombstone batch failed: " + ex.getMessage());
+                } finally {
+                    try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+                }
+            } catch (Exception ex) {
+                logger.error("tombstone error", ex);
+            }
+        }
+        return done;
+    }
+
+    /** Tombstones no subscriber has confirmed (insync=0), oldest first, at most {@code limit}. */
+    public List<Tombstone> getTombstonesNotInSync(int limit) {
+        List<Tombstone> out = new ArrayList<>();
+        String sql = "SELECT filepath, filename, md5, deleted_at FROM tombstone WHERE insync = 0 ORDER BY deleted_at"
+                + " FETCH FIRST ? ROWS ONLY";
+        try (Connection conn = ds.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, Math.max(1, limit));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(new Tombstone(rs.getString(1), rs.getString(2), rs.getString(3), rs.getLong(4)));
+                }
+            }
+        } catch (Exception ex) {
+            logger.error("getTombstonesNotInSync error", ex);
+        }
+        return out;
+    }
+
+    /** Count of tombstones (both offered and confirmed). */
+    public long getTombstoneCount() {
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM tombstone")) {
+            return rs.next() ? rs.getLong(1) : 0L;
+        } catch (Exception ex) {
+            logger.error("getTombstoneCount error", ex);
+            return 0L;
+        }
+    }
+
+    /** A subscriber applied these deletes: mark them insync=1 (only a tombstone for that same content). */
+    public int confirmTombstones(List<Tombstone> confirmed) {
+        if (confirmed.isEmpty()) return 0;
+        String sql = "UPDATE tombstone SET insync = 1 WHERE filepath = ? AND deleted_at = ?";
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (Tombstone t : confirmed) {
+                    ps.setString(1, t.filepath);
+                    ps.setLong(2, t.deletedAt);
+                    ps.addBatch();
+                }
+                int n = 0;
+                for (int c : ps.executeBatch()) n += Math.max(0, c);
+                conn.commit();
+                return n;
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("confirmTombstones failed: " + ex.getMessage());
+                return 0;
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("confirmTombstones error", ex);
+            return 0;
+        }
+    }
+
+    /** Forget confirmed tombstones deleted before {@code before} (epoch ms). Returns how many went. */
+    public int purgeTombstones(long before) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM tombstone WHERE insync = 1 AND deleted_at < ?")) {
+            ps.setLong(1, before);
+            return ps.executeUpdate();
+        } catch (Exception ex) {
+            logger.error("purgeTombstones error", ex);
+            return 0;
+        }
+    }
+
+    public int deleteTombstone(String filepath) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM tombstone WHERE filepath = ?")) {
+            ps.setString(1, filepath);
+            return ps.executeUpdate();
+        } catch (Exception ex) {
+            logger.error("deleteTombstone error for " + filepath, ex);
+            return -1;
+        }
+    }
+
+    /**
+     * A subscriber confirmed it holds these files: insync=1, but only where the catalog still holds the content that
+     * was offered. A file changed since the offer keeps insync=0 and is offered again; the old code wrote the offered
+     * md5 and mtime back over the newer ones.
+     */
+    public int confirmFiles(List<Row> confirmed) {
+        if (confirmed.isEmpty()) return 0;
+        String sql = "UPDATE filelist SET insync = 1 WHERE filepath = ? AND md5 = ?";
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (Row r : confirmed) {
+                    ps.setString(1, r.filepath);
+                    ps.setString(2, r.md5);
+                    ps.addBatch();
+                }
+                int n = 0;
+                for (int c : ps.executeBatch()) n += Math.max(0, c);
+                conn.commit();
+                return n;
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("confirmFiles failed: " + ex.getMessage());
+                return 0;
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("confirmFiles error", ex);
+            return 0;
+        }
+    }
+
+    /** Every tombstone, for tests and diagnostics. */
+    List<Tombstone> getTombstones() {
+        List<Tombstone> out = new ArrayList<>();
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT filepath, filename, md5, deleted_at, insync FROM tombstone")) {
+            while (rs.next()) {
+                out.add(new Tombstone(rs.getString(1), rs.getString(2), rs.getString(3), rs.getLong(4)));
+            }
+        } catch (Exception ex) {
+            logger.error("getTombstones error", ex);
+        }
+        return out;
     }
 
     /**
@@ -230,20 +554,17 @@ public class DBEngine {
     // Derby cache the query plan across the per-file scan loop.
 
     public void addFile(String filepath, String md5, long lastmodified, long filesize) {
-        String sql = "insert into filelist (filepath, md5, insync, lastmodified, filesize) values (?,?,?,?,?)";
-        try (Connection conn = ds.getConnection()) {
-            conn.setAutoCommit(false);
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setString(1, filepath);
-                ps.setString(2, md5);
-                ps.setInt(3, 0);
-                ps.setString(4, String.valueOf(lastmodified));
-                ps.setString(5, String.valueOf(filesize));
-                ps.executeUpdate();
-                conn.commit();
-            }
-        } catch(Exception ex) {
-            logger.error("addFile error for " + filepath, ex);
+        addFileRow(new Row(filepath, md5, lastmodified, filesize));
+    }
+
+    /**
+     * Insert or replace one row (a landing that overwrote a cataloged file). insync=0: the new content is offered.
+     */
+    public void upsertFile(String filepath, String md5, long lastmodified, long filesize) {
+        if (updateFile(filepath, md5, 0, lastmodified, filesize) > 0) {
+            deleteTombstone(filepath);
+        } else {
+            addFile(filepath, md5, lastmodified, filesize);
         }
     }
 

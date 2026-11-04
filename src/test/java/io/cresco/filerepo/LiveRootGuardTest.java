@@ -134,7 +134,9 @@ class LiveRootGuardTest {
             assertEquals("live-root", streamed.getParam("refusal"), p.toString());
         }
         // and a clear forgets them without deleting them: only the provider's own drop removes a live file
-        assertEquals("10", rig.call("clearrepo", "repo_name", "fr", "force", "true").getParam("status"));
+        MsgEvent clear = TestRig.as(TestRig.request("clearrepo", "repo_name", "fr", "force", "true",
+                "confirm", rig.repo.repoDirFile().getAbsolutePath()), "admin");
+        assertEquals("10", rig.call(clear).getParam("status"));
         assertEquals(0, rig.repo.getRepoCount());
         assertTrue(Files.exists(secret));
     }
@@ -209,7 +211,10 @@ class LiveRootGuardTest {
         Map<String, Object> cfg = new HashMap<>();
         cfg.put("filerepo_name", "fr");
         cfg.put("repo_dir", mirror.toString());
+        cfg.put("sync_rpc_timeout_ms", "200");
         rig(cfg);
+        // the request comes from a producer this mirror subscribed to (its discover)
+        rig.repo.rememberProducer(TestRig.REGION, TestRig.AGENT, "caller");
         Map<String, FileObject> diff = new LinkedHashMap<>();
         diff.put("/remote/new.txt", new FileObject("into/tenant-a/new.txt", "abc", "/remote/new.txt", 1L, 3L));
         diff.put("/remote/plain.txt", new FileObject("plain.txt", "def", "/remote/plain.txt", 1L, 3L));
@@ -218,13 +223,15 @@ class LiveRootGuardTest {
         assertEquals("10", rig.call(in).getParam("status_code"));
 
         long deadline = System.currentTimeMillis() + 10_000;
-        while (rig.sent.isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(25);
-        assertEquals(1, rig.sent.size(), "the updater confirmed");
-        MsgEvent confirm = rig.sent.get(0);
-        assertEquals("repoconfirm", confirm.getParam("action"));
+        while (rig.sent.stream().noneMatch(m -> "repoconfirm".equals(m.getParam("action")))
+                && System.currentTimeMillis() < deadline) Thread.sleep(25);
+        MsgEvent confirm = rig.sent.stream().filter(m -> "repoconfirm".equals(m.getParam("action"))).findFirst().orElse(null);
+        assertNotNull(confirm, "the updater confirmed");
         String failed = confirm.getCompressedParam("failedfiles");
         assertTrue(failed.contains("/remote/new.txt"), failed);
-        assertEquals(List.of("/remote/plain.txt"), rig.downloads, "nothing was fetched through the link");
+        List<String> fetched = new java.util.ArrayList<>();
+        for (MsgEvent m : rig.sent) if ("streamfile".equals(m.getParam("action"))) fetched.add(m.getParam("file_path"));
+        assertEquals(List.of("/remote/plain.txt"), fetched, "nothing was fetched through the link");
         assertFalse(Files.exists(root.resolve("tenant-a/new.txt")));
     }
 

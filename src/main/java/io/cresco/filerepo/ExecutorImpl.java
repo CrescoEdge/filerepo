@@ -2,6 +2,7 @@ package io.cresco.filerepo;
 
 import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
+import io.cresco.library.data.DataPlaneService;
 import io.cresco.library.data.TopicType;
 import io.cresco.library.messaging.MsgEvent;
 import io.cresco.library.metrics.CMetric;
@@ -14,17 +15,29 @@ import jakarta.jms.BytesMessage;
 import jakarta.jms.DeliveryMode;
 
 import java.io.File;
-import java.io.RandomAccessFile;
+import java.io.IOException;
 import java.lang.reflect.Type;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
 import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.jar.JarFile;
+import java.util.regex.Pattern;
 
 import io.cresco.library.capability.*;
 
@@ -48,47 +61,77 @@ import io.cresco.library.capability.*;
     @CrescoAction(name = "getjar", type = "EXEC",
         summary = "Return a plugin jar inline, matched by name+md5.", why = "Pull a plugin bundle to an agent.",
         params = {@CrescoParam(name = "action_pluginname", required = true, description = "plugin name"),
-                  @CrescoParam(name = "action_pluginmd5", required = true, description = "plugin md5")},
+                  @CrescoParam(name = "action_pluginmd5", required = true, description = "plugin content hash (the inventory's md5 field)")},
         returns = @CrescoReturn(name = "jardata", type = "bytes", description = "the jar bytes")),
     @CrescoAction(name = "putjar", type = "EXEC",
-        summary = "Write a plugin jar (inline bytes) into this repo, md5-verified.", why = "Publish a plugin bundle.",
-        params = {@CrescoParam(name = "pluginname", required = true), @CrescoParam(name = "md5", required = true),
-                  @CrescoParam(name = "jarfile", required = true), @CrescoParam(name = "version", required = true),
+        summary = "Store a plugin jar (inline bytes) in this repo. Accepted only if it is signed by a signer that chains to " +
+                  "plugin_signing_truststore; the repo computes its SHA-384 itself.",
+        why = "Publish a plugin bundle.",
+        params = {@CrescoParam(name = "pluginname", required = true, description = "must match the jar's Bundle-SymbolicName"),
+                  @CrescoParam(name = "jarfile", required = true, description = "file name: letters, digits, '.', '_', '-'"),
+                  @CrescoParam(name = "md5", description = "advisory content hash: a mismatch is refused, a match proves nothing"),
+                  @CrescoParam(name = "version"),
                   @CrescoParam(name = "jardata", required = true, type = "bytes", description = "jar bytes")},
-        returns = @CrescoReturn(name = "uploaded", description = "plugin name on success")),
+        returns = {@CrescoReturn(name = "uploaded", description = "plugin name on success"),
+                   @CrescoReturn(name = "md5-confirm", description = "the content hash the repo computed"),
+                   @CrescoReturn(name = "sha384", description = "the SHA-384 the repo computed")}),
     @CrescoAction(name = "putfiles", type = "EXEC",
-        summary = "Land pushed files (MsgEvent attachments) into a repo.", why = "Receiving side of a file push.",
-        params = {@CrescoParam(name = "repo_name", required = true), @CrescoParam(name = "overwrite", type = "boolean")}),
+        summary = "Land pushed files (MsgEvent attachments) into a repo, each verified against its expected content hash.",
+        why = "Receiving side of a file push.",
+        params = {@CrescoParam(name = "repo_name", required = true),
+                  @CrescoParam(name = "file_hashes", required = true, compressed = true, type = "object",
+                          description = "JSON object: file name -> expected content hash"),
+                  @CrescoParam(name = "overwrite", type = "boolean")},
+        returns = {@CrescoReturn(name = "status", description = "10 every file stored; 9 some skipped or failed (see the lists)"),
+                   @CrescoReturn(name = "stored", type = "object", compressed = true),
+                   @CrescoReturn(name = "unchanged", type = "object", compressed = true),
+                   @CrescoReturn(name = "skipped", type = "object", compressed = true),
+                   @CrescoReturn(name = "failed", type = "object", compressed = true)}),
     @CrescoAction(name = "putfilesremote", type = "EXEC",
-        summary = "Push a set of files from this repo to another agent's repo.", why = "Distribute files across the mesh.",
+        summary = "Push a set of files from this agent to another agent's repo.", why = "Distribute files across the mesh.",
         params = {@CrescoParam(name = "file_list", required = true, compressed = true, type = "object", description = "JSON list of paths"),
                   @CrescoParam(name = "dst_region", required = true), @CrescoParam(name = "dst_agent", required = true),
                   @CrescoParam(name = "dst_plugin", required = true), @CrescoParam(name = "repo_name", required = true)},
         returns = @CrescoReturn(name = "status", description = "10 request sent")),
     @CrescoAction(name = "streamfile", type = "EXEC",
-        summary = "Stream a byte-range of a file over the dataplane in chunks.", why = "Move large artifacts efficiently.",
+        summary = "Stream a byte-range of a cataloged file over the dataplane in chunks, ending with a terminal frame that " +
+                  "carries the SHA-384 of the bytes sent.",
+        why = "Move large artifacts efficiently.",
         params = {@CrescoParam(name = "file_path", required = true), @CrescoParam(name = "start_byte", required = true, type = "long"),
-                  @CrescoParam(name = "byte_length", required = true, type = "long"), @CrescoParam(name = "transfer_id", required = true),
-                  @CrescoParam(name = "ident_key", required = true), @CrescoParam(name = "ident_id", required = true),
-                  @CrescoParam(name = "buffer_size", type = "int", description = "chunk size, default 32768")},
-        returns = @CrescoReturn(name = "status", description = "10 accepted")),
+                  @CrescoParam(name = "byte_length", required = true, type = "long"),
+                  @CrescoParam(name = "transfer_id", description = "1-128 of [A-Za-z0-9_.:-], unique among the caller's transfers; generated when absent"),
+                  @CrescoParam(name = "ident_key", required = true, description = "dataplane property name the frames carry"),
+                  @CrescoParam(name = "ident_id", required = true, description = "its value"),
+                  @CrescoParam(name = "buffer_size", type = "int", description = "chunk size, default 262144")},
+        returns = {@CrescoReturn(name = "status", description = "10 accepted; 11 busy (bounded queue full), retry later"),
+                   @CrescoReturn(name = "transfer_id", description = "the transfer's id")}),
     @CrescoAction(name = "streamfilecancel", type = "EXEC",
-        summary = "Cancel an in-progress streamfile transfer.", why = "Stop a large transfer.",
+        summary = "Cancel one of the caller's own streamfile transfers (running or queued).", why = "Stop a large transfer.",
         params = @CrescoParam(name = "transfer_id", required = true),
         returns = @CrescoReturn(name = "status_code", description = "10 cancelled")),
     @CrescoAction(name = "getscandir", type = "EXEC",
         summary = "Return this repo's configured scan directory.", why = "Discover where the repo watches.",
         returns = @CrescoReturn(name = "scan_dir", description = "the scan directory")),
     @CrescoAction(name = "removefile", type = "EXEC",
-        summary = "Remove a file from a repo (file + catalog row).", why = "Delete an artifact.",
-        params = {@CrescoParam(name = "repo_name", required = true), @CrescoParam(name = "file_name", required = true)},
+        summary = "Remove a file from this repo (file + catalog row); a producer offers the delete to its subscribers.",
+        why = "Delete an artifact.",
+        params = {@CrescoParam(name = "repo_name", description = "when given, must name this repository"),
+                  @CrescoParam(name = "file_name", required = true)},
         returns = @CrescoReturn(name = "status", description = "10 removed")),
     @CrescoAction(name = "clearrepo", type = "EXEC",
-        summary = "Delete all files in a repo. An only copy (repostate ONLY_COPY) is refused unless force=true.",
+        summary = "Delete every file in this repository's directory. Must be confirmed with that directory's exact name. " +
+                  "An only copy (repostate ONLY_COPY) is refused unless force=true, which needs the admin role; " +
+                  "a protected directory or one holding a live-tier root is never cleared.",
         why = "Wipe a repo.",
-        params = {@CrescoParam(name = "repo_name", required = true),
-                  @CrescoParam(name = "force", type = "boolean", description = "clear an only copy anyway")},
+        params = {@CrescoParam(name = "confirm", required = true, description = "this repository's directory, exactly (scan_dir, or repo_dir)"),
+                  @CrescoParam(name = "repo_name", description = "when given, must name this repository"),
+                  @CrescoParam(name = "force", type = "boolean", description = "clear an only copy anyway (admin only)")},
         returns = @CrescoReturn(name = "status", description = "10 cleared; 9 refused (see refusal) or not cleared")),
+    @CrescoAction(name = "releasedeletes", type = "EXEC",
+        summary = "Release the deletes the mass-delete guard is holding, so the next scan offers them to subscribers.",
+        why = "Confirm that many files really were deleted from a producer's scan dir.",
+        params = @CrescoParam(name = "confirm", required = true, description = "this repository's directory, exactly"),
+        returns = @CrescoReturn(name = "released", description = "how many held deletes were released")),
     @CrescoAction(name = "repostate", type = "EXEC",
         summary = "Report what this repo is: LIVE, WORKSPACE_CLEAN, WORKSPACE_DIRTY, MIRROR or ONLY_COPY.",
         why = "Know what would be lost with a repo before clearing, releasing or relying on it.",
@@ -112,16 +155,17 @@ import io.cresco.library.capability.*;
                    @CrescoReturn(name = "reply_status", description = "the realise reply's own status"),
                    @CrescoReturn(name = "status", description = "10 realise accepted; 8 bad params; 9 refused (see refusal); 11 the live-tier provider did not answer")}),
     @CrescoAction(name = "repolistin", type = "EXEC",
-        summary = "Receive a producer's file-diff and pull changed files (sync consumer side).",
-        why = "Directory-sync receiving half.",
+        summary = "Receive a producer's file-diff (and deletes) and pull changed files over the dataplane (sync consumer side).",
+        why = "Directory-sync receiving half. Accepted only from a producer this repo subscribed to.",
         params = {@CrescoParam(name = "repolistin", required = true, compressed = true, type = "object", description = "JSON diff"),
+                  @CrescoParam(name = "repodeletes", compressed = true, type = "object", description = "JSON list of deletes"),
                   @CrescoParam(name = "transfer_id", required = true)},
-        returns = @CrescoReturn(name = "status_code", description = "10 accepted")),
+        returns = @CrescoReturn(name = "status_code", description = "10 accepted; 9 refused; 11 busy, offer again")),
     @CrescoAction(name = "repoconfirm", type = "EXEC",
-        summary = "Acknowledge a peer received a transfer generation.", why = "Sync handshake.",
+        summary = "Acknowledge a subscriber received a transfer generation.", why = "Sync handshake.",
         params = @CrescoParam(name = "transfer_id", required = true)),
     @CrescoAction(name = "getmetrics", type = "EXEC",
-        summary = "Return filerepo metrics (cataloged file count, in-flight transfers) as MeasurementEngine gauges JSON.",
+        summary = "Return filerepo metrics (catalog, transfers, sync) as MeasurementEngine gauges JSON.",
         why = "Standard cross-bundle metrics contract; folded into the controller's getmetricinventory.",
         returns = @CrescoReturn(name = "metrics", type = "object", description = "getAllMetrics() JSON")),
     @CrescoAction(name = "getcapabilities", type = "EXEC",
@@ -137,6 +181,11 @@ public class ExecutorImpl implements Executor {
     static final Set<String> LIVE_BACKED_VERBS = Set.of("repostate", "liverelay", "liverealise",
             "getmetrics", "getcapabilities");
 
+    /** Verifies a jar that arrived over the network; returns its SHA-384 (lowercase hex) or throws to refuse it. */
+    interface JarVerifier {
+        String verify(Path jar) throws Exception;
+    }
+
     private PluginBuilder plugin;
     private CLogger logger;
     private Gson gson;
@@ -146,9 +195,8 @@ public class ExecutorImpl implements Executor {
     // the live-tier client; may be null (no provider, ever)
     private final LiveTierClient liveTier;
 
-    private final AtomicBoolean transferLock = new AtomicBoolean();
-
-    private Map<String,StreamObject> transferStreams;
+    // caller|transfer_id -> transfer, from the moment it is accepted (so a queued transfer can be cancelled too)
+    private final Map<String, StreamObject> transferStreams = new ConcurrentHashMap<>();
 
     // B-2 unified metrics: filerepo catalog size / in-flight transfers as MeasurementEngine gauges,
     // exposed via the standard getmetrics EXEC so they fold into the controller's metric inventory.
@@ -156,14 +204,31 @@ public class ExecutorImpl implements Executor {
     // set under `this` monitor in cleanup(); blocks a racing getmetrics from recreating the engine
     private boolean closed = false;
 
-    // Bounded, named, daemon pool for byte-range streamers (replaces unbounded `new Thread()` per
-    // transfer). Safeguards: inline reads (getfile/getjar) are capped to keep them off the heap for
-    // large artifacts; anything bigger must use streamfile. Buffer size is tunable.
-    private final ExecutorService transferPool;
+    // Bounded, named, daemon pool for byte-range streamers (FR-D5): transfer_threads at once, transfer_queue_max
+    // waiting, transfer_max_per_caller per caller; beyond that a streamfile is refused as busy (11), never queued
+    // without bound. Inline reads (getfile/getjar) are capped to keep them off the heap for large artifacts.
+    private final ThreadPoolExecutor transferPool;
+    private final int maxPerCaller;
+    private final AtomicLong transfersRejected = new AtomicLong();
     private final long maxInlineBytes;
     private final int defaultStreamBuffer;
     // Hard ceiling on a streamfile chunk: it + its framing header must fit one dataplane frame.
     private static final int MAX_STREAM_BUFFER = 786432; // 768 KB
+
+    private static final Pattern TRANSFER_ID = Pattern.compile("[A-Za-z0-9_.:-]{1,128}");
+    private static final Pattern PROPERTY_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]{0,63}");
+    private static final Pattern JAR_NAME = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9._-]{0,254}");
+    /** Properties a streamfile frame carries itself: an ident_key may not shadow one. */
+    private static final Set<String> FRAME_PROPERTIES = Set.of("transfer_id", "seq_num", "offset", "transfer_end",
+            "transfer_status", "transfer_desc", "total_bytes", "sha384", "start_byte", "byte_length");
+    /** JMS selector words: a property may not be named after one. */
+    private static final Set<String> SELECTOR_WORDS = Set.of("NULL", "TRUE", "FALSE", "NOT", "AND", "OR", "BETWEEN",
+            "LIKE", "IN", "IS", "ESCAPE");
+
+    private final JarInventory jarInventory;
+    private volatile JarVerifier jarVerifier;
+    // test hook: runs on the transfer thread before a streamer reads its first byte
+    volatile Runnable beforeStream;
 
     public ExecutorImpl(PluginBuilder pluginBuilder, RepoEngine repoEngine, LiveTierClient liveTier) {
         this.plugin = pluginBuilder;
@@ -172,15 +237,17 @@ public class ExecutorImpl implements Executor {
         this.repoEngine = repoEngine;
         this.liveTier = liveTier;
         listType = new TypeToken<ArrayList<String>>(){}.getType();
-        transferStreams = Collections.synchronizedMap(new HashMap<>());
+        this.jarInventory = new JarInventory(plugin);
+        this.jarVerifier = defaultJarVerifier();
 
         int maxThreads = (int) Math.max(2L, plugin.getConfig().getLongParam("transfer_threads", 8L));
-        // core==max so up to maxThreads transfers run concurrently. With core<max and an unbounded
-        // queue, ThreadPoolExecutor never starts more than core threads, so transfer_threads was
-        // dead config and every streamfile serialized behind the one running transfer.
+        int queueMax = (int) Math.max(1L, Math.min(100_000L, plugin.getConfig().getLongParam("transfer_queue_max", 64L)));
+        this.maxPerCaller = (int) Math.max(1L, plugin.getConfig().getLongParam("transfer_max_per_caller", 16L));
+        // core==max so up to maxThreads transfers run concurrently; the queue is bounded and a full one refuses
         ThreadPoolExecutor tp = new ThreadPoolExecutor(maxThreads, maxThreads, 60L, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(),
-                r -> { Thread t = new Thread(r, "filerepo-transfer"); t.setDaemon(true); return t; });
+                new ArrayBlockingQueue<>(queueMax),
+                r -> { Thread t = new Thread(r, "filerepo-transfer"); t.setDaemon(true); return t; },
+                new ThreadPoolExecutor.AbortPolicy());
         tp.allowCoreThreadTimeOut(true);
         this.transferPool = tp;
         // Inline getfile returns the whole file in ONE control-plane RPC message, which the wss
@@ -192,9 +259,30 @@ public class ExecutorImpl implements Executor {
         this.defaultStreamBuffer = (int)(long) plugin.getConfig().getLongParam("stream_buffer_size", 262144L); // 256 KB
     }
 
+    /**
+     * The production jar check: the library's plugin-signing policy (A's JarSignatures, through the PluginBuilder).
+     * Until that is in the library this build runs against, every jar is refused: fail closed.
+     */
+    private JarVerifier defaultJarVerifier() {
+        return jar -> {
+            throw new SecurityException("jar signature verification is not available in this build; no jar is accepted");
+        };
+    }
+
+    /** The jar inventory (tests). */
+    JarInventory jarInventory() {
+        return jarInventory;
+    }
+
+    /** Tests: the jar check. */
+    void setJarVerifier(JarVerifier verifier) {
+        this.jarVerifier = verifier;
+    }
+
     /** Shut the transfer pool down; called from Plugin.isStopped(). */
     public void cleanup() {
         try {
+            for (StreamObject s : transferStreams.values()) s.setActive(false);
             transferPool.shutdownNow();
         } catch (Exception ex) {
             logger.error("transferPool shutdown error", ex);
@@ -218,14 +306,38 @@ public class ExecutorImpl implements Executor {
             if (metricEngine == null) {
                 metricEngine = new MeasurementEngine(plugin);
                 metricEngine.setGauge("filerepo.files.count", "files tracked in the local repo catalog", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
-                metricEngine.setGauge("filerepo.active.transfers", "in-flight streamfile transfers", "filerepo", CMetric.MeasureClass.GAUGE_INT);
+                metricEngine.setGauge("filerepo.active.transfers", "in-flight streamfile transfers (running and queued)", "filerepo", CMetric.MeasureClass.GAUGE_INT);
+                metricEngine.setGauge("filerepo.transfer.queued", "streamfile transfers waiting for a thread", "filerepo", CMetric.MeasureClass.GAUGE_INT);
+                metricEngine.setGauge("filerepo.transfer.rejected", "streamfile requests refused as busy (bounded queue or per-caller cap)", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.queued", "producer diffs waiting for a sync updater", "filerepo", CMetric.MeasureClass.GAUGE_INT);
+                metricEngine.setGauge("filerepo.sync.active", "sync updaters running", "filerepo", CMetric.MeasureClass.GAUGE_INT);
+                metricEngine.setGauge("filerepo.sync.rejected", "producer diffs refused as busy (bounded queues)", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.refused", "diffs refused from a source that is not a subscribed producer", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.fetched", "files fetched and verified by sync", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.failed", "file fetches that failed (offered again)", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.verify.failed", "fetched files refused by hash verification", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.deleted", "local copies deleted because their producer deleted them", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.tombstones", "deletes recorded for subscribers (offered and confirmed)", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.deletes.held", "deletes held by the mass-delete guard", "filerepo", CMetric.MeasureClass.GAUGE_INT);
             }
             long fileCount = 0L;
+            long tombstones = 0L;
             try { fileCount = repoEngine.getRepoCount(); } catch (Exception ignore) {}
-            int active;
-            synchronized (transferLock) { active = transferStreams.size(); }
+            try { tombstones = repoEngine.getTombstoneCount(); } catch (Exception ignore) {}
             metricEngine.updateLongGauge("filerepo.files.count", fileCount);
-            metricEngine.updateIntGauge("filerepo.active.transfers", active);
+            metricEngine.updateIntGauge("filerepo.active.transfers", transferStreams.size());
+            metricEngine.updateIntGauge("filerepo.transfer.queued", transferPool.getQueue().size());
+            metricEngine.updateLongGauge("filerepo.transfer.rejected", transfersRejected.get());
+            metricEngine.updateIntGauge("filerepo.sync.queued", repoEngine.getSyncQueued());
+            metricEngine.updateIntGauge("filerepo.sync.active", repoEngine.getSyncActive());
+            metricEngine.updateLongGauge("filerepo.sync.rejected", repoEngine.syncRejected.get());
+            metricEngine.updateLongGauge("filerepo.sync.refused", repoEngine.syncRefused.get());
+            metricEngine.updateLongGauge("filerepo.sync.fetched", repoEngine.syncFetched.get());
+            metricEngine.updateLongGauge("filerepo.sync.failed", repoEngine.syncFetchFailed.get());
+            metricEngine.updateLongGauge("filerepo.sync.verify.failed", repoEngine.syncVerifyFailed.get());
+            metricEngine.updateLongGauge("filerepo.sync.deleted", repoEngine.syncDeleted.get());
+            metricEngine.updateLongGauge("filerepo.sync.tombstones", tombstones);
+            metricEngine.updateIntGauge("filerepo.sync.deletes.held", repoEngine.getDeletesHeld());
             return gson.toJson(metricEngine.getAllMetrics());
         } catch (Exception ex) {
             logger.error("getMetricsJson() " + ex.getMessage(), ex);
@@ -235,7 +347,7 @@ public class ExecutorImpl implements Executor {
 
     @Override
     public MsgEvent executeCONFIG(MsgEvent incoming) { return null; }
-    
+
     @Override
     public MsgEvent executeDISCOVER(MsgEvent incoming) { return null; }
     @Override
@@ -277,6 +389,8 @@ public class ExecutorImpl implements Executor {
                     return liveRealise(incoming);
                 case "clearrepo":
                     return clearRepo(incoming);
+                case "releasedeletes":
+                    return releaseDeletes(incoming);
                 case "getjar":
                     return getPluginJar(incoming);
                 case "getfile":
@@ -316,14 +430,11 @@ public class ExecutorImpl implements Executor {
 
     @Override
     public MsgEvent executeWATCHDOG(MsgEvent incoming) { return null; }
-    
+
     @Override
     public MsgEvent executeKPI(MsgEvent incoming) { return null; }
 
     private MsgEvent getRepoFileList(MsgEvent msg) {
-        long startTime = System.currentTimeMillis();
-        //logger.error("return getrepofilelist start");
-
         try {
             if(msg.paramsContains("repo_name")) {
                String repo_name = msg.getParam("repo_name");
@@ -353,26 +464,15 @@ public class ExecutorImpl implements Executor {
             msg.setParam("status","8");
             msg.setParam("status_desc",ex.getMessage());
         }
-        //logger.error("return getrepofilelist end: time = " + (System.currentTimeMillis() - startTime));
         return msg;
-
     }
 
     private MsgEvent repoList(MsgEvent msg) {
 
         try {
             Map<String, List<Map<String, String>>> repoMap = new HashMap<>();
-            List<Map<String, String>> pluginInventory = null;
-            File repoDir = getRepoDir();
-            if (repoDir != null) {
-                pluginInventory = plugin.getPluginInventory(repoDir.getAbsolutePath());
-            }
-
-            repoMap.put("plugins", pluginInventory);
-
-            List<Map<String, String>> repoInfo = getRepoInfo();
-            repoMap.put("server", repoInfo);
-
+            repoMap.put("plugins", pluginInventory());
+            repoMap.put("server", getRepoInfo());
             msg.setCompressedParam("repolist", gson.toJson(repoMap));
         }catch (Exception ex) {
             logger.error(ex.getMessage());
@@ -380,6 +480,13 @@ public class ExecutorImpl implements Executor {
 
         return msg;
 
+    }
+
+    /** The plugin jars in the repository directory, as the inventory reports them (null when there are none). */
+    private List<Map<String, String>> pluginInventory() {
+        List<Map<String, String>> out = new ArrayList<>();
+        for (JarInventory.Entry e : jarInventory.list(getRepoDir())) out.add(e.asMap());
+        return out.isEmpty() ? null : out;
     }
 
     private List<Map<String,String>> getRepoInfo() {
@@ -397,86 +504,98 @@ public class ExecutorImpl implements Executor {
         return repoInfo;
     }
 
+    /** One repository directory for every verb (FR-D9): putjar lands where the scanner looks and getjar serves. */
     private File getRepoDir() {
-        File repoDir = null;
-        try {
-            String repoDirString =  plugin.getConfig().getStringParam("repo_dir", "filerepo");
-
-            File tmpRepo = new File(repoDirString);
-            if(tmpRepo.isDirectory()) {
-                repoDir = tmpRepo;
-            } else {
-                tmpRepo.mkdir();
-                repoDir = tmpRepo;
-            }
-
-        } catch(Exception ex) {
-            logger.error("filerepo error", ex);
-        }
-        return repoDir;
+        return repoEngine.getRepoDir();
     }
 
+    /**
+     * putjar (FR-D3): the jar is staged in the repository directory under a name no scan or inventory sees, accepted
+     * only if it is signed by a signer that chains to plugin_signing_truststore (the repo computes its SHA-384 itself;
+     * a hash the caller supplies is advisory, and a mismatch refuses it), then moved into place atomically.
+     */
     private MsgEvent putPluginJar(MsgEvent incoming) {
 
-        File jarFileSaved = null;
+        Path staged = null;
         try {
-
             String pluginName = incoming.getParam("pluginname");
             String pluginMD5 = incoming.getParam("md5");
             String pluginJarFile = incoming.getParam("jarfile");
-            String pluginVersion = incoming.getParam("version");
             byte[] jarData = incoming.getDataParam("jardata");
             // copy the (large, base64) payload out and drop it from the message early
             if(incoming.getParams().containsKey("jardata")) incoming.removeParam("jardata");
 
-            if((pluginName != null) && (pluginMD5 != null) && (pluginJarFile != null) && (pluginVersion != null) && (jarData != null)) {
-
-                jarFileSaved = safeRepoFile(getRepoDir(), pluginJarFile);
-                if (jarFileSaved != null) {
-                    // the shared side of the repository gate, as for putfiles: a jar never lands mid-clear
-                    if (!repoEngine.enterGate()) {
-                        jarFileSaved = null;
-                        incoming.setParam("status","9");
-                        incoming.setParam("status_desc","repository busy: a clear holds it");
-                    } else {
-                        try {
-                            repoEngine.markLanded();
-                            Files.write(jarFileSaved.toPath(), jarData);
-                            if (jarFileSaved.isFile()) {
-                                String md5 = plugin.getMD5(jarFileSaved.getAbsolutePath());
-                                if (pluginMD5.equals(md5)) {
-                                    incoming.setParam("uploaded", pluginName);
-                                    incoming.setParam("status","10");
-                                    incoming.setParam("status_desc","uploaded");
-                                } else {
-                                    // integrity check failed: drop the bad/partial file rather than serve it
-                                    jarFileSaved.delete();
-                                    incoming.setParam("status","9");
-                                    incoming.setParam("status_desc","md5 mismatch, upload rejected");
-                                }
-                            } else {
-                                incoming.setParam("status","9");
-                                incoming.setParam("status_desc","write did not produce a file");
-                            }
-                        } finally {
-                            repoEngine.exitGate();
-                        }
-                    }
-                } else {
-                    incoming.setParam("status","8");
-                    incoming.setParam("status_desc","invalid jarfile name");
-                }
-            } else {
+            if (pluginName == null || pluginJarFile == null || jarData == null) {
                 incoming.setParam("status","7");
-                incoming.setParam("status_desc","missing required putjar params");
+                incoming.setParam("status_desc","missing required putjar params (pluginname, jarfile, jardata)");
+                return incoming;
+            }
+            if (!JAR_NAME.matcher(pluginJarFile).matches() || pluginJarFile.contains("..")
+                    || RepoEngine.isStaging(pluginJarFile)) {
+                incoming.setParam("status","8");
+                incoming.setParam("status_desc","invalid jarfile name");
+                return incoming;
+            }
+            File repoDir = getRepoDir();
+            Path target = repoDir.toPath().resolve(pluginJarFile);
+            // the shared side of the repository gate, as for putfiles: a jar never lands mid-clear
+            if (!repoEngine.enterGate()) {
+                incoming.setParam("status","9");
+                incoming.setParam("status_desc","repository busy: a clear holds it");
+                return incoming;
+            }
+            try {
+                staged = RepoEngine.stagingFor(target);
+                Files.write(staged, jarData, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+                jarData = null;
+                String sha384;
+                try {
+                    sha384 = jarVerifier.verify(staged);
+                } catch (Exception refused) {
+                    logger.warn("putjar " + pluginJarFile + " refused: " + refused.getMessage());
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","jar refused: " + refused.getMessage());
+                    incoming.setParam("refusal","signature");
+                    return incoming;
+                }
+                String contentHash = plugin.getMD5(staged.toString());
+                if (contentHash == null) {
+                    incoming.setParam("status","6");
+                    incoming.setParam("status_desc","the staged jar could not be read back");
+                    return incoming;
+                }
+                if (pluginMD5 != null && !pluginMD5.equals(contentHash)) {
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","the jar's content hash differs from the md5 supplied, upload rejected");
+                    return incoming;
+                }
+                String declared = symbolicName(staged);
+                if (declared != null && !declared.equals(pluginName)) {
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","pluginname does not match the jar's Bundle-SymbolicName");
+                    return incoming;
+                }
+                repoEngine.markLanded();
+                Files.move(staged, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                staged = null;
+                incoming.setParam("uploaded", pluginName);
+                incoming.setParam("md5-confirm", contentHash);
+                incoming.setParam("sha384", sha384);
+                incoming.setParam("status","10");
+                incoming.setParam("status_desc","uploaded");
+            } finally {
+                repoEngine.exitGate();
             }
 
         } catch(Exception ex){
             logger.error("putPluginJar error", ex);
-            // a partial/truncated jar must not be left where the inventory would advertise+serve it
-            try { if (jarFileSaved != null) jarFileSaved.delete(); } catch (Exception ignore) {}
             incoming.setParam("status","6");
-            incoming.setParam("status_desc","putjar error: " + ex.getMessage());
+            incoming.setParam("status_desc","putjar error: " + ex.getClass().getSimpleName());
+        } finally {
+            // a partial, refused or unverified jar is never left where the inventory would advertise and serve it
+            if (staged != null) {
+                try { Files.deleteIfExists(staged); } catch (Exception ignore) {}
+            }
         }
 
         if(incoming.getParams().containsKey("jardata")) {
@@ -486,66 +605,147 @@ public class ExecutorImpl implements Executor {
         return incoming;
     }
 
+    /** The jar's Bundle-SymbolicName without directives, or null. */
+    private static String symbolicName(Path jar) {
+        try (JarFile jf = new JarFile(jar.toFile(), false)) {
+            if (jf.getManifest() == null) return null;
+            String v = jf.getManifest().getMainAttributes().getValue("Bundle-SymbolicName");
+            if (v == null) return null;
+            int semi = v.indexOf(';');
+            return (semi < 0 ? v : v.substring(0, semi)).trim();
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    /**
+     * getjar: the inventory is cached by size, mtime and file key; the bytes sent are rechecked against the requested
+     * hash, so a jar changed in place is never served under its old hash.
+     */
     private MsgEvent getPluginJar(MsgEvent incoming) {
 
         try {
-            if ((incoming.getParam("action_pluginname") != null) && (incoming.getParam("action_pluginmd5") != null)) {
-                String requestPluginName = incoming.getParam("action_pluginname");
-                String requestPluginMD5 = incoming.getParam("action_pluginmd5");
-
-                File repoDir = getRepoDir();
-                if (repoDir != null) {
-
-                    List<Map<String, String>> pluginInventory = plugin.getPluginInventory(repoDir.getAbsolutePath());
-                    for (Map<String, String> repoMap : pluginInventory) {
-
-                        if (repoMap.containsKey("pluginname") && repoMap.containsKey("md5") && repoMap.containsKey("jarfile")) {
-                            String pluginName = repoMap.get("pluginname");
-                            String pluginMD5 = repoMap.get("md5");
-                            String pluginJarFile = repoMap.get("jarfile");
-
-                            if (pluginName.equals(requestPluginName) && pluginMD5.equals(requestPluginMD5)) {
-
-                                File jarFile = safeRepoFile(repoDir, pluginJarFile);
-                                if (jarFile != null && jarFile.isFile() && jarFile.length() <= maxInlineBytes) {
-                                    incoming.setDataParam("jardata", Files.readAllBytes(jarFile.toPath()));
-                                } else if (jarFile != null && jarFile.length() > maxInlineBytes) {
-                                    incoming.setParam("status_desc","jar " + jarFile.length()
-                                            + " bytes exceeds max_inline_bytes; use streamfile");
-                                }
-                                // requested jar found+handled: stop scanning the rest of the inventory
-                                break;
-
-                            }
-                        }
-
-                    }
-
-                }
+            String requestPluginName = incoming.getParam("action_pluginname");
+            String requestPluginMD5 = incoming.getParam("action_pluginmd5");
+            if (requestPluginName == null || requestPluginMD5 == null) {
+                incoming.setParam("status","8");
+                incoming.setParam("status_desc","getjar takes action_pluginname and action_pluginmd5");
+                return incoming;
             }
+            File repoDir = getRepoDir();
+            for (JarInventory.Entry e : jarInventory.list(repoDir)) {
+                if (!requestPluginName.equals(e.pluginname) || !requestPluginMD5.equals(e.md5)) continue;
+                Path jar = repoDir.toPath().resolve(e.jarfile);
+                if (e.size > maxInlineBytes) {
+                    incoming.setParam("status","5");
+                    incoming.setParam("status_desc","jar " + e.size + " bytes exceeds max_inline_bytes; use streamfile");
+                    return incoming;
+                }
+                byte[] data = Files.readAllBytes(jar);
+                if (data.length > maxInlineBytes || !requestPluginMD5.equals(Hashes.content(data))) {
+                    jarInventory.invalidate(jar);
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","the jar changed since it was listed; list again");
+                    return incoming;
+                }
+                incoming.setDataParam("jardata", data);
+                incoming.setParam("status","10");
+                incoming.setParam("status_desc","found");
+                return incoming;
+            }
+            incoming.setParam("status","9");
+            incoming.setParam("status_desc","no such jar");
         } catch(Exception ex) {
             logger.error("getPluginJar error", ex);
+            incoming.setParam("status","7");
+            incoming.setParam("status_desc","getjar error: " + ex.getClass().getSimpleName());
         }
         return incoming;
     }
 
-    /**
-     * Resolve a child name against repoDir and guarantee the result stays inside repoDir
-     * (path-traversal guard for names like "../../etc/x"). Returns null if it escapes.
-     */
-    private File safeRepoFile(File repoDir, String childName) {
-        try {
-            if (childName == null) return null;
-            Path base = repoDir.getCanonicalFile().toPath();
-            File candidate = new File(repoDir, childName).getCanonicalFile();
-            if (candidate.toPath().startsWith(base)) {
-                return candidate;
-            }
-            logger.error("path traversal blocked: '" + childName + "' escapes repo dir " + base);
-        } catch (Exception ex) {
-            logger.error("safeRepoFile error for " + childName, ex);
+    /** A file opened to be served, and checked on the descriptor it will be read through. */
+    private static final class Served {
+        final FileChannel channel;
+        final long size;
+
+        Served(FileChannel channel, long size) {
+            this.channel = channel;
+            this.size = size;
         }
-        return null;
+    }
+
+    /** Why a file cannot be served, as a status and description (the open itself refused it). */
+    private static final class NotServed extends Exception {
+        final String status;
+        final String refusal;
+
+        NotServed(String status, String desc, String refusal) {
+            super(desc);
+            this.status = status;
+            this.refusal = refusal;
+        }
+    }
+
+    /**
+     * Open a cataloged file to serve it, then check it on that same descriptor (the TOCTOU fix): the final component is
+     * opened without following a link, the file must still be the one the path named a moment before (same file key),
+     * a regular file, inside this repository's directory and in no live-tier root once every link is resolved, and in
+     * the catalog. Its size is the open file's own. Nothing swapped in after the check can be read: the bytes come
+     * through this descriptor. The caller owns the returned channel.
+     */
+    private Served openServable(String filePath, String missingStatus) throws NotServed {
+        Path p = Paths.get(filePath);
+        BasicFileAttributes before;
+        try {
+            before = Files.readAttributes(p, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (IOException ex) {
+            throw new NotServed(missingStatus, "file does not exist on this agent", null);
+        }
+        if (!before.isRegularFile()) {
+            // a link, a directory, a device: never opened at all
+            throw new NotServed("9", "not a regular file", null);
+        }
+        FileChannel ch;
+        try {
+            ch = FileChannel.open(p, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+        } catch (NoSuchFileException ex) {
+            throw new NotServed(missingStatus, "file does not exist on this agent", null);
+        } catch (FileSystemException ex) {
+            throw new NotServed("9", "not a regular file", null);
+        } catch (IOException ex) {
+            throw new NotServed(missingStatus, "file could not be opened", null);
+        }
+        boolean ok = false;
+        try {
+            BasicFileAttributes after = Files.readAttributes(p, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!after.isRegularFile() || !before.isRegularFile()) {
+                throw new NotServed("9", "not a regular file", null);
+            }
+            if (!Objects.equals(before.fileKey(), after.fileKey())) {
+                throw new NotServed("9", "the file was replaced while it was being opened", null);
+            }
+            Path real = p.toRealPath();
+            String conflict = repoEngine.liveRootConflict(real);
+            if (conflict != null) throw new NotServed("9", "the file " + conflict, "live-root");
+            Path base = getRepoDir().getCanonicalFile().toPath();
+            if (!real.startsWith(base)) {
+                throw new NotServed("9", "the file is not in this repository's directory", null);
+            }
+            if (repoEngine.getFileInfo(filePath) == null) {
+                throw new NotServed("9", "file not in catalog", null);
+            }
+            Served s = new Served(ch, ch.size());
+            ok = true;
+            return s;
+        } catch (NotServed n) {
+            throw n;
+        } catch (IOException ex) {
+            throw new NotServed(missingStatus, "file could not be checked: " + ex.getClass().getSimpleName(), null);
+        } finally {
+            if (!ok) {
+                try { ch.close(); } catch (IOException ignore) { }
+            }
+        }
     }
 
     private MsgEvent getFile(MsgEvent incoming) {
@@ -558,33 +758,35 @@ public class ExecutorImpl implements Executor {
                 if (conflict != null) {
                     return refuseLiveRoot(incoming, "the file " + conflict);
                 }
-                //logger.error("file_name: " + filename);
-
-                ///opt/cresco/filerepo/extract_dump_7e90b402-8076-11ec-bc89-0242ac11001a.json
-                //Path filePath = Paths.get(repoEngine.getRepoDir().getAbsolutePath(), filename);
-                //incoming.setParam("file_path",filePath.toFile().getAbsolutePath());
-                //logger.error("file_path: " + filePath.toFile().getAbsolutePath());
                 Map<String,String> fileInfo = repoEngine.getFileInfo(filePath);
-
-                if(fileInfo != null) {
-                    File f = new File(filePath);
-                    if (!f.isFile()) {
-                        incoming.setParam("status","6");
-                        incoming.setParam("status_desc","file missing on disk");
-                    } else if (f.length() > maxInlineBytes) {
+                if (fileInfo == null) {
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","fileInfo == null");
+                    return incoming;
+                }
+                Served served;
+                try {
+                    served = openServable(filePath, "6");
+                } catch (NotServed n) {
+                    if ("live-root".equals(n.refusal)) return refuseLiveRoot(incoming, n.getMessage());
+                    incoming.setParam("status", n.status);
+                    incoming.setParam("status_desc", n.getMessage());
+                    return incoming;
+                }
+                try (FileChannel ch = served.channel) {
+                    if (served.size > maxInlineBytes) {
                         // Memory safeguard: never slurp a huge file onto the heap for an inline reply.
                         incoming.setParam("status","5");
-                        incoming.setParam("status_desc","file " + f.length() + " bytes exceeds max_inline_bytes "
+                        incoming.setParam("status_desc","file " + served.size + " bytes exceeds max_inline_bytes "
                                 + maxInlineBytes + "; use streamfile");
                     } else {
+                        ByteBuffer buf = ByteBuffer.allocate((int) served.size);
+                        while (buf.hasRemaining() && ch.read(buf, buf.position()) > 0) { }
                         incoming.setCompressedParam("file_metadata",gson.toJson(fileInfo));
-                        incoming.setDataParam("file_data", Files.readAllBytes(f.toPath()));
+                        incoming.setDataParam("file_data", Arrays.copyOf(buf.array(), buf.position()));
                         incoming.setParam("status","10");
                         incoming.setParam("status_desc","found list");
                     }
-                } else {
-                    incoming.setParam("status","9");
-                    incoming.setParam("status_desc","fileInfo == null");
                 }
             } else {
                 incoming.setParam("status","8");
@@ -593,7 +795,7 @@ public class ExecutorImpl implements Executor {
 
         } catch(Exception ex) {
             incoming.setParam("status","7");
-            incoming.setParam("status_desc","getFile error " + ex.getMessage());
+            incoming.setParam("status_desc","getFile error " + ex.getClass().getSimpleName());
             logger.error("getFile error", ex);
         }
         return incoming;
@@ -622,176 +824,227 @@ public class ExecutorImpl implements Executor {
         return incoming;
     }
 
-    private void streamFile(Map<String,String> transferInfo) {
-        String transferId = transferInfo.get("transfer_id");
-        int BUFFER_SIZE = Integer.parseInt(transferInfo.get("buffer_size"));
-        //logger.info("transferid: " + transferId + " BUFFER_SIZE: " + BUFFER_SIZE + " TRANSFERINFO: " + transferInfo);
-
-        try {
-
-            transferPool.submit(() -> {
-                try {
-
-                    boolean alerted = false;
-                    long startByte = Long.parseLong(transferInfo.get("start_byte"));
-                    long byteLength = Long.parseLong(transferInfo.get("byte_length"));
-                    String filePath = transferInfo.get("file_path");
-                    StreamObject streamObject = new StreamObject(transferId, filePath, startByte, byteLength);
-                    synchronized (transferLock) {
-                        transferStreams.put(transferId, streamObject);
-                    }
-
-                    // try-with-resources: the RAF is closed even if the loop throws (previously it
-                    // leaked the descriptor on any exception mid-transfer).
-                    try (RandomAccessFile raf = new RandomAccessFile(filePath, "r")) {
-                        raf.seek(startByte);
-
-                        int seqNum = 0;
-                        byte[] buffer = new byte[BUFFER_SIZE];
-                        int read;
-                        boolean isActive = true;
-                        while((byteLength > 0) && (isActive)){
-                            BytesMessage updateMessage = plugin.getAgentService().getDataPlaneService().createBytesMessage();
-                            read = (int) Math.min((long) BUFFER_SIZE, byteLength);
-                            // Honor the ACTUAL bytes read: RandomAccessFile.read() may return a short
-                            // read (< requested); writing the requested length shipped stale bytes.
-                            int got = raf.read(buffer, 0, read);
-                            if (got <= 0) { break; }
-                            updateMessage.writeBytes(buffer, 0, got);
-                            updateMessage.setStringProperty(transferInfo.get("ident_key"), transferInfo.get("ident_id"));
-                            updateMessage.setStringProperty("transfer_id", transferId);
-                            updateMessage.setStringProperty("seq_num", String.valueOf(seqNum));
-                            plugin.getAgentService().getDataPlaneService().sendMessage(TopicType.GLOBAL,updateMessage, DeliveryMode.NON_PERSISTENT, 0, 0);
-                            byteLength = byteLength - got;
-                            seqNum += 1;
-
-                            synchronized (transferLock) {
-                                if(transferStreams.containsKey(transferId)) {
-                                    transferStreams.get(transferId).setBytesTransfered(transferStreams.get(transferId).getBytesTransfered() + got);
-                                    isActive = transferStreams.get(transferId).isActive();
-                                    if(!alerted) {
-                                        if (transferStreams.get(transferId).getBytesTransfered() > (1024)) {
-                                            logger.debug("streamFile transferId: " + transferId + " bytesTransfered: " + transferStreams.get(transferId).getBytesTransfered());
-                                            alerted = true;
-                                        }
-                                    }
-                                } else {
-                                    logger.error("streamFile transferId: " + transferId + " not found in transferStreams");
-                                }
-                            }
-                        }
-                    }
-
-                } catch(Exception ex) {
-                    logger.error("streamFile error: " + ex.getMessage());
-                    synchronized (transferLock) {
-                        if(transferStreams.containsKey(transferId)) {
-                            transferStreams.get(transferId).setActive(false);
-                        }
-                    }
-                } finally {
-                    // Remove the finished/failed transfer so the map doesn't grow unbounded
-                    // (this cleanup was previously commented out -> a memory leak per transfer).
-                    synchronized (transferLock) {
-                        transferStreams.remove(transferId);
-                    }
-                }
-            });
-
-
-        } catch (Exception ex) {
-            logger.error("Error streamFile(Map<String,String> transferInfo)", ex);
-        }
-
+    /** Why {@code identKey} cannot name a frame property, or null. */
+    private static String badIdentKey(String identKey) {
+        if (identKey == null) return "ident_key is required";
+        if (!PROPERTY_NAME.matcher(identKey).matches()) return "ident_key must be a property name ([A-Za-z_][A-Za-z0-9_]*, at most 64)";
+        if (identKey.toUpperCase(Locale.ROOT).startsWith("JMS")) return "ident_key may not start with JMS";
+        if (FRAME_PROPERTIES.contains(identKey)) return "ident_key may not be " + identKey + ": the frames carry it themselves";
+        if (SELECTOR_WORDS.contains(identKey.toUpperCase(Locale.ROOT))) return "ident_key may not be a selector word";
+        return null;
     }
+
+    /**
+     * streamfile (FR-D6): the transfer id is the caller's own (validated; unique among the caller's transfers) or one
+     * generated here; the file is opened and checked on its descriptor before the transfer is accepted (TOCTOU);
+     * every chunk carries its offset; a terminal frame ends every accepted transfer (status 10 with the SHA-384 of the
+     * bytes sent and their count, or the reason it stopped). Bounded (FR-D5): busy (11) when the pool's queue or the
+     * caller's own cap is full.
+     */
     private MsgEvent streamFile(MsgEvent incoming) {
 
         try {
-
-            if(incoming.getParam("file_path") != null) {
-                String filePath = incoming.getParam("file_path");
-                String conflict = repoEngine.liveRootConflict(Paths.get(filePath));
-                if (conflict != null) {
-                    return refuseLiveRoot(incoming, "the file " + conflict);
-                }
-
-                File file = new File(filePath);
-                if(file.exists()) {
-                    long startByte = Long.parseLong(incoming.getParam("start_byte"));
-                    long byteLength = Long.parseLong(incoming.getParam("byte_length"));
-
-                    // overflow-safe range validation: reject a bad range up-front instead of replying
-                    // "10 accepted" and then failing silently on the async streamer (start+len could
-                    // also overflow to a negative endByte that slips past a <= file.length() check)
-                    if(startByte >= 0 && byteLength > 0 && startByte <= file.length()
-                            && byteLength <= file.length() - startByte) {
-
-                        Map<String, String> fileInfo = repoEngine.getFileInfo(filePath);
-                        if (fileInfo != null) {
-                            fileInfo.put("transfer_id", incoming.getParam("transfer_id"));
-                            fileInfo.put("file_path", incoming.getParam("file_path"));
-                            fileInfo.put("start_byte", incoming.getParam("start_byte"));
-                            fileInfo.put("byte_length", incoming.getParam("byte_length"));
-                            fileInfo.put("ident_key", incoming.getParam("ident_key"));
-                            fileInfo.put("ident_id", incoming.getParam("ident_id"));
-
-                            // Clamp the chunk size: each chunk carries a small framing header and must
-                            // stay under the dataplane frame limit, else chunks are silently dropped.
-                            // A caller passing an oversized buffer_size must not be able to break the
-                            // transfer — cap it (and floor it) to a safe range.
-                            int reqBuf = defaultStreamBuffer;
-                            try { if (incoming.getParam("buffer_size") != null) reqBuf = Integer.parseInt(incoming.getParam("buffer_size")); }
-                            catch (Exception ignore) { }
-                            if (reqBuf > MAX_STREAM_BUFFER) reqBuf = MAX_STREAM_BUFFER;
-                            if (reqBuf < 4096) reqBuf = 4096;
-                            fileInfo.put("buffer_size", String.valueOf(reqBuf));
-
-                            //transfer in new thread, send recept
-                            streamFile(fileInfo);
-                            //logger.error("transferid: " + incoming.getParam("transfer_id") + " START");
-
-                            incoming.setParam("status", "10");
-                            incoming.setParam("status_desc", "transfer accepted");
-                        } else {
-                            incoming.setParam("status", "9");
-                            incoming.setParam("status_desc", "file not in catalog");
-                        }
-                    } else {
-                        incoming.setParam("status", "8");
-                        incoming.setParam("status_desc", "invalid byte range");
-                    }
-                } else {
-                    incoming.setParam("status","7");
-                    incoming.setParam("status_desc","no filename parameter");
-                }
-            } else {
+            String filePath = incoming.getParam("file_path");
+            if (filePath == null) {
                 incoming.setParam("status","6");
-                incoming.setParam("status_desc","file does not exists on OS");
+                incoming.setParam("status_desc","no file_path parameter");
+                return incoming;
+            }
+            String conflict = repoEngine.liveRootConflict(Paths.get(filePath));
+            if (conflict != null) {
+                return refuseLiveRoot(incoming, "the file " + conflict);
+            }
+            long startByte, byteLength;
+            try {
+                startByte = Long.parseLong(incoming.getParam("start_byte"));
+                byteLength = Long.parseLong(incoming.getParam("byte_length"));
+            } catch (Exception bad) {
+                incoming.setParam("status", "8");
+                incoming.setParam("status_desc", "start_byte and byte_length are whole numbers");
+                return incoming;
+            }
+            String identKey = incoming.getParam("ident_key");
+            String identId = incoming.getParam("ident_id");
+            String why = badIdentKey(identKey);
+            if (why == null && (identId == null || identId.length() > 1024)) why = "ident_id is required (at most 1024 characters)";
+            if (why != null) {
+                incoming.setParam("status", "8");
+                incoming.setParam("status_desc", why);
+                return incoming;
+            }
+            String transferId = incoming.getParam("transfer_id");
+            if (transferId == null || transferId.isEmpty()) {
+                transferId = "fr-" + SyncReceiver.token();
+            } else if (!TRANSFER_ID.matcher(transferId).matches()) {
+                incoming.setParam("status", "8");
+                incoming.setParam("status_desc", "transfer_id is 1-128 of letters, digits, '_', '.', ':' or '-'");
+                return incoming;
+            }
+            int reqBuf = defaultStreamBuffer;
+            try { if (incoming.getParam("buffer_size") != null) reqBuf = Integer.parseInt(incoming.getParam("buffer_size")); }
+            catch (Exception ignore) { }
+            // Clamp the chunk size: each chunk carries a small framing header and must stay under the dataplane frame
+            // limit, else chunks are silently dropped.
+            if (reqBuf > MAX_STREAM_BUFFER) reqBuf = MAX_STREAM_BUFFER;
+            if (reqBuf < 4096) reqBuf = 4096;
+
+            String owner = Callers.key(incoming);
+            String key = owner + "|" + transferId;
+            int mine = 0;
+            for (String k : transferStreams.keySet()) if (k.startsWith(owner + "|")) mine++;
+            if (mine >= maxPerCaller) {
+                transfersRejected.incrementAndGet();
+                incoming.setParam("status", "11");
+                incoming.setParam("status_desc", "busy: " + mine + " transfers of this caller in flight (transfer_max_per_caller)");
+                return incoming;
+            }
+
+            Served served;
+            try {
+                served = openServable(filePath, "7");
+            } catch (NotServed n) {
+                if ("live-root".equals(n.refusal)) return refuseLiveRoot(incoming, n.getMessage());
+                incoming.setParam("status", n.status);
+                incoming.setParam("status_desc", n.getMessage());
+                return incoming;
+            }
+            boolean handedOff = false;
+            try {
+                // overflow-safe range validation against the OPEN file's size
+                if (!(startByte >= 0 && byteLength > 0 && startByte <= served.size && byteLength <= served.size - startByte)) {
+                    incoming.setParam("status", "8");
+                    incoming.setParam("status_desc", "invalid byte range");
+                    return incoming;
+                }
+                StreamObject so = new StreamObject(transferId, filePath, startByte, byteLength);
+                if (transferStreams.putIfAbsent(key, so) != null) {
+                    incoming.setParam("status", "8");
+                    incoming.setParam("status_desc", "transfer_id is in use by another of this caller's transfers");
+                    return incoming;
+                }
+                final String tid = transferId;
+                final int buffer = reqBuf;
+                final FileChannel channel = served.channel;
+                try {
+                    transferPool.execute(() -> stream(channel, so, key, tid, identKey, identId, buffer));
+                    handedOff = true;
+                } catch (RejectedExecutionException full) {
+                    transferStreams.remove(key, so);
+                    transfersRejected.incrementAndGet();
+                    incoming.setParam("status", "11");
+                    incoming.setParam("status_desc", "busy: the transfer queue is full (transfer_queue_max), retry later");
+                    return incoming;
+                }
+                incoming.setParam("transfer_id", transferId);
+                incoming.setParam("status", "10");
+                incoming.setParam("status_desc", "transfer accepted");
+                return incoming;
+            } finally {
+                if (!handedOff) {
+                    try { served.channel.close(); } catch (IOException ignore) { }
+                }
             }
 
         } catch(Exception ex) {
             incoming.setParam("status","5");
-            incoming.setParam("status_desc","getFile error " + ex.getMessage());
+            incoming.setParam("status_desc","streamfile error " + ex.getClass().getSimpleName());
             logger.error("filerepo error", ex);
         }
         return incoming;
     }
 
+    /** The streamer: chunks with their offsets, then the terminal frame, whatever happened. */
+    private void stream(FileChannel channel, StreamObject so, String key, String transferId, String identKey,
+                        String identId, int bufferSize) {
+        DataPlaneService dp = plugin.getAgentService().getDataPlaneService();
+        MessageDigest sha = Hashes.sha384();
+        long sent = 0;
+        int seqNum = 0;
+        String status = "10", desc = "complete";
+        try (FileChannel ch = channel) {
+            Runnable hook = beforeStream;
+            if (hook != null) hook.run();
+            if (!so.isActive()) {
+                status = "9";
+                desc = "cancelled";
+            } else {
+                ByteBuffer buf = ByteBuffer.allocate(bufferSize);
+                long pos = so.getStartByte();
+                long remaining = so.getByteLength();
+                while (remaining > 0) {
+                    if (!so.isActive()) {
+                        status = "9";
+                        desc = "cancelled";
+                        break;
+                    }
+                    buf.clear();
+                    buf.limit((int) Math.min((long) bufferSize, remaining));
+                    // Honor the ACTUAL bytes read: a read may return fewer bytes than requested
+                    int got = ch.read(buf, pos);
+                    if (got <= 0) {
+                        status = "8";
+                        desc = "the file is shorter than the requested range (it changed while streaming)";
+                        break;
+                    }
+                    sha.update(buf.array(), 0, got);
+                    BytesMessage m = dp.createBytesMessage();
+                    m.writeBytes(buf.array(), 0, got);
+                    m.setStringProperty(identKey, identId);
+                    m.setStringProperty("transfer_id", transferId);
+                    m.setStringProperty("seq_num", String.valueOf(seqNum));
+                    m.setStringProperty("offset", String.valueOf(pos));
+                    if (!dp.sendMessage(TopicType.GLOBAL, m, DeliveryMode.NON_PERSISTENT, 0, 0)) {
+                        status = "8";
+                        desc = "the dataplane did not take a frame";
+                        break;
+                    }
+                    pos += got;
+                    remaining -= got;
+                    sent += got;
+                    seqNum += 1;
+                    so.setBytesTransfered(sent);
+                }
+            }
+        } catch (Exception ex) {
+            status = "8";
+            desc = "read or send failed: " + ex.getClass().getSimpleName();
+            logger.error("streamFile " + transferId + " error: " + ex.getMessage());
+        } finally {
+            try {
+                BytesMessage end = dp.createBytesMessage();
+                end.setStringProperty(identKey, identId);
+                end.setStringProperty("transfer_id", transferId);
+                end.setStringProperty("seq_num", String.valueOf(seqNum));
+                end.setStringProperty("offset", String.valueOf(so.getStartByte() + sent));
+                end.setStringProperty("transfer_end", "true");
+                end.setStringProperty("transfer_status", status);
+                end.setStringProperty("transfer_desc", desc);
+                end.setStringProperty("total_bytes", String.valueOf(sent));
+                end.setStringProperty("start_byte", String.valueOf(so.getStartByte()));
+                end.setStringProperty("byte_length", String.valueOf(so.getByteLength()));
+                if ("10".equals(status)) end.setStringProperty("sha384", Hashes.hex(sha.digest()));
+                dp.sendMessage(TopicType.GLOBAL, end, DeliveryMode.PERSISTENT, 0, 0);
+            } catch (Exception ex) {
+                logger.error("streamFile " + transferId + ": terminal frame not sent: " + ex.getMessage());
+            }
+            // Remove the finished/failed transfer so the map doesn't grow unbounded
+            transferStreams.remove(key, so);
+        }
+    }
+
     private MsgEvent streamFileCancel(MsgEvent incoming) {
         try {
             incoming.setParam("status_code","9");
-            logger.debug("streamFileCancel transferid: " + incoming.getParam("transfer_id"));
-
-            if(incoming.paramsContains("transfer_id")) {
-                String transferId = incoming.getParam("transfer_id");
-                synchronized (transferLock) {
-                    if(transferStreams.containsKey(transferId)) {
-                        transferStreams.get(transferId).setActive(false);
-                        incoming.setParam("status_code","10");
-                        logger.info("streamFileCancel transferId: " + transferId + " set canceled transfered " + transferStreams.get(transferId).getBytesTransfered() + " bytes." );
-                    } else {
-                        logger.error("streamFileCancel transferId: " + transferId + " not found in transferStreams!");
-                    }
+            String transferId = incoming.getParam("transfer_id");
+            if (transferId != null) {
+                // only the caller's own transfer: no one cancels another caller's
+                StreamObject so = transferStreams.get(Callers.key(incoming) + "|" + transferId);
+                if (so != null) {
+                    so.setActive(false);
+                    incoming.setParam("status_code","10");
+                    logger.info("streamFileCancel transferId: " + transferId + " set canceled transfered " + so.getBytesTransfered() + " bytes." );
+                } else {
+                    logger.debug("streamFileCancel transferId: " + transferId + " not found among the caller's transfers");
                 }
             } else {
                 logger.error("streamFileCancel transferId not found in MsgEvent!");
@@ -799,7 +1052,7 @@ public class ExecutorImpl implements Executor {
 
         } catch(Exception ex) {
             incoming.setParam("status","7");
-            incoming.setParam("status_desc","getFile error " + ex.getMessage());
+            incoming.setParam("status_desc","streamfilecancel error " + ex.getMessage());
             logger.error("filerepo error", ex);
         }
         return incoming;
@@ -807,7 +1060,8 @@ public class ExecutorImpl implements Executor {
 
 
     private void confirmTransfer(MsgEvent incoming) {
-        repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getCompressedParam("failedfiles"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
+        repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getCompressedParam("failedfiles"),
+                incoming.getCompressedParam("faileddeletes"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
     }
 
     private MsgEvent putFileRemote(MsgEvent incoming) {
@@ -820,12 +1074,40 @@ public class ExecutorImpl implements Executor {
 
                 String fileListString = incoming.getCompressedParam("file_list");
                 List<String> fileList = gson.fromJson(fileListString, listType);
+                if (fileList == null || fileList.isEmpty()) {
+                    incoming.setParam("status","8");
+                    incoming.setParam("status_desc","file_list is empty");
+                    return incoming;
+                }
                 // these are any paths the caller names: none may lie in a live-tier root
-                for (String f : fileList == null ? Collections.<String>emptyList() : fileList) {
+                for (String f : fileList) {
                     String conflict = repoEngine.liveRootConflict(Paths.get(f));
                     if (conflict != null) {
                         return refuseLiveRoot(incoming, "a listed file " + conflict);
                     }
+                }
+                // FR-D10: the receiver verifies every file against the hash computed here, before it lands
+                Map<String, String> hashes = new LinkedHashMap<>();
+                for (String f : fileList) {
+                    Path p = Paths.get(f);
+                    String name = p.getFileName() == null ? null : p.getFileName().toString();
+                    if (name == null || !Files.isRegularFile(p)) {
+                        incoming.setParam("status","8");
+                        incoming.setParam("status_desc","not a file: " + f);
+                        return incoming;
+                    }
+                    if (hashes.containsKey(name)) {
+                        incoming.setParam("status","8");
+                        incoming.setParam("status_desc","two files are named " + name + ": the receiver lands by name");
+                        return incoming;
+                    }
+                    String h = plugin.getMD5(p.toString());
+                    if (h == null) {
+                        incoming.setParam("status","8");
+                        incoming.setParam("status_desc","could not read " + f);
+                        return incoming;
+                    }
+                    hashes.put(name, h);
                 }
                 String dst_region = incoming.getParam("dst_region");
                 String dst_agent = incoming.getParam("dst_agent");
@@ -835,22 +1117,25 @@ public class ExecutorImpl implements Executor {
                 MsgEvent filesTransfer = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,dst_region, dst_agent, dst_plugin);
                 filesTransfer.setParam("action", "putfiles");
                 filesTransfer.setParam("repo_name",repo_name);
+                filesTransfer.setCompressedParam("file_hashes", gson.toJson(hashes));
                 filesTransfer.addFiles(fileList);
-                logger.info("File Transfer Params: " + filesTransfer.getParams().toString());
+                logger.info("putfilesremote: " + fileList.size() + " file(s) to " + dst_region + "/" + dst_agent + "/" + dst_plugin);
                 plugin.msgOut(filesTransfer);
-                //plugin.sendRPC(filesTransfer);
-
 
                 incoming.setParam("status","10");
                 incoming.setParam("status_desc","request sent");
 
             } else {
                 logger.error("filelist not found");
+                incoming.setParam("status","8");
+                incoming.setParam("status_desc","putfilesremote takes file_list, dst_region, dst_agent, dst_plugin and repo_name");
             }
 
         } catch(Exception ex){
             logger.error("putFileRemote: " + ex.getMessage());
             logger.error("filerepo error", ex);
+            incoming.setParam("status","7");
+            incoming.setParam("status_desc","putfilesremote error: " + ex.getClass().getSimpleName());
         }
 
         if(incoming.getParams().containsKey("filedata")) {
@@ -860,42 +1145,68 @@ public class ExecutorImpl implements Executor {
         return incoming;
     }
 
+    /** Refuse, when {@code repo_name} is given and this repository has a name, a call that names another repository. */
+    private MsgEvent refuseOtherRepo(MsgEvent incoming) {
+        String asked = incoming.getParam("repo_name");
+        String mine = repoEngine.getRepoName();
+        if (asked == null || mine == null || asked.equals(mine)) return null;
+        incoming.setParam("status","9");
+        incoming.setParam("status_desc","refused: repo_name '" + asked + "' does not name this repository");
+        incoming.setParam("refusal","repo-name");
+        return incoming;
+    }
+
+    /**
+     * clearrepo (FR-D2): wipes this repository's whole directory, so it must be confirmed with that directory's exact
+     * name; repo_name, when given, must name this repository; force (clear an only copy) needs the admin role, and no
+     * force clears a protected directory or one that is or holds a live-tier root.
+     */
     private MsgEvent clearRepo(MsgEvent incoming) {
 
         try {
+            MsgEvent other = refuseOtherRepo(incoming);
+            if (other != null) return other;
 
-            if(incoming.paramsContains("repo_name")){
-
-                String repoName = incoming.getParam("repo_name");
-
-                // force=true clears an only copy too: whoever sends it has decided the contents are disposable.
-                // The check runs inside clearRepo, under the repository gate, never before it.
-                boolean force = "true".equalsIgnoreCase(incoming.getParam("force"));
-                RepoEngine.Clear cleared = repoEngine.clearRepo(force);
-                if (cleared.state != null && cleared.state.state != null) {
-                    incoming.setParam("state", cleared.state.state);
-                }
-                switch (cleared.outcome) {
-                    case RepoEngine.Clear.CLEARED:
-                        incoming.setParam("status","10");
-                        incoming.setParam("status_desc", cleared.remaining == 0 ? "repo cleared" : "repo cleared; " + cleared.why);
-                        break;
-                    case RepoEngine.Clear.ONLY_COPY:
-                        incoming.setParam("status","9");
-                        incoming.setParam("status_desc","refused: this repository is the only copy of what it holds ("
-                                + cleared.why + "); pass force=true to clear it anyway");
-                        incoming.setParam("refusal","only-copy");
-                        break;
-                    default:
-                        incoming.setParam("status","9");
-                        incoming.setParam("status_desc","repo not cleared: " + cleared.why);
-                        break;
-                }
-
-            } else {
-                logger.error("No repo name found");
+            boolean force = "true".equalsIgnoreCase(incoming.getParam("force"));
+            if (force && !Callers.hasRole(incoming, Callers.ROLE_ADMIN)) {
                 incoming.setParam("status","9");
-                incoming.setParam("status_desc","No repo or file name name found");
+                incoming.setParam("status_desc","refused: force=true needs the admin role");
+                incoming.setParam("refusal","force-needs-admin");
+                return incoming;
+            }
+            // force=true clears an only copy too: an admin who sends it has decided the contents are disposable.
+            // The check runs inside clearRepo, under the repository gate, never before it.
+            RepoEngine.Clear cleared = repoEngine.clearRepo(incoming.getParam("confirm"), force);
+            if (cleared.state != null && cleared.state.state != null) {
+                incoming.setParam("state", cleared.state.state);
+            }
+            switch (cleared.outcome) {
+                case RepoEngine.Clear.CLEARED:
+                    incoming.setParam("status","10");
+                    incoming.setParam("status_desc", cleared.remaining == 0 ? "repo cleared" : "repo cleared; " + cleared.why);
+                    break;
+                case RepoEngine.Clear.ONLY_COPY:
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","refused: this repository is the only copy of what it holds ("
+                            + cleared.why + "); an admin may pass force=true to clear it anyway");
+                    incoming.setParam("refusal","only-copy");
+                    break;
+                case RepoEngine.Clear.UNCONFIRMED:
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","refused: " + cleared.why);
+                    incoming.setParam("refusal","unconfirmed");
+                    break;
+                case RepoEngine.Clear.PROTECTED:
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","refused: " + cleared.why);
+                    incoming.setParam("refusal","protected-dir");
+                    break;
+                case RepoEngine.Clear.LIVE_ROOT:
+                    return refuseLiveRoot(incoming, cleared.why);
+                default:
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","repo not cleared: " + cleared.why);
+                    break;
             }
 
         } catch(Exception ex){
@@ -904,6 +1215,22 @@ public class ExecutorImpl implements Executor {
             incoming.setParam("status_desc","clear repo error: " + ex.getMessage());
         }
 
+        return incoming;
+    }
+
+    /** releasedeletes: let the next scan offer the deletes the mass-delete guard holds; confirmed like clearrepo. */
+    private MsgEvent releaseDeletes(MsgEvent incoming) {
+        if (!repoEngine.confirms(incoming.getParam("confirm"))) {
+            incoming.setParam("status","9");
+            incoming.setParam("status_desc","refused: confirm must name this repository's directory exactly");
+            incoming.setParam("refusal","unconfirmed");
+            return incoming;
+        }
+        int released = repoEngine.releaseHeldDeletes();
+        incoming.setParam("released", String.valueOf(released));
+        incoming.setParam("status", released > 0 ? "10" : "9");
+        incoming.setParam("status_desc", released > 0 ? released + " held delete(s) released to the next scan"
+                : "no deletes are held");
         return incoming;
     }
 
@@ -1094,8 +1421,10 @@ public class ExecutorImpl implements Executor {
     private MsgEvent removeFile(MsgEvent incoming) {
 
         try {
+            MsgEvent other = refuseOtherRepo(incoming);
+            if (other != null) return other;
 
-            if(incoming.paramsContains("repo_name") && incoming.paramsContains("file_name")){
+            if(incoming.paramsContains("file_name")){
 
                 String repoName = incoming.getParam("repo_name");
                 String fileName = incoming.getParam("file_name");
@@ -1111,7 +1440,7 @@ public class ExecutorImpl implements Executor {
 
 
             } else {
-                logger.error("No repo name found");
+                logger.error("No file name found");
                 incoming.setParam("status","9");
                 incoming.setParam("status_desc","No repo or file name name found");
             }
@@ -1125,13 +1454,14 @@ public class ExecutorImpl implements Executor {
         return incoming;
     }
 
+    /**
+     * putfiles (FR-D10): every file is verified against its expected content hash (file_hashes) before it lands, and the
+     * reply says which were stored, unchanged (already held), skipped (held with other content, overwrite=false) or
+     * failed. Only "every file stored or unchanged" is status 10.
+     */
     private MsgEvent putFiles(MsgEvent incoming) {
 
         try {
-            //String fileName = incoming.getParam("filename");
-            //String fileMD5 = incoming.getParam("md5");
-            //byte[] fileData = incoming.getDataParam("filedata");
-            //String filePath = incoming.getFileList().get(0);
             List<String> fileList = incoming.getFileList();
 
             boolean overwrite = false;
@@ -1139,7 +1469,8 @@ public class ExecutorImpl implements Executor {
 
             if((fileList != null) && incoming.paramsContains("repo_name")){
 
-                String repoName = incoming.getParam("repo_name");
+                MsgEvent other = refuseOtherRepo(incoming);
+                if (other != null) return other;
 
                 // a landing from this agent copies the paths the caller names: none may lie in a live-tier root
                 for (String f : fileList) {
@@ -1149,6 +1480,17 @@ public class ExecutorImpl implements Executor {
                     }
                 }
 
+                Map<String, String> expected = null;
+                String hashesJson = incoming.getCompressedParam("file_hashes");
+                if (hashesJson != null) {
+                    try {
+                        expected = gson.fromJson(hashesJson, stringMapType);
+                    } catch (Exception bad) {
+                        incoming.setParam("status","8");
+                        incoming.setParam("status_desc","file_hashes is not a JSON object of file name to hash");
+                        return incoming;
+                    }
+                }
 
                 try{
                     if(incoming.getParam("overwrite") != null) {
@@ -1162,18 +1504,28 @@ public class ExecutorImpl implements Executor {
                     isLocal = true;
                 }
 
-                if(repoEngine.putFiles(fileList,repoName, overwrite, isLocal)) {
-                    MsgEvent filesConfirm = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,incoming.getSrcRegion(),incoming.getSrcAgent(),incoming.getSrcPlugin());
-                    filesConfirm.setParam("action", "repoconfirm");
-                    filesConfirm.setParam("transfer_id", incoming.getParam("transfer_id"));
-                    plugin.msgOut(filesConfirm);
-                    logger.debug("putfiles stored, confirmation sent");
-                    incoming.setParam("status","10");
-                    incoming.setParam("status_desc","putfiles stored");
-                } else {
-                    logger.error("putfiles failed for repo " + repoName);
+                RepoEngine.Put put = repoEngine.putFiles(fileList, expected, overwrite, isLocal, true);
+                incoming.setCompressedParam("stored", gson.toJson(put.stored));
+                incoming.setCompressedParam("unchanged", gson.toJson(put.unchanged));
+                incoming.setCompressedParam("skipped", gson.toJson(put.skipped));
+                incoming.setCompressedParam("failed", gson.toJson(put.failed));
+                if (put.busy) {
                     incoming.setParam("status","9");
-                    incoming.setParam("status_desc","putfiles failed");
+                    incoming.setParam("status_desc","repository busy: a clear holds it");
+                    incoming.setParam("refusal","busy");
+                } else if (put.allStored()) {
+                    if (incoming.getParam("transfer_id") != null) {
+                        MsgEvent filesConfirm = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,incoming.getSrcRegion(),incoming.getSrcAgent(),incoming.getSrcPlugin());
+                        filesConfirm.setParam("action", "repoconfirm");
+                        filesConfirm.setParam("transfer_id", incoming.getParam("transfer_id"));
+                        plugin.msgOut(filesConfirm);
+                    }
+                    incoming.setParam("status","10");
+                    incoming.setParam("status_desc","putfiles stored: " + put.summary());
+                } else {
+                    logger.warn("putfiles for repo " + incoming.getParam("repo_name") + ": " + put.summary() + " " + put.failed);
+                    incoming.setParam("status","9");
+                    incoming.setParam("status_desc","putfiles incomplete: " + put.summary());
                 }
 
             } else {
@@ -1202,20 +1554,15 @@ public class ExecutorImpl implements Executor {
         try {
 
             String repoListStringIn = incoming.getCompressedParam("repolistin");
+            String deletesIn = incoming.getCompressedParam("repodeletes");
             String transferId = incoming.getParam("transfer_id");
 
             if((repoListStringIn != null) && (transferId != null)) {
 
-                //this needs to be a new thread
-                repoEngine.getFileRepoDiff(repoListStringIn, transferId, incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
-
-                incoming.setParam("status_code","10");
-                incoming.setParam("status_desc","New transferID accepted");
-
-                //logger.info("repoListIn OK");
-                //String repoDiffString = repoEngine.getFileRepoDiff(repoIn,repoListStringIn);
-                //incoming.setCompressedParam("repodiff",repoDiffString);
-
+                RepoEngine.Accepted accepted = repoEngine.acceptDiff(repoListStringIn, deletesIn, transferId,
+                        incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
+                incoming.setParam("status_code", accepted.code);
+                incoming.setParam("status_desc", accepted.desc);
 
             } else {
                 incoming.setParam("status_code","9");
@@ -1230,6 +1577,9 @@ public class ExecutorImpl implements Executor {
         }
         if(incoming.paramsContains("repolistin")) {
             incoming.removeParam("repolistin");
+        }
+        if(incoming.paramsContains("repodeletes")) {
+            incoming.removeParam("repodeletes");
         }
         return incoming;
     }

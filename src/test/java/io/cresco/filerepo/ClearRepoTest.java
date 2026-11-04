@@ -66,12 +66,21 @@ class ClearRepoTest {
         return Files.write(file, content.getBytes());
     }
 
-    /** A putfiles of one local file, landing it (a copy) into the repository. */
+    /** A putfiles of one local file, landing it (a copy) into the repository, with its expected content hash. */
     MsgEvent putfiles(String name) throws Exception {
         Path src = write(tmp.resolve("incoming").resolve(name), "landed " + name);
         MsgEvent m = TestRig.request("putfiles", "repo_name", "fr");
         m.addFile(src.toString());
+        m.setCompressedParam("file_hashes", "{\"" + name + "\":\"" + Hashes.content(Files.readAllBytes(src)) + "\"}");
         return m;
+    }
+
+    /** clearrepo confirmed with this repository's directory, as the caller must; a force is sent by an admin. */
+    MsgEvent clear(String... kv) {
+        MsgEvent m = TestRig.request("clearrepo", "repo_name", "fr", "confirm", rig.repo.repoDirFile().getAbsolutePath());
+        for (int i = 0; i + 1 < kv.length; i += 2) m.setParam(kv[i], kv[i + 1]);
+        if ("true".equalsIgnoreCase(m.getParam("force"))) TestRig.as(m, "admin");
+        return rig.call(m);
     }
 
     // ------------------------------------------------------------------ states and refusals
@@ -90,7 +99,7 @@ class ClearRepoTest {
         assertEquals("subscriber", s.getParam("role"));
         assertEquals("false", s.getParam("landed"));
 
-        MsgEvent c = rig.call("clearrepo", "repo_name", "fr");
+        MsgEvent c = clear();
         assertEquals("10", c.getParam("status"), c.getParams().toString());
         assertEquals("repo cleared", c.getParam("status_desc"));
         assertEquals("MIRROR", c.getParam("state"));
@@ -106,18 +115,18 @@ class ClearRepoTest {
         assertEquals("ONLY_COPY", s.getParam("state"));
         assertEquals("on-demand", s.getParam("role"));
 
-        MsgEvent refused = rig.call("clearrepo", "repo_name", "fr");
+        MsgEvent refused = clear();
         assertEquals("9", refused.getParam("status"));
         assertEquals("only-copy", refused.getParam("refusal"));
         assertEquals("ONLY_COPY", refused.getParam("state"));
         assertTrue(refused.getParam("status_desc").contains("force=true"), refused.getParam("status_desc"));
         assertTrue(Files.exists(f));
 
-        assertEquals("9", rig.call("clearrepo", "repo_name", "fr", "force", "false").getParam("status"));
-        assertEquals("9", rig.call("clearrepo", "repo_name", "fr", "force", "yes").getParam("status"), "only force=true forces");
+        assertEquals("9", clear("force", "false").getParam("status"));
+        assertEquals("9", clear("force", "yes").getParam("status"), "only force=true forces");
         assertTrue(Files.exists(f));
 
-        MsgEvent forced = rig.call("clearrepo", "repo_name", "fr", "force", "true");
+        MsgEvent forced = clear("force", "true");
         assertEquals("10", forced.getParam("status"));
         assertFalse(Files.exists(f));
     }
@@ -130,7 +139,7 @@ class ClearRepoTest {
         MsgEvent s = rig.call("repostate");
         assertEquals("ONLY_COPY", s.getParam("state"));
         assertEquals("producer", s.getParam("role"));
-        assertEquals("only-copy", rig.call("clearrepo", "repo_name", "fr").getParam("refusal"));
+        assertEquals("only-copy", clear().getParam("refusal"));
         assertTrue(Files.exists(f));
     }
 
@@ -145,23 +154,22 @@ class ClearRepoTest {
         MsgEvent s = rig.call("repostate");
         assertEquals("ONLY_COPY", s.getParam("state"));
         assertEquals("true", s.getParam("landed"));
-        assertEquals("only-copy", rig.call("clearrepo", "repo_name", "fr").getParam("refusal"));
+        assertEquals("only-copy", clear().getParam("refusal"));
         assertTrue(Files.exists(landed));
 
         // removing the landed file does not make it a mirror again: only a clear that removed everything does
         assertEquals("10", rig.call("removefile", "repo_name", "fr", "file_name", "landed.bin").getParam("status"));
         assertEquals("ONLY_COPY", rig.call("repostate").getParam("state"));
 
-        assertEquals("10", rig.call("clearrepo", "repo_name", "fr", "force", "true").getParam("status"));
+        assertEquals("10", clear("force", "true").getParam("status"));
         assertEquals("MIRROR", rig.call("repostate").getParam("state"));
     }
 
     @Test
     void aJarLandedInAMirrorMakesItAnOnlyCopyAndTheRecordSurvivesARestart() throws Exception {
         mirror();
-        byte[] jar = "not really a jar".getBytes();
-        Path probe = write(tmp.resolve("probe.jar"), "not really a jar");
-        MsgEvent putjar = TestRig.request("putjar", "pluginname", "p", "md5", rig.plugin.getMD5(probe.toString()),
+        byte[] jar = JarSigning.signedJar("p", "a signed plugin");
+        MsgEvent putjar = TestRig.request("putjar", "pluginname", "p", "md5", Hashes.content(jar),
                 "jarfile", "p.jar", "version", "1");
         putjar.setDataParam("jardata", jar);
         assertEquals("10", rig.call(putjar).getParam("status"));
@@ -173,7 +181,7 @@ class ClearRepoTest {
         mirror();                                            // the same catalog, a fresh engine
         MsgEvent s = rig.call("repostate");
         assertEquals("ONLY_COPY", s.getParam("state"), "the landing is recorded in the catalog, not in memory");
-        assertEquals("only-copy", rig.call("clearrepo", "repo_name", "fr").getParam("refusal"));
+        assertEquals("only-copy", clear().getParam("refusal"));
         assertTrue(Files.exists(tmp.resolve("mirror").resolve("p.jar")));
     }
 
@@ -214,7 +222,7 @@ class ClearRepoTest {
         landing.start();
         assertTrue(entered.await(5, TimeUnit.SECONDS));
 
-        MsgEvent c = rig.call("clearrepo", "repo_name", "fr");
+        MsgEvent c = clear();
         assertEquals("9", c.getParam("status"), "a check made before the gate would have seen MIRROR and deleted the file");
         assertEquals("only-copy", c.getParam("refusal"));
         assertTrue(Files.exists(landed));
@@ -240,7 +248,7 @@ class ClearRepoTest {
             putWaited.set(t.isAlive() && putReply.get() == null);
         };
 
-        MsgEvent c = rig.call("clearrepo", "repo_name", "fr");
+        MsgEvent c = clear();
         rig.repo.afterClearCheck = null;
         assertEquals("10", c.getParam("status"));
         assertEquals("MIRROR", c.getParam("state"));
@@ -268,7 +276,7 @@ class ClearRepoTest {
         int cleared = 0, refused = 0;
         for (int round = 0; round < 25; round++) {
             rig.repo.afterClearCheck = null;
-            assertEquals("10", rig.call("clearrepo", "repo_name", "fr", "force", "true").getParam("status"));
+            assertEquals("10", clear("force", "true").getParam("status"));
             write(dir.resolve("synced-" + round + ".txt"), "from the producer");
             assertEquals("MIRROR", rig.call("repostate").getParam("state"));
             rig.repo.afterClearCheck = () -> {
@@ -313,7 +321,7 @@ class ClearRepoTest {
         try {
             MsgEvent put = putfiles(name);
             go.await(10, TimeUnit.SECONDS);
-            clears.add(rig.call("clearrepo", "repo_name", "fr"));
+            clears.add(clear());
             MsgEvent r = rig.call(put);
             if ("10".equals(r.getParam("status"))) landedOk.add(name);
         } catch (Exception e) {
@@ -341,7 +349,7 @@ class ClearRepoTest {
         threads.add(landing);
         landing.start();
         assertTrue(holding.await(5, TimeUnit.SECONDS));
-        MsgEvent busy = rig.call("clearrepo", "repo_name", "fr", "force", "true");
+        MsgEvent busy = clear("force", "true");
         assertEquals("9", busy.getParam("status"));
         assertTrue(busy.getParam("status_desc").startsWith("repo not cleared"), busy.getParam("status_desc"));
         assertTrue(Files.exists(f));
@@ -357,7 +365,7 @@ class ClearRepoTest {
             } catch (InterruptedException ignored) {
             }
         };
-        Thread clear = new Thread(() -> rig.call("clearrepo", "repo_name", "fr", "force", "true"));
+        Thread clear = new Thread(() -> clear("force", "true"));
         threads.add(clear);
         clear.start();
         assertTrue(inClear.await(5, TimeUnit.SECONDS));

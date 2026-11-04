@@ -26,6 +26,8 @@ final class TestRig implements AutoCloseable {
     static final String REGION = "region-1", AGENT = "agent-1", PLUGIN_ID = "plugin-0";
 
     final Path agentDir;
+    final String pluginId;
+    final Fabric fabric;
     final Map<String, Object> config;
     final PluginBuilder plugin;
     final DBEngine db;
@@ -44,15 +46,41 @@ final class TestRig implements AutoCloseable {
 
     /** filerepo with {@code config} (pluginID added), its catalog under {@code agentDir}, and {@code live} (may be null). */
     TestRig(Path agentDir, Map<String, Object> config, LiveTierClient live) throws Exception {
+        this(agentDir, config, live, PLUGIN_ID, null);
+    }
+
+    /** filerepo as plugin {@code pluginId} on this agent, joined to {@code fabric} (may be null: messages only recorded). */
+    TestRig(Path agentDir, Map<String, Object> config, LiveTierClient live, String pluginId, Fabric fabric) throws Exception {
         this.agentDir = agentDir;
+        this.pluginId = pluginId;
+        this.fabric = fabric;
         Files.createDirectories(agentDir);
         this.config = new HashMap<>(config);
-        this.config.put("pluginID", PLUGIN_ID);
+        this.config.put("pluginID", pluginId);
         this.plugin = new PluginBuilder(agent(), "io.cresco.filerepo.Plugin", null, this.config);
         this.db = new DBEngine(plugin);
         this.repo = new RepoEngine(plugin, db, live);
         this.exec = new ExecutorImpl(plugin, repo, live);
+        // jars are checked by the library's signing policy in production; tests choose their own verifier
+        this.exec.setJarVerifier(jar -> JarSigning.verifyForTests(jar));
         plugin.setIsActive(true);
+        if (fabric != null) fabric.register(this);
+    }
+
+    /** One EXEC request to this rig's plugin, from a caller on this agent. */
+    MsgEvent requestTo(String action, String... kv) {
+        MsgEvent m = new MsgEvent(MsgEvent.Type.EXEC, REGION, AGENT, "caller", REGION, AGENT, pluginId, false, false);
+        m.setParam("action", action);
+        for (int i = 0; i + 1 < kv.length; i += 2) m.setParam(kv[i], kv[i + 1]);
+        return m;
+    }
+
+    /** Stamp {@code m} as infrastructure would for an API user of the tenant holding {@code roles}. */
+    static MsgEvent as(MsgEvent m, String... roles) {
+        m.setParam(Callers.PARAM_CALLER, "api:tenant-a/operator");
+        m.setParam("cresco_caller_tenant", "tenant-a");
+        m.setParam(Callers.PARAM_ROLES, String.join(",", roles));
+        return m;
     }
 
     /** One EXEC request, as a caller on this agent sends it. */
@@ -107,10 +135,27 @@ final class TestRig implements AutoCloseable {
                     switch (m.getName()) {
                         case "addMessageListener":
                             listeners.add(String.valueOf(a[2]));
+                            if (fabric != null) return fabric.addListener(String.valueOf(a[2]), (jakarta.jms.MessageListener) a[1]);
                             return "listener-" + listeners.size();
-                        case "sendMessage":
-                            dataplaneSent.add(a[a.length > 2 && !(a[1] instanceof jakarta.jms.Message) ? 2 : 1]);
+                        case "removeMessageListener":
+                            if (fabric != null) fabric.removeListener(String.valueOf(a[0]));
+                            return null;
+                        case "sendMessage": {
+                            Object msg = a[a.length > 2 && !(a[1] instanceof jakarta.jms.Message) ? 2 : 1];
+                            dataplaneSent.add(msg);
+                            if (fabric != null && msg instanceof jakarta.jms.Message) return fabric.publish((jakarta.jms.Message) msg);
                             return true;
+                        }
+                        case "createBytesMessage":
+                            return FakeJms.bytes();
+                        case "createTextMessage":
+                            return FakeJms.text();
+                        case "createMapMessage":
+                            return FakeJms.map();
+                        case "shardFor":
+                            return 0;
+                        case "getDataPlaneShardCount":
+                            return 1;
                         case "downloadRemoteFile":
                             downloads.add(String.valueOf(a[2]));
                             return null;
@@ -127,6 +172,7 @@ final class TestRig implements AutoCloseable {
                         case "getDataPlaneService": return dp;
                         case "msgOut":
                             sent.add((MsgEvent) a[1]);
+                            if (fabric != null) fabric.route(this, (MsgEvent) a[1]);
                             return null;
                         default: return defaultValue(m.getReturnType());
                     }

@@ -11,19 +11,26 @@ import jakarta.jms.Message;
 import jakarta.jms.MessageListener;
 import jakarta.jms.TextMessage;
 import java.io.File;
-import java.io.PrintWriter;
-import java.io.StringWriter;
+import java.io.IOException;
 import java.lang.reflect.Type;
-import java.nio.file.DirectoryStream;
+import java.nio.file.FileSystemLoopException;
+import java.nio.file.FileVisitOption;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class RepoEngine {
@@ -33,6 +40,12 @@ public class RepoEngine {
     private Gson gson;
 
     private Type repoListType;
+    private final Type deleteListType = new TypeToken<List<DeleteObject>>() {}.getType();
+    private final Type stringListType = new TypeToken<List<String>>() {}.getType();
+
+    /** Files filerepo is still writing (putjar, putfiles, sync) are staged under this name and never scanned or served. */
+    static final String STAGING_PREFIX = ".filerepo-";
+    static final String STAGING_SUFFIX = ".part";
 
     // one scan at a time (the scan timer's own re-entry guard)
     private AtomicBoolean inScan = new AtomicBoolean(false);
@@ -46,6 +59,8 @@ public class RepoEngine {
     volatile long gateWaitMs = 30000L;
     // test hook: runs inside clearRepo between its check and its delete, with the gate held
     volatile Runnable afterClearCheck;
+    // test hook: runs as an updater starts on a diff
+    volatile Runnable beforeApplyDiff;
 
     // Live-tier backing (config live_row): the repository is a live copy or a workspace held at this node, read only
     // through the filesystem. Read once, here; no verb can change it. A live-backed repository runs no scanner and no
@@ -65,25 +80,28 @@ public class RepoEngine {
     private final Object liveRootsLock = new Object();
     private volatile boolean warnedRepoDirConflict;
 
-    private AtomicBoolean lockFileMap = new AtomicBoolean();
-    private Map<String, Map<String,FileObject>> fileMap;
-
-    private AtomicBoolean lockPeerVersionMap = new AtomicBoolean();
-    private Map<String, String> peerVersionMap;
-    // transferId -> the files offered in that transfer; consumed by confirmTransfer() so insync=1
-    // is only recorded once a subscriber confirms verified downloads (bounded: oldest evicted)
-    private final Map<String, Map<String, FileObject>> pendingTransferMap =
-            Collections.synchronizedMap(new LinkedHashMap<String, Map<String, FileObject>>() {
-                protected boolean removeEldestEntry(Map.Entry<String, Map<String, FileObject>> eldest) {
-                    return size() > 64;
+    // transferId -> what that offer carried (files and deletes); consumed by confirmTransfer() so insync=1 is only
+    // recorded once a subscriber confirms verified downloads and applied deletes (bounded: oldest evicted)
+    private final Map<String, Offer> pendingTransferMap =
+            Collections.synchronizedMap(new LinkedHashMap<String, Offer>() {
+                protected boolean removeEldestEntry(Map.Entry<String, Offer> eldest) {
+                    return size() > 4096;
                 }
             });
+    // producer side: catalog path (or "del:" + path) -> when it was last offered, so a file still being fetched is not
+    // offered again every cycle; cleared by the confirm, expired after sync_offer_timeout_ms
+    private final Map<String, Long> offeredAt = new ConcurrentHashMap<>();
+    private final AtomicLong transferSeq = new AtomicLong();
 
-    private AtomicBoolean lockPeerUpdateStateMap = new AtomicBoolean();
-    private Map<String, Boolean> peerUpdateStateMap;
+    private final Object lockPeerUpdateStateMap = new Object();
+    private final Map<String, Boolean> peerUpdateStateMap = new HashMap<>();
 
-    private AtomicBoolean lockPeerUpdateQueueMap = new AtomicBoolean();
-    private Map<String, Queue<Map<String,String>>> peerUpdateQueueMap;
+    private final Object lockPeerUpdateQueueMap = new Object();
+    // producer -> its diffs waiting for the updater (FR-D5: bounded per producer and in producers)
+    private final Map<String, Deque<PendingDiff>> peerUpdateQueueMap = new HashMap<>();
+    // subscriber side: the producers this repository subscribed to (from their discover broadcasts); a diff from any
+    // other source is refused, so no caller can make this repository fetch from an agent it never chose
+    private final Set<String> knownProducers = ConcurrentHashMap.newKeySet();
 
     private Type mapType;
 
@@ -93,23 +111,50 @@ public class RepoEngine {
 
     private String scanDirString;
 
-    private AtomicBoolean lockSubscriberMap = new AtomicBoolean();
+    private final Object lockSubscriberMap = new Object();
     private Map<String,Map<String,String>> subscriberMap;
 
     private int transferId = -1;
 
     private  DBEngine dbEngine;
 
-    private List<String> listenerList;
+    private final List<String> listenerList = Collections.synchronizedList(new ArrayList<>());
     private String fileRepoName;
     private String repoDir;
 
-    // Bounded, named, daemon pool for peer-sync downloader threads (replaces unbounded new Thread()).
-    // core==max so up to N peer syncs run concurrently: with core<max and an unbounded queue,
-    // ThreadPoolExecutor never starts more than core threads, so this used to pin at 1.
-    private final ThreadPoolExecutor syncPool = new ThreadPoolExecutor(8, 8, 60L, TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(),
-            r -> { Thread t = new Thread(r, "filerepo-sync"); t.setDaemon(true); return t; });
+    // ---- limits and tunables (config) ----
+    private final int scanBatchSize;
+    private final int diffPageSize;
+    private final int deletePageSize;
+    private final int syncPendingPerPeer;
+    private final int syncMaxPeers;
+    private final long offerTimeoutMs;
+    private final long tombstoneTtlMs;
+    private final int deleteGuardMin;
+    private final double deleteGuardFraction;
+    private final boolean followLinks;
+    private final boolean requirePutHashes;
+    private final int syncStreamBuffer;
+    private final long syncStreamIdleMs;
+    private final int syncStreamRounds;
+    private final long syncRpcTimeoutMs;
+
+    // Bounded, named, daemon pool for peer-sync updaters: one per producer at a time, at most sync_threads at once,
+    // and at most sync_queue_max waiting (FR-D5). A diff that finds both full is refused as busy (status 11) and the
+    // producer offers it again next cycle: back-pressure instead of an unbounded backlog.
+    private final ThreadPoolExecutor syncPool;
+
+    // ---- sync metrics ----
+    final AtomicLong syncRejected = new AtomicLong();
+    final AtomicLong syncRefused = new AtomicLong();
+    final AtomicLong syncFetched = new AtomicLong();
+    final AtomicLong syncFetchFailed = new AtomicLong();
+    final AtomicLong syncVerifyFailed = new AtomicLong();
+    final AtomicLong syncDeleted = new AtomicLong();
+    final AtomicLong tombstonesRecorded = new AtomicLong();
+    // the deletes the last scan held back (the mass-delete guard), and how many an admin released
+    private volatile int deletesHeld;
+    private volatile int releaseUpTo;
 
     public RepoEngine(PluginBuilder pluginBuilder, DBEngine dbEngine) {
         this(pluginBuilder, dbEngine, null);
@@ -128,12 +173,6 @@ public class RepoEngine {
         this.mapType = new TypeToken<Map<String,String>>() {}.getType();
 
         subscriberMap = Collections.synchronizedMap(new HashMap<>());
-        listenerList = new ArrayList<>();
-
-        fileMap = Collections.synchronizedMap(new HashMap<>());
-        peerVersionMap = Collections.synchronizedMap(new HashMap<>());
-        peerUpdateStateMap = Collections.synchronizedMap(new HashMap<>());
-        peerUpdateQueueMap = Collections.synchronizedMap(new HashMap<>());
 
         scanDirString =  plugin.getConfig().getStringParam("scan_dir");
         fileRepoName =  plugin.getConfig().getStringParam("filerepo_name");
@@ -143,6 +182,36 @@ public class RepoEngine {
         liveRow = (row == null || row.trim().isEmpty()) ? null : row.trim();
         // the same test start() applies to choose the subscriber mode
         subscriber = (liveRow == null) && (scanDirString == null) && (fileRepoName != null) && (repoDir != null);
+
+        scanBatchSize = (int) clamp(longParam("scan_batch_size", 500L), 1, 100_000);
+        diffPageSize = (int) clamp(longParam("sync_diff_page", 1000L), 1, 100_000);
+        deletePageSize = (int) clamp(longParam("sync_delete_page", 1000L), 1, 100_000);
+        syncPendingPerPeer = (int) clamp(longParam("sync_pending_per_peer", 4L), 1, 1024);
+        syncMaxPeers = (int) clamp(longParam("sync_max_peers", 256L), 1, 100_000);
+        offerTimeoutMs = clamp(longParam("sync_offer_timeout_ms", 600_000L), 1_000L, Long.MAX_VALUE);
+        tombstoneTtlMs = clamp(longParam("sync_tombstone_ttl_ms", 7L * 24 * 3600 * 1000), 0L, Long.MAX_VALUE);
+        deleteGuardMin = (int) clamp(longParam("sync_delete_guard_min", 100L), 1, Integer.MAX_VALUE);
+        double fraction = 0.25;
+        try {
+            Double d = plugin.getConfig().getDoubleParam("sync_delete_guard_fraction");
+            if (d != null && d > 0 && d <= 1) fraction = d;
+        } catch (Exception ignore) { }
+        deleteGuardFraction = fraction;
+        followLinks = plugin.getConfig().getBooleanParam("scan_follow_links", false);
+        requirePutHashes = plugin.getConfig().getBooleanParam("putfiles_require_hashes", true);
+        syncStreamBuffer = (int) clamp(longParam("sync_stream_buffer", 262144L), 4096, 786432);
+        syncStreamIdleMs = clamp(longParam("sync_stream_idle_ms", 30_000L), 100L, 3_600_000L);
+        syncStreamRounds = (int) clamp(longParam("sync_stream_rounds", 3L), 1, 16);
+        syncRpcTimeoutMs = clamp(longParam("sync_rpc_timeout_ms", 30_000L), 100L, 600_000L);
+
+        int syncThreads = (int) clamp(longParam("sync_threads", 8L), 1, 256);
+        int syncQueue = (int) clamp(longParam("sync_queue_max", 64L), 1, 100_000);
+        syncPool = new ThreadPoolExecutor(syncThreads, syncThreads, 60L, TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(syncQueue),
+                r -> { Thread t = new Thread(r, "filerepo-sync"); t.setDaemon(true); return t; },
+                new ThreadPoolExecutor.AbortPolicy());
+        // let idle sync threads retire (core==max would otherwise keep them alive forever)
+        syncPool.allowCoreThreadTimeOut(true);
 
         if (liveTier != null) {
             List<String> known = new ArrayList<>();
@@ -158,8 +227,34 @@ public class RepoEngine {
             liveTier.rememberRoots(known, this::rememberLiveRoot);
         }
 
-        // let idle sync threads retire (core==max would otherwise keep 8 daemons alive forever)
-        syncPool.allowCoreThreadTimeOut(true);
+        if (liveRow == null && scanDirString == null && repoDir == null) {
+            // FR-D9: the old default was the relative path "filerepo", wherever the JVM happened to start
+            File legacy = new File("filerepo").getAbsoluteFile();
+            if (legacy.isDirectory()) {
+                logger.warn("repo_dir is not set: the repository is now " + getRepoDir().getAbsolutePath()
+                        + " (it was the relative path 'filerepo'); files landed before are still in "
+                        + legacy.getAbsolutePath() + " and are not served until moved");
+            }
+        } else if (liveRow == null) {
+            String configuredDir = scanDirString != null ? scanDirString : repoDir;
+            if (configuredDir != null && !new File(configuredDir).isAbsolute()) {
+                logger.warn("the repository directory '" + configuredDir + "' is relative: it depends on the agent's"
+                        + " working directory; configure an absolute path");
+            }
+        }
+    }
+
+    private long longParam(String name, long dflt) {
+        try {
+            Long v = plugin.getConfig().getLongParam(name, dflt);
+            return v == null ? dflt : v;
+        } catch (Exception ex) {
+            return dflt;
+        }
+    }
+
+    private static long clamp(long v, long min, long max) {
+        return Math.max(min, Math.min(max, v));
     }
 
     /** Keep a live-tier root in the catalog, so it is refused even while no provider is registered. */
@@ -187,7 +282,7 @@ public class RepoEngine {
      */
     String repoDirConflict() {
         if (liveTier == null) return null;
-        for (String dir : new String[]{scanDirString, plugin.getConfig().getStringParam("repo_dir", "filerepo")}) {
+        for (String dir : new String[]{scanDirString, repoDirFile().getPath()}) {
             if (dir == null) continue;
             String why = liveTier.liveRootConflict(Paths.get(dir));
             if (why != null) return why;
@@ -203,6 +298,11 @@ public class RepoEngine {
     /** The live-tier row this repository is backed by, or null. */
     public String getLiveRow() {
         return liveRow;
+    }
+
+    /** This repository's name (filerepo_name), or null. */
+    String getRepoName() {
+        return fileRepoName;
     }
 
     public void start() {
@@ -244,55 +344,11 @@ public class RepoEngine {
         TimerTask fileScanTask = new TimerTask() {
             public void run() {
                 try {
-
                     if(plugin.isActive()) {
-
-                        //check file location
-                        if(Paths.get(scanDirString).toFile().exists()) {
-
-                            // claim the scan atomically; the finally guarantees release even if the scan/sync throws
-                            if (inScan.compareAndSet(false, true)) {
-                                try {
-                                    String conflict = repoDirConflict();
-                                    if (conflict != null) {
-                                        // a scan dir over live-tier files: catalog and offer none of them
-                                        if (!warnedRepoDirConflict) {
-                                            logger.error("scan refused: the scan dir " + conflict);
-                                            warnedRepoDirConflict = true;
-                                        }
-                                    // the shared side of the repository gate: a clear holding it skips this cycle
-                                    } else if (gate.readLock().tryLock()) {
-                                        try {
-                                            logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " inScan: " + inScan.get() + " tid:" + transferId);
-
-                                            //build file list
-                                            Map<String, FileObject> diffList = getFileRepoDiff();
-                                            if (diffList.size() > 0) {
-
-                                                logger.debug("SYNC Files");
-                                                syncRegionFiles(diffList);
-                                            }
-                                        } finally {
-                                            gate.readLock().unlock();
-                                        }
-                                    } else {
-                                        logger.debug("scan skipped: a clear holds the repository gate");
-                                    }
-                                } finally {
-                                    inScan.set(false);
-                                }
-
-                            } else {
-                                logger.debug("already in scan");
-                            }
-                        } else {
-                            logger.warn("scan dir no longer exists: " + scanDirString);
-                        }
-
+                        scanOnce();
                     } else {
                         logger.debug("scan skipped: plugin not active");
                     }
-
                 } catch (Exception ex) {
                     logger.error("filerepo error", ex);
                 }
@@ -329,6 +385,52 @@ public class RepoEngine {
         logger.debug("broadcasttimer : set : " + period);
     }
 
+    /**
+     * One scan cycle: catalog what changed, record what was deleted, offer both to the subscribers. Returns false when
+     * the cycle was skipped (another scan running, the scan dir missing, the gate held, the dir over a live root).
+     */
+    boolean scanOnce() {
+        //check file location
+        if (!Paths.get(scanDirString).toFile().exists()) {
+            logger.warn("scan dir no longer exists: " + scanDirString);
+            return false;
+        }
+        // claim the scan atomically; the finally guarantees release even if the scan/sync throws
+        if (!inScan.compareAndSet(false, true)) {
+            logger.debug("already in scan");
+            return false;
+        }
+        try {
+            String conflict = repoDirConflict();
+            if (conflict != null) {
+                // a scan dir over live-tier files: catalog and offer none of them
+                if (!warnedRepoDirConflict) {
+                    logger.error("scan refused: the scan dir " + conflict);
+                    warnedRepoDirConflict = true;
+                }
+                return false;
+            }
+            // the shared side of the repository gate: a clear holding it skips this cycle
+            if (!gate.readLock().tryLock()) {
+                logger.debug("scan skipped: a clear holds the repository gate");
+                return false;
+            }
+            try {
+                logger.debug("\t\t ***STARTING SCAN repo_name: " + fileRepoName + " tid:" + transferId);
+                ScanResult result = scan();
+                if (!result.files.isEmpty() || !result.deletes.isEmpty()) {
+                    logger.debug("SYNC Files");
+                    syncRegionFiles(result);
+                }
+                return true;
+            } finally {
+                gate.readLock().unlock();
+            }
+        } finally {
+            inScan.set(false);
+        }
+    }
+
     public void shutdown() {
 
         if(repoBroadcastTimer != null) {
@@ -336,11 +438,17 @@ public class RepoEngine {
             repoBroadcastTimer = null;
         }
         stopScan();
-        //if(fileRepoName != null) {
-        //    repoBroadcast(fileRepoName,"shutdown");
-        //}
-        for(String listenerid : listenerList) {
-            plugin.getAgentService().getDataPlaneService().removeMessageListener(listenerid);
+        List<String> ids;
+        synchronized (listenerList) {
+            ids = new ArrayList<>(listenerList);
+            listenerList.clear();
+        }
+        for(String listenerid : ids) {
+            try {
+                plugin.getAgentService().getDataPlaneService().removeMessageListener(listenerid);
+            } catch (Exception ex) {
+                logger.error("listener removal error", ex);
+            }
         }
         try { syncPool.shutdownNow(); } catch (Exception ex) { logger.error("syncPool shutdown error", ex); }
 
@@ -361,158 +469,181 @@ public class RepoEngine {
         }
     }
 
-    private List<File> getFileNames(List<File> fileNames, Path dir) {
-        try(DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
-            for (Path path : stream) {
-                if(path.toFile().isDirectory()) {
-                    getFileNames(fileNames, path);
-                } else {
-                    fileNames.add(path.toFile());
-                }
-            }
-        } catch(Exception e) {
-            logger.error("filerepo error", e);
-        }
-        return fileNames;
+    static boolean isStaging(String name) {
+        return name != null && name.startsWith(STAGING_PREFIX) && name.endsWith(STAGING_SUFFIX);
     }
 
-    //build and sync
-    Map<String,FileObject> getFileRepoDiff() {
+    /** A fresh staging file beside {@code destination}: same directory, so the final move is an atomic rename. */
+    static Path stagingFor(Path destination) {
+        return destination.resolveSibling(STAGING_PREFIX + UUID.randomUUID().toString().replace("-", "") + STAGING_SUFFIX);
+    }
 
-        Map<String,FileObject> fileDiffMap = null;
+    /**
+     * The regular files under {@code root} (recursively or not), skipping staging files and, unless scan_follow_links,
+     * every symbolic link. Returns false when part of the tree could not be read: then no file may be taken for deleted.
+     */
+    private boolean walk(Path root, boolean recursive, List<Path> out) {
+        final boolean[] complete = {true};
         try {
+            Files.walkFileTree(root,
+                    followLinks ? EnumSet.of(FileVisitOption.FOLLOW_LINKS) : EnumSet.noneOf(FileVisitOption.class),
+                    recursive ? Integer.MAX_VALUE : 1,
+                    new SimpleFileVisitor<Path>() {
+                        @Override
+                        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                            if (attrs.isRegularFile() && !isStaging(file.getFileName().toString())) out.add(file);
+                            return FileVisitResult.CONTINUE;
+                        }
 
-            fileDiffMap = new HashMap<>();
+                        @Override
+                        public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                            if (exc instanceof FileSystemLoopException) {
+                                logger.warn("scan: a directory loop at " + file + " was not followed");
+                            } else {
+                                complete[0] = false;
+                                logger.warn("scan: could not read " + file + ": " + exc.getMessage());
+                            }
+                            return FileVisitResult.CONTINUE;
+                        }
+                    });
+        } catch (IOException ex) {
+            complete[0] = false;
+            logger.error("scan walk failed: " + ex.getMessage());
+        }
+        return complete[0];
+    }
 
-            // Load the catalog once (path -> lastmodified) so the per-file freshness check below is
-            // an in-memory lookup instead of a DB round-trip per file on every scan cycle.
-            Map<String,Long> catalogMtime = new HashMap<>();
-            for (Map<String,String> row : dbEngine.getRepoList()) {
-                try { catalogMtime.put(row.get("filepath"), Long.parseLong(row.get("lastmodified"))); }
-                catch (Exception ignore) { /* skip malformed row */ }
-            }
+    /** What one scan found to offer: new and changed files, and deletes. */
+    static final class ScanResult {
+        final Map<String, FileObject> files;
+        final List<DeleteObject> deletes;
 
-            File[] listOfFiles = null;
+        ScanResult(Map<String, FileObject> files, List<DeleteObject> deletes) {
+            this.files = files;
+            this.deletes = deletes;
+        }
+    }
+
+    /** What one offer (a page of a scan) carried, to settle on its confirm. */
+    static final class Offer {
+        final Map<String, FileObject> files;
+        final List<DeleteObject> deletes;
+
+        Offer(Map<String, FileObject> files, List<DeleteObject> deletes) {
+            this.files = files;
+            this.deletes = deletes;
+        }
+    }
+
+    //build and sync (the scan's files to offer; deletes are recorded and kept in the catalog)
+    Map<String,FileObject> getFileRepoDiff() {
+        return scan().files;
+    }
+
+    /**
+     * Scan the scan dir against the catalog: new and changed files are hashed and cataloged in batches (FR-D8), files
+     * that are gone become tombstones (FR-D4), unless the mass-delete guard holds them, and unconfirmed rows and
+     * tombstones are offered again once their last offer has expired.
+     */
+    ScanResult scan() {
+
+        Map<String,FileObject> fileDiffMap = new LinkedHashMap<>();
+        List<DeleteObject> deletes = new ArrayList<>();
+        try {
+            Path root = Paths.get(scanDirString).toAbsolutePath();
             boolean scanRecursive = plugin.getConfig().getBooleanParam("scan_recursive",true);
-            if(scanRecursive) {
-                logger.debug("SCAN RECURSIVE");
-                List<File> tp = new ArrayList<>();
-                List<File> fn = getFileNames(tp,Paths.get(scanDirString));
-                for(File f : fn) {
-                    logger.debug("File: " + f.getAbsolutePath());
-                }
 
-
-                listOfFiles = new File[fn.size()];
-                listOfFiles = fn.toArray(listOfFiles);
-
-            } else {
-                logger.debug("NOT SCAN RECURSIVE");
-                //get all files in the scan directory
-                File folder = new File(scanDirString);
-                listOfFiles = folder.listFiles();
+            // Load the catalog once (path -> md5, lastmodified, filesize) so the per-file freshness check below is an
+            // in-memory lookup instead of a DB round-trip per file on every scan cycle.
+            Map<String,String[]> catalog = new HashMap<>();
+            for (Map<String,String> row : dbEngine.getRepoList()) {
+                catalog.put(row.get("filepath"), new String[]{row.get("md5"), row.get("lastmodified"), row.get("filesize")});
             }
 
-            if(listOfFiles != null) {
-                for (int i = 0; i < listOfFiles.length; i++) {
-                    if (listOfFiles[i].isFile()) {
-                        // In recursive mode use the path RELATIVE to scan_dir so nested directory
-                        // structure is preserved on the consumer (the consumer creates parent dirs);
-                        // getName() alone would flatten every subdir file to its basename and collide.
-                        String fileName;
-                        if (scanRecursive) {
-                            fileName = Paths.get(scanDirString).toAbsolutePath()
-                                    .relativize(listOfFiles[i].toPath().toAbsolutePath()).toString();
-                        } else {
-                            fileName = listOfFiles[i].getName();
-                        }
-                        String filePath = listOfFiles[i].getAbsolutePath();
-                        long lastModified = listOfFiles[i].lastModified();
-                        long filesize = listOfFiles[i].length();
+            List<Path> found = new ArrayList<>();
+            boolean complete = walk(root, scanRecursive, found);
 
-                        boolean add = false;
-                        boolean update = false;
-
-                        //see if file is in the database (in-memory lookup from the pre-loaded catalog)
-                        long lastModifiedDb = catalogMtime.getOrDefault(filePath, -1L);
-                        logger.trace("found file: " + filePath + " lastmodified: " + lastModified + " dblastmodified: " + lastModifiedDb);
-                        if (lastModifiedDb == -1) {
-                            add = true;
-                            logger.trace("add file: " + filePath);
-                        } else if (lastModifiedDb < lastModified) {
-                            update = true;
-                            logger.trace("add file: " + filePath);
-                        } else if (lastModifiedDb > lastModified) {
-                            logger.error("How can an older file be recored in DB? lastModifiedDb > lastModified ");
-                            update = true;
-                            logger.trace("update file: " + filePath);
-                        }
-
-                        String MD5hash = null;
-                        if (add || update) {
-                            // a link into a live-tier root is never read, cataloged or offered
-                            String conflict = liveRootConflict(listOfFiles[i].toPath());
-                            if (conflict != null) {
-                                logger.warn("skipping a file that " + conflict);
-                                continue;
-                            }
-                            MD5hash = plugin.getMD5(filePath);
-                            // Skip files we can't safely catalog: a null md5 means the file vanished
-                            // mid-scan (getMD5 failed); a path longer than the catalog column would
-                            // fail the insert. Skipping keeps one bad file from wedging the scan.
-                            if (MD5hash == null || filePath.length() > 1000) {
-                                logger.warn("skipping uncatalogable file (null md5 or path>1000): " + filePath);
-                                continue;
-                            }
-                            logger.trace("generate MD5 for fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
-                            FileObject fileObject = new FileObject(fileName, MD5hash, filePath, lastModified, filesize);
-                            fileDiffMap.put(filePath, fileObject);
-                        }
-
-                        if (add) {
-                            dbEngine.addFile(filePath, MD5hash, lastModified, filesize);
-                            logger.trace("DB insert fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
-                        }
-
-                        if (update) {
-                            dbEngine.updateFile(filePath, MD5hash, 0, lastModified, filesize);
-                            logger.trace("DB update fileName:" + filePath + " MD5:" + MD5hash + " filepath:" + filePath);
-                        }
-
-                        if (add || update) {
-                            //start sync
-                            transferId++;
-                            //find other repos
-                        }
-
-                    }
+            Set<String> seen = new HashSet<>();
+            List<DBEngine.Row> adds = new ArrayList<>();
+            List<DBEngine.Row> updates = new ArrayList<>();
+            for (Path p : found) {
+                String filePath = p.toFile().getAbsolutePath();
+                seen.add(filePath);
+                long lastModified;
+                long filesize;
+                try {
+                    BasicFileAttributes a = Files.readAttributes(p, BasicFileAttributes.class,
+                            followLinks ? new LinkOption[0] : new LinkOption[]{LinkOption.NOFOLLOW_LINKS});
+                    lastModified = a.lastModifiedTime().toMillis();
+                    filesize = a.size();
+                } catch (IOException gone) {
+                    continue;   // vanished mid-scan: the next cycle sees it
                 }
-            }
+                String[] row = catalog.get(filePath);
+                boolean add = row == null;
+                boolean update = false;
+                if (!add) {
+                    long dbMtime = -1, dbSize = -1;
+                    try { dbMtime = Long.parseLong(row[1]); } catch (Exception ignore) { }
+                    try { dbSize = Long.parseLong(row[2]); } catch (Exception ignore) { }
+                    update = dbMtime != lastModified || dbSize != filesize;
+                }
+                if (!add && !update) continue;
 
-            // Re-offer catalog rows no subscriber has confirmed (insync=0): the FS-vs-DB diff
-            // above only sees NEW or MODIFIED files, so a failed download would otherwise become
-            // a permanent silent gap (receivers md5-skip files they already hold, so this is cheap).
-            boolean reofferRecursive = plugin.getConfig().getBooleanParam("scan_recursive",true);
-            for (Map<String,String> row : dbEngine.getFilesNotInSync()) {
-                String filePath = row.get("filepath");
-                if (fileDiffMap.containsKey(filePath)) {
+                // a link into a live-tier root is never read, cataloged or offered
+                String conflict = liveRootConflict(p);
+                if (conflict != null) {
+                    logger.warn("skipping a file that " + conflict);
                     continue;
                 }
-                File unsyncedFile = new File(filePath);
-                if (!unsyncedFile.isFile()) {
+                String MD5hash = plugin.getMD5(filePath);
+                // Skip files we can't safely catalog: a null md5 means the file vanished mid-scan (getMD5 failed); a
+                // path longer than the catalog column would fail the insert. Skipping keeps one bad file from wedging
+                // the scan.
+                if (MD5hash == null || filePath.length() > 1000) {
+                    logger.warn("skipping uncatalogable file (null md5 or path>1000): " + filePath);
+                    continue;
+                }
+                // In recursive mode use the path RELATIVE to scan_dir so nested directory structure is preserved on the
+                // consumer (the consumer creates parent dirs); getName() alone would flatten and collide.
+                String fileName = scanRecursive ? root.relativize(p.toAbsolutePath()).toString() : p.getFileName().toString();
+                fileDiffMap.put(filePath, new FileObject(fileName, MD5hash, filePath, lastModified, filesize));
+                (add ? adds : updates).add(new DBEngine.Row(filePath, MD5hash, lastModified, filesize));
+                if (adds.size() + updates.size() >= scanBatchSize) {
+                    dbEngine.applyScan(adds, updates, scanBatchSize);
+                    adds.clear();
+                    updates.clear();
+                }
+                transferId++;
+            }
+            dbEngine.applyScan(adds, updates, scanBatchSize);
+
+            // the delete phase: catalog rows under the scan dir whose file is gone
+            if (complete) {
+                recordDeletes(root, scanRecursive, catalog, seen);
+            } else {
+                logger.warn("scan of " + root + " was incomplete: no file is taken for deleted this cycle");
+            }
+
+            long now = System.currentTimeMillis();
+            // Re-offer catalog rows no subscriber has confirmed (insync=0): the FS-vs-DB diff above only sees NEW or
+            // MODIFIED files, so a failed download would otherwise become a permanent silent gap. A row offered less
+            // than sync_offer_timeout_ms ago is still being fetched and is not offered again.
+            for (Map<String,String> row : dbEngine.getFilesNotInSync()) {
+                String filePath = row.get("filepath");
+                if (fileDiffMap.containsKey(filePath) || inFlight(filePath, now)) {
+                    continue;
+                }
+                Path unsynced = Paths.get(filePath);
+                if (!unsynced.toAbsolutePath().startsWith(root) || !Files.isRegularFile(unsynced)) {
                     continue;
                 }
                 // a row cataloged before a live-tier root was known is never offered from it
-                if (liveRootConflict(unsyncedFile.toPath()) != null) {
+                if (liveRootConflict(unsynced) != null) {
                     continue;
                 }
-                String reofferName;
-                if (reofferRecursive) {
-                    reofferName = Paths.get(scanDirString).toAbsolutePath()
-                            .relativize(unsyncedFile.toPath().toAbsolutePath()).toString();
-                } else {
-                    reofferName = unsyncedFile.getName();
-                }
+                String reofferName = scanRecursive ? root.relativize(unsynced.toAbsolutePath()).toString()
+                        : unsynced.getFileName().toString();
                 try {
                     fileDiffMap.put(filePath, new FileObject(reofferName, row.get("md5"), filePath,
                             Long.parseLong(row.get("lastmodified")), Long.parseLong(row.get("filesize"))));
@@ -520,313 +651,525 @@ public class RepoEngine {
                     logger.error("re-offer skipped for malformed catalog row: " + filePath, rex);
                 }
             }
-
-        }catch (Exception ex) {
-            logger.error(ex.getMessage());
-            logger.error("filerepo error", ex);
-        }
-        return fileDiffMap;
-    }
-
-    private void syncRegionFiles(Map<String,FileObject> fileDiffMap) {
-        String returnString = null;
-        try {
-            int subscriberCount = 0;
-
-            List<Map<String,String>> currentSubscriberList = null;
-
-            synchronized (lockSubscriberMap) {
-                subscriberCount = subscriberMap.size();
-                if (subscriberCount >0) {
-                    currentSubscriberList = new ArrayList<>();
-                    for (Map<String,String> subscriber : subscriberMap.values()) {
-                        currentSubscriberList.add(subscriber);
-                    }
-                }
+            for (DBEngine.Tombstone t : dbEngine.getTombstonesNotInSync(deletePageSize * 16)) {
+                if (inFlight("del:" + t.filepath, now)) continue;
+                deletes.add(new DeleteObject(t.filename, t.md5, t.filepath, t.deletedAt));
+            }
+            if (tombstoneTtlMs > 0) {
+                int purged = dbEngine.purgeTombstones(now - tombstoneTtlMs);
+                if (purged > 0) logger.debug("purged " + purged + " confirmed tombstone(s)");
             }
 
-            if(subscriberCount > 0) {
+        } catch (Exception ex) {
+            logger.error("filerepo scan error", ex);
+        }
+        return new ScanResult(fileDiffMap, deletes);
+    }
 
+    private boolean inFlight(String key, long now) {
+        Long at = offeredAt.get(key);
+        if (at == null) return false;
+        if (now - at < offerTimeoutMs) return true;
+        offeredAt.remove(key, at);
+        return false;
+    }
+
+    /**
+     * Turn the catalog rows whose file is gone into tombstones, unless the mass-delete guard holds them: a scan dir that
+     * is suddenly empty (an unmounted volume, a removed directory) or loses more than sync_delete_guard_fraction of the
+     * catalog (and at least sync_delete_guard_min files) must not empty every subscriber. Held deletes are reported
+     * (repostate, getmetrics, health) until an admin releases them (releasedeletes) or the files come back.
+     */
+    private void recordDeletes(Path root, boolean recursive, Map<String, String[]> catalog, Set<String> seen) {
+        List<DBEngine.Tombstone> gone = new ArrayList<>();
+        long now = System.currentTimeMillis();
+        for (Map.Entry<String, String[]> e : catalog.entrySet()) {
+            String path = e.getKey();
+            if (seen.contains(path)) continue;
+            Path p = Paths.get(path);
+            // a stale row from elsewhere (an earlier scan_dir) is not this scanner's to delete
+            if (!p.toAbsolutePath().startsWith(root)) continue;
+            // still there: a subdirectory file in a non-recursive scan, a link, an unreadable file
+            if (Files.exists(p, LinkOption.NOFOLLOW_LINKS)) continue;
+            String name = recursive ? root.relativize(p.toAbsolutePath()).toString() : p.getFileName().toString();
+            gone.add(new DBEngine.Tombstone(path, name, e.getValue()[0], now));
+        }
+        if (gone.isEmpty()) {
+            if (deletesHeld != 0) logger.info("the held deletes are gone (the files came back)");
+            deletesHeld = 0;
+            releaseUpTo = 0;
+            return;
+        }
+        boolean mass = seen.isEmpty()
+                || (gone.size() >= deleteGuardMin && gone.size() > deleteGuardFraction * catalog.size());
+        if (mass) {
+            int released = releaseUpTo;
+            if (released > 0 && gone.size() <= released) {
+                logger.warn("releasing " + gone.size() + " held delete(s), as an admin asked");
+                releaseUpTo = 0;
+            } else {
+                if (deletesHeld != gone.size()) {
+                    logger.error("mass-delete guard: " + gone.size() + " of " + catalog.size() + " cataloged file(s) are"
+                            + " gone from " + root + (seen.isEmpty() ? " (the scan dir is empty)" : "")
+                            + "; the deletes are held, not offered to subscribers. If this is intended, an admin"
+                            + " releases them with releasedeletes");
+                }
+                deletesHeld = gone.size();
+                return;
+            }
+        }
+        deletesHeld = 0;
+        int n = dbEngine.tombstone(gone, scanBatchSize);
+        tombstonesRecorded.addAndGet(n);
+        if (n > 0) logger.info("recorded " + n + " deleted file(s) to offer to subscribers");
+    }
+
+    /** How many deletes the mass-delete guard is holding. */
+    int getDeletesHeld() {
+        return deletesHeld;
+    }
+
+    /**
+     * Let the next scan record up to the deletes now held (an admin's releasedeletes). Returns how many were released,
+     * 0 when nothing is held.
+     */
+    int releaseHeldDeletes() {
+        int held = deletesHeld;
+        if (held > 0) releaseUpTo = held;
+        return held;
+    }
+
+    private void syncRegionFiles(ScanResult result) {
+        try {
+            List<Map<String,String>> currentSubscriberList;
+            synchronized (lockSubscriberMap) {
+                currentSubscriberList = new ArrayList<>(subscriberMap.values());
+            }
+            if (currentSubscriberList.isEmpty()) return;
+
+            // FR-D5/scale: one message per page, never the whole catalog in one control-plane message
+            List<FileObject> files = new ArrayList<>(result.files.values());
+            List<DeleteObject> deletes = result.deletes;
+            int pages = Math.max((files.size() + diffPageSize - 1) / diffPageSize,
+                    (deletes.size() + deletePageSize - 1) / deletePageSize);
+            long now = System.currentTimeMillis();
+            for (int page = 0; page < pages; page++) {
+                Map<String, FileObject> pageFiles = new LinkedHashMap<>();
+                for (FileObject f : files.subList(Math.min(files.size(), page * diffPageSize),
+                        Math.min(files.size(), (page + 1) * diffPageSize))) {
+                    pageFiles.put(f.filePath, f);
+                }
+                List<DeleteObject> pageDeletes = new ArrayList<>(deletes.subList(Math.min(deletes.size(), page * deletePageSize),
+                        Math.min(deletes.size(), (page + 1) * deletePageSize)));
+                String tid = String.valueOf(transferSeq.incrementAndGet());
                 //remember what this transfer offered; insync flips only on subscriber confirm
-                pendingTransferMap.put(String.valueOf(transferId), new HashMap<>(fileDiffMap));
+                pendingTransferMap.put(tid, new Offer(pageFiles, pageDeletes));
+                for (String p : pageFiles.keySet()) offeredAt.put(p, now);
+                for (DeleteObject d : pageDeletes) offeredAt.put("del:" + d.filePath, now);
 
-                // the diff is identical for every subscriber: serialize it once, not once per peer
-                String repoListStringIn = gson.toJson(fileDiffMap);
+                // the page is identical for every subscriber: serialize it once, not once per peer
+                String filesJson = gson.toJson(pageFiles);
+                String deletesJson = pageDeletes.isEmpty() ? null : gson.toJson(pageDeletes);
 
-                for (Map<String, String> subscriberMap : currentSubscriberList) {
-
+                for (Map<String, String> sub : currentSubscriberList) {
                     //This is another filerepo in my region, I need to send it data
-                    String region = subscriberMap.get("sub_region_id");
-                    String agent = subscriberMap.get("sub_agent_id");
-                    String pluginID = subscriberMap.get("sub_plugin_id");
-
-                    logger.debug("SEND :" + region + " " + agent + " " + pluginID + " data");
+                    String region = sub.get("sub_region_id");
+                    String agent = sub.get("sub_agent_id");
+                    String pluginID = sub.get("sub_plugin_id");
 
                     MsgEvent fileRepoRequest = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginID);
                     fileRepoRequest.setParam("action", "repolistin");
-                    fileRepoRequest.setCompressedParam("repolistin", repoListStringIn);
-                    fileRepoRequest.setParam("transfer_id", String.valueOf(transferId));
+                    fileRepoRequest.setCompressedParam("repolistin", filesJson);
+                    if (deletesJson != null) fileRepoRequest.setCompressedParam("repodeletes", deletesJson);
+                    fileRepoRequest.setParam("transfer_id", tid);
 
-                    logger.debug("repoListStringIn: " + repoListStringIn);
-
-                    MsgEvent fileRepoResponse = plugin.sendRPC(fileRepoRequest);
-
+                    MsgEvent fileRepoResponse = plugin.sendRPC(fileRepoRequest, syncRpcTimeoutMs);
                     if (fileRepoResponse != null) {
-
-                        logger.debug("Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " responded");
-
-                        if (fileRepoResponse.paramsContains("status_code") && fileRepoResponse.paramsContains("status_desc")) {
-                            int status_code = Integer.parseInt(fileRepoResponse.getParam("status_code"));
-                            String status_desc = fileRepoResponse.getParam("status_code");
-                            if (status_code != 10) {
-                                logger.error("Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " filerepo update failed status_code: " + status_code + " status_desc:" + status_desc);
-                            } else {
-                                // do NOT mark insync here: status 10 only means the peer accepted
-                                // the list; rows flip to insync=1 in confirmTransfer() after the
-                                // peer reports verified downloads (failed files stay 0 -> re-offer)
-                                logger.info("Offered " + fileDiffMap.size() + " files to " + pluginID);
-                            }
+                        String code = fileRepoResponse.getParam("status_code");
+                        if ("10".equals(code)) {
+                            // do NOT mark insync here: status 10 only means the peer accepted the list; rows flip to
+                            // insync=1 in confirmTransfer() after the peer reports verified downloads
+                            logger.info("Offered " + pageFiles.size() + " file(s) and " + pageDeletes.size()
+                                    + " delete(s) to " + pluginID + " (transfer " + tid + ")");
+                        } else {
+                            logger.warn("Region: " + region + " Agent: " + agent + " pluginId:" + pluginID
+                                    + " did not take transfer " + tid + ": status_code " + code + " "
+                                    + fileRepoResponse.getParam("status_desc"));
+                            // busy or refused: offered again next cycle
+                            for (String p : pageFiles.keySet()) offeredAt.remove(p);
+                            for (DeleteObject d : pageDeletes) offeredAt.remove("del:" + d.filePath);
                         }
-
-
                     } else {
                         logger.error("Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID + " failed to respond!");
                         logger.error("Removing Host Region: " + region + " Agent: " + agent + " pluginId:" + pluginID);
-                        removeSubscribe(subscriberMap);
+                        removeSubscribe(sub);
                     }
-
                 }
             }
 
-        }catch (Exception ex) {
+        } catch (Exception ex) {
             logger.error("filerepo error", ex);
+        }
+    }
+
+    private static String peerKey(String region, String agent, String pluginId) {
+        return region + "_" + agent + "_" + pluginId;
+    }
+
+    /** True when {@code region/agent/pluginId} has subscribed to this repository. */
+    boolean isSubscriber(String region, String agent, String pluginId) {
+        synchronized (lockSubscriberMap) {
+            return subscriberMap.containsKey(peerKey(region, agent, pluginId));
         }
     }
 
     //data transfer
     public void confirmTransfer(String incomingTransferId, String failedFilesJson, String region, String agent, String pluginId) {
-        try{
+        confirmTransfer(incomingTransferId, failedFilesJson, null, region, agent, pluginId);
+    }
 
+    /**
+     * A subscriber's confirm: the files it now holds (all offered but {@code failedFiles}) flip to insync=1, where the
+     * catalog still holds the offered content, and so do the deletes it applied. Only a subscriber of this repository
+     * may confirm: any other caller could otherwise mark files synced that no subscriber holds.
+     */
+    public void confirmTransfer(String incomingTransferId, String failedFilesJson, String failedDeletesJson,
+                                String region, String agent, String pluginId) {
+        try {
             String repoId = region + "-" + agent + "-" + pluginId;
-            synchronized (lockPeerVersionMap) {
-                peerVersionMap.put(repoId,incomingTransferId);
+            if (!isSubscriber(region, agent, pluginId)) {
+                logger.warn("confirm of transfer " + incomingTransferId + " from " + repoId + " ignored: not a subscriber");
+                return;
             }
 
-            Set<String> failedFiles = new HashSet<>();
-            if (failedFilesJson != null) {
-                try {
-                    List<String> failedList = gson.fromJson(failedFilesJson,
-                            new com.google.gson.reflect.TypeToken<List<String>>(){}.getType());
-                    if (failedList != null) failedFiles.addAll(failedList);
-                } catch (Exception pe) {
-                    logger.error("confirmTransfer: unparseable failedfiles from " + repoId, pe);
-                }
-            }
+            Set<String> failedFiles = parseSet(failedFilesJson, repoId);
+            Set<String> failedDeletes = parseSet(failedDeletesJson, repoId);
 
-            Map<String, FileObject> offered = pendingTransferMap.get(incomingTransferId);
+            Offer offered = incomingTransferId == null ? null : pendingTransferMap.get(incomingTransferId);
             if (offered != null) {
-                int confirmed = 0;
-                for (FileObject fileObject : offered.values()) {
+                List<DBEngine.Row> confirmed = new ArrayList<>();
+                for (FileObject fileObject : offered.files.values()) {
+                    offeredAt.remove(fileObject.filePath);
                     if (!failedFiles.contains(fileObject.filePath)) {
-                        dbEngine.updateFile(fileObject.filePath, fileObject.MD5, 1, fileObject.lastModified, fileObject.filesize);
-                        confirmed++;
+                        confirmed.add(new DBEngine.Row(fileObject.filePath, fileObject.MD5, fileObject.lastModified, fileObject.filesize));
                     }
                 }
+                List<DBEngine.Tombstone> applied = new ArrayList<>();
+                for (DeleteObject d : offered.deletes) {
+                    offeredAt.remove("del:" + d.filePath);
+                    if (!failedDeletes.contains(d.filePath)) {
+                        applied.add(new DBEngine.Tombstone(d.filePath, d.fileName, d.MD5, d.deletedAt));
+                    }
+                }
+                int files = dbEngine.confirmFiles(confirmed);
+                int dels = dbEngine.confirmTombstones(applied);
                 logger.info("Transfer " + incomingTransferId + " confirmed by " + repoId + ": "
-                        + confirmed + " in sync, " + failedFiles.size() + " failed"
-                        + (failedFiles.isEmpty() ? "" : " (will re-offer)"));
+                        + files + " in sync, " + failedFiles.size() + " failed, " + dels + " delete(s) applied, "
+                        + failedDeletes.size() + " delete(s) failed"
+                        + (failedFiles.isEmpty() && failedDeletes.isEmpty() ? "" : " (will re-offer)"));
             } else {
                 logger.debug("confirmTransfer: unknown/expired transfer_id " + incomingTransferId + " from " + repoId);
             }
 
         } catch (Exception ex) {
-            logger.error(ex.getMessage());
-            logger.error("filerepo error", ex);
+            logger.error("filerepo confirm error", ex);
         }
+    }
 
+    private Set<String> parseSet(String json, String repoId) {
+        Set<String> out = new HashSet<>();
+        if (json == null) return out;
+        try {
+            List<String> list = gson.fromJson(json, stringListType);
+            if (list != null) out.addAll(list);
+        } catch (Exception pe) {
+            logger.error("confirmTransfer: unparseable list from " + repoId, pe);
+        }
+        return out;
+    }
+
+    /** One diff from a producer, waiting for its updater. */
+    private static final class PendingDiff {
+        final String transferId;
+        final String filesJson;
+        final String deletesJson;
+
+        PendingDiff(String transferId, String filesJson, String deletesJson) {
+            this.transferId = transferId;
+            this.filesJson = filesJson;
+            this.deletesJson = deletesJson;
+        }
+    }
+
+    /** How a diff was taken: 10 queued, 9 refused (unknown producer), 11 busy (bounded queues full; offer again). */
+    static final class Accepted {
+        final String code;
+        final String desc;
+
+        Accepted(String code, String desc) {
+            this.code = code;
+            this.desc = desc;
+        }
     }
 
     public void getFileRepoDiff(String repoDiffString, String transferId, String region, String agent, String pluginId) {
-        try {
+        acceptDiff(repoDiffString, null, transferId, region, agent, pluginId);
+    }
 
-            String repoId = region + "-" + agent + "-" + pluginId;
-            Map<String,String> update = new HashMap<>();
-            update.put(transferId,repoDiffString);
+    /** Remember a producer this repository subscribed to (its discover broadcast). Bounded by sync_max_peers. */
+    void rememberProducer(String region, String agent, String pluginId) {
+        String key = peerKey(region, agent, pluginId);
+        if (knownProducers.contains(key)) return;
+        if (knownProducers.size() >= syncMaxPeers) {
+            logger.warn("not subscribing to " + key + ": already " + knownProducers.size() + " producers (sync_max_peers)");
+            return;
+        }
+        knownProducers.add(key);
+    }
 
-            synchronized (lockPeerUpdateQueueMap) {
-                if(!peerUpdateQueueMap.containsKey(repoId)) {
-                    peerUpdateQueueMap.put(repoId,new LinkedList());
+    boolean isKnownProducer(String region, String agent, String pluginId) {
+        return knownProducers.contains(peerKey(region, agent, pluginId));
+    }
 
+    /**
+     * Take a producer's diff (FR-D5): only from a producer this repository subscribed to, at most
+     * sync_pending_per_peer waiting per producer and sync_max_peers producers at once, on a bounded pool. Anything over
+     * a bound is refused as busy, and the producer offers it again next cycle.
+     */
+    Accepted acceptDiff(String filesJson, String deletesJson, String transferId, String region, String agent, String pluginId) {
+        String repoId = peerKey(region, agent, pluginId);
+        if (!knownProducers.contains(repoId)) {
+            syncRefused.incrementAndGet();
+            logger.warn("diff " + transferId + " from " + repoId + " refused: not a producer this repository subscribed to");
+            return new Accepted("9", "refused: not a producer this repository subscribed to");
+        }
+        PendingDiff diff = new PendingDiff(transferId, filesJson, deletesJson);
+        synchronized (lockPeerUpdateQueueMap) {
+            Deque<PendingDiff> q = peerUpdateQueueMap.get(repoId);
+            if (q == null) {
+                if (peerUpdateQueueMap.size() >= syncMaxPeers) {
+                    syncRejected.incrementAndGet();
+                    return new Accepted("11", "busy: " + peerUpdateQueueMap.size() + " producers syncing (sync_max_peers)");
                 }
-                logger.debug("getFileRepoDiff() adding transfer_id: " + transferId + " to queueMap");
-                peerUpdateQueueMap.get(repoId).add(update);
+                q = new ArrayDeque<>();
+                peerUpdateQueueMap.put(repoId, q);
             }
-
-            //if updater for specific id is not active, activate it
-
-            boolean startUpdater = false;
-            synchronized (lockPeerUpdateStateMap) {
-
-                if(!peerUpdateStateMap.containsKey(repoId)) {
-                    // true: an updater IS being started; false here spawned a duplicate updater
-                    // for every diff that arrived while the first was still draining
-                    peerUpdateStateMap.put(repoId,true);
-                    startUpdater = true;
-                } else {
-                    if(!peerUpdateStateMap.get(repoId)) {
-                        peerUpdateStateMap.put(repoId,true);
-                        startUpdater = true;
-                    }
-                }
+            if (q.size() >= syncPendingPerPeer) {
+                syncRejected.incrementAndGet();
+                return new Accepted("11", "busy: " + q.size() + " diffs from this producer waiting (sync_pending_per_peer)");
             }
-
-            if(startUpdater) {
-                logger.debug("starting new updater thread for repoId: " + repoId + " transfer id: " + transferId );
-                syncPool.submit(() -> {
-                        try {
-
-                            boolean workExist = true;
-                            while(workExist && plugin.isActive()) {
-
-                                Map<String, String> pendingUpdate = null;
-
-                                synchronized (lockPeerUpdateQueueMap) {
-                                    pendingUpdate = peerUpdateQueueMap.get(repoId).poll();
-                                }
-
-                                if(pendingUpdate == null) {
-
-                                    // only go idle if nothing raced in between poll() and here;
-                                    // otherwise that update would sit unserviced until the next diff
-                                    synchronized (lockPeerUpdateStateMap) {
-                                        synchronized (lockPeerUpdateQueueMap) {
-                                            if (peerUpdateQueueMap.get(repoId).isEmpty()) {
-                                                peerUpdateStateMap.put(repoId, false);
-                                                workExist = false;
-                                            }
-                                        }
-                                    }
-
-                                } else {
-
-                                    //get the update
-                                    Map.Entry<String, String> entry = pendingUpdate.entrySet().iterator().next();
-                                    String currentTransferId = entry.getKey();
-                                    String diffJson = entry.getValue();
-
-                                    //extract file objects
-                                    Map<String,FileObject> remoteRepoFiles = gson.fromJson(diffJson, repoListType);
-
-                                    logger.debug("UPDATING " + repoId + " transferid: " + currentTransferId);
-
-                                    List<String> failedFiles = new ArrayList<>();
-
-                                    for (Map.Entry<String, FileObject> diffEntry : remoteRepoFiles .entrySet()) {
-                                        FileObject fileObject = diffEntry.getValue();
-
-                                        // reject malformed peer entries (null fields) rather than let an
-                                        // NPE abort the whole batch and drop every good file in this diff
-                                        if (fileObject == null || fileObject.fileName == null
-                                                || fileObject.MD5 == null || fileObject.filePath == null) {
-                                            logger.warn("skipping malformed peer diff entry: " + diffEntry.getKey());
-                                            if (fileObject != null && fileObject.filePath != null) {
-                                                failedFiles.add(fileObject.filePath);
-                                            }
-                                            continue;
-                                        }
-
-                                        //public Path downloadRemoteFile(String remoteRegion, String remoteAgent, String remoteFilePath, String localFilePath) {
-                                        File localDir = getRepoDir();
-                                        logger.debug("localDir: " + localDir.getAbsolutePath());
-                                        // CONTAINMENT: fileName comes from the peer's listing and may carry
-                                        // subdirs (recursive repos), but must never escape the repo dir via
-                                        // ".." or an absolute path (resolve() returns an absolute arg as-is)
-                                        Path repoBase = localDir.toPath().toAbsolutePath().normalize();
-                                        Path localPath = repoBase.resolve(fileObject.fileName).normalize();
-                                        if (!localPath.startsWith(repoBase)) {
-                                            logger.error("rejecting peer file name escaping repo dir: [" + fileObject.fileName + "]");
-                                            failedFiles.add(fileObject.filePath);
-                                            continue;
-                                        }
-                                        // nor may it lead, through a link, into a live-tier root
-                                        String conflict = liveRootConflict(localPath);
-                                        if (conflict != null) {
-                                            logger.error("rejecting peer file: its destination " + conflict);
-                                            failedFiles.add(fileObject.filePath);
-                                            continue;
-                                        }
-                                        logger.debug("localFilePath: " + localPath.toFile().getAbsolutePath());
-                                        //check that file exists
-                                        boolean downloadFile = true;
-                                        if(localPath.toFile().exists()) {
-                                            if(localPath.toFile().length() == fileObject.filesize) {
-                                                if(fileObject.MD5.equals(plugin.getMD5(localPath.toAbsolutePath().toString()))) {
-                                                    downloadFile = false;
-                                                }
-                                            }
-                                        }
-
-                                        if(downloadFile) {
-                                            // create parent dirs so nested (recursive) repo layouts sync,
-                                            // not just flat top-level files.
-                                            try {
-                                                Path parent = localPath.toAbsolutePath().getParent();
-                                                if (parent != null) Files.createDirectories(parent);
-                                            } catch (Exception mkdirEx) {
-                                                logger.warn("could not create parent dir for " + localPath + ": " + mkdirEx.getMessage());
-                                            }
-                                            Path tmpFile = plugin.getAgentService().getDataPlaneService().downloadRemoteFile(region, agent, fileObject.filePath, localPath.toFile().getAbsolutePath());
-                                            // A null return means this one file's transfer failed. Skip it and keep
-                                            // going: one bad/slow file must not NPE-abort the whole batch (which would
-                                            // wedge sync forever). Failed files are reported in the confirm so the
-                                            // sender keeps them insync=0 and re-offers them next cycle.
-                                            if (tmpFile == null) {
-                                                logger.warn("filerepo download returned null, will retry next cycle: " + fileObject.filePath);
-                                                failedFiles.add(fileObject.filePath);
-                                            } else if (!fileObject.MD5.equals(plugin.getMD5(tmpFile.toFile().getAbsolutePath()))) {
-                                                // verify what actually landed; keep a corrupt file and it would
-                                                // wrongly count as synced forever
-                                                logger.warn("filerepo download md5 mismatch, deleting + retry next cycle: " + fileObject.filePath);
-                                                tmpFile.toFile().delete();
-                                                failedFiles.add(fileObject.filePath);
-                                            } else {
-                                                logger.debug("Synced " + tmpFile.toFile().getAbsolutePath());
-                                            }
-                                        }
-
-                                    }
-
-                                    logger.debug("SENDING UPDATE " + repoId);
-
-                                    MsgEvent filesConfirm = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginId);
-                                    filesConfirm.setParam("action", "repoconfirm");
-                                    filesConfirm.setParam("transfer_id", currentTransferId);
-                                    if (!failedFiles.isEmpty()) {
-                                        filesConfirm.setCompressedParam("failedfiles", gson.toJson(failedFiles));
-                                    }
-                                    plugin.msgOut(filesConfirm);
-
-                                }
-                            }
-
-                        } catch (Exception v) {
-                            logger.error("filerepo sync updater error", v);
-                            // never leave the state stuck 'active' after a crash or it wedges forever
-                            synchronized (lockPeerUpdateStateMap) {
-                                peerUpdateStateMap.put(repoId,false);
-                            }
-                        }
-                });
-            }
-
-
-        } catch (Exception ex) {
-            StringWriter errors = new StringWriter();
-            ex.printStackTrace(new PrintWriter(errors));
-            logger.error("getFileRepoDiff() " + errors.toString());
-
+            q.add(diff);
         }
 
+        boolean startUpdater = false;
+        synchronized (lockPeerUpdateStateMap) {
+            // true: an updater IS being started; never a second one while the first drains
+            if (!Boolean.TRUE.equals(peerUpdateStateMap.get(repoId))) {
+                peerUpdateStateMap.put(repoId, true);
+                startUpdater = true;
+            }
+        }
+        if (startUpdater) {
+            try {
+                syncPool.execute(() -> runUpdater(repoId, region, agent, pluginId));
+            } catch (RejectedExecutionException full) {
+                synchronized (lockPeerUpdateStateMap) {
+                    peerUpdateStateMap.put(repoId, false);
+                }
+                synchronized (lockPeerUpdateQueueMap) {
+                    Deque<PendingDiff> q = peerUpdateQueueMap.get(repoId);
+                    if (q != null) {
+                        q.remove(diff);
+                        if (q.isEmpty()) peerUpdateQueueMap.remove(repoId);
+                    }
+                }
+                syncRejected.incrementAndGet();
+                return new Accepted("11", "busy: the sync pool is full (sync_threads, sync_queue_max)");
+            }
+        }
+        return new Accepted("10", "New transferID accepted");
+    }
+
+    private void runUpdater(String repoId, String region, String agent, String pluginId) {
+        try {
+            while (plugin.isActive()) {
+                PendingDiff pending;
+                synchronized (lockPeerUpdateStateMap) {
+                    synchronized (lockPeerUpdateQueueMap) {
+                        Deque<PendingDiff> q = peerUpdateQueueMap.get(repoId);
+                        pending = q == null ? null : q.poll();
+                        if (pending == null) {
+                            // only go idle with nothing queued; drop the empty queue so the map stays bounded
+                            peerUpdateQueueMap.remove(repoId);
+                            peerUpdateStateMap.remove(repoId);
+                            return;
+                        }
+                    }
+                }
+                applyDiff(pending, repoId, region, agent, pluginId);
+            }
+        } catch (Exception v) {
+            logger.error("filerepo sync updater error", v);
+        } finally {
+            // never leave the state stuck 'active' after a crash or a stop, or it wedges forever
+            synchronized (lockPeerUpdateStateMap) {
+                if (Boolean.TRUE.equals(peerUpdateStateMap.get(repoId))) peerUpdateStateMap.put(repoId, false);
+            }
+        }
+    }
+
+    private void applyDiff(PendingDiff pending, String repoId, String region, String agent, String pluginId) {
+        Runnable hook = beforeApplyDiff;
+        if (hook != null) hook.run();
+        Map<String,FileObject> remoteRepoFiles = null;
+        List<DeleteObject> remoteDeletes = null;
+        try {
+            remoteRepoFiles = pending.filesJson == null ? null : gson.fromJson(pending.filesJson, repoListType);
+            remoteDeletes = pending.deletesJson == null ? null : gson.fromJson(pending.deletesJson, deleteListType);
+        } catch (Exception bad) {
+            logger.error("unparseable diff " + pending.transferId + " from " + repoId + ": " + bad.getMessage());
+        }
+        if (remoteRepoFiles == null) remoteRepoFiles = Collections.emptyMap();
+        if (remoteDeletes == null) remoteDeletes = Collections.emptyList();
+
+        logger.debug("UPDATING " + repoId + " transferid: " + pending.transferId);
+        List<String> failedFiles = new ArrayList<>();
+        List<String> failedDeletes = new ArrayList<>();
+        Path repoBase = getRepoDir().toPath().toAbsolutePath().normalize();
+
+        for (DeleteObject d : remoteDeletes) {
+            if (d == null || d.filePath == null) continue;
+            if (!applyDelete(d, repoBase)) failedDeletes.add(d.filePath);
+        }
+
+        SyncReceiver rx = null;
+        try {
+            for (Map.Entry<String, FileObject> diffEntry : remoteRepoFiles.entrySet()) {
+                if (!plugin.isActive()) break;
+                FileObject fileObject = diffEntry.getValue();
+
+                // reject malformed peer entries (null fields) rather than let an NPE abort the whole batch
+                if (fileObject == null || fileObject.fileName == null
+                        || fileObject.MD5 == null || fileObject.filePath == null || fileObject.filesize < 0) {
+                    logger.warn("skipping malformed peer diff entry: " + diffEntry.getKey());
+                    if (fileObject != null && fileObject.filePath != null) {
+                        failedFiles.add(fileObject.filePath);
+                    }
+                    continue;
+                }
+
+                // CONTAINMENT: fileName comes from the peer's listing and may carry subdirs (recursive repos), but must
+                // never escape the repo dir via ".." or an absolute path (resolve() returns an absolute arg as-is)
+                Path localPath = repoBase.resolve(fileObject.fileName).normalize();
+                if (!localPath.startsWith(repoBase) || localPath.equals(repoBase)
+                        || isStaging(localPath.getFileName().toString())) {
+                    logger.error("rejecting peer file name escaping repo dir: [" + fileObject.fileName + "]");
+                    failedFiles.add(fileObject.filePath);
+                    continue;
+                }
+                // nor may it lead, through a link, into a live-tier root
+                String conflict = liveRootConflict(localPath);
+                if (conflict != null) {
+                    logger.error("rejecting peer file: its destination " + conflict);
+                    failedFiles.add(fileObject.filePath);
+                    continue;
+                }
+                //check that file exists
+                if (Files.isRegularFile(localPath, LinkOption.NOFOLLOW_LINKS)) {
+                    try {
+                        if (Files.size(localPath) == fileObject.filesize
+                                && fileObject.MD5.equals(plugin.getMD5(localPath.toString()))) {
+                            continue;   // already held, verified
+                        }
+                    } catch (IOException ignore) { }
+                }
+
+                // create parent dirs so nested (recursive) repo layouts sync, not just flat top-level files.
+                try {
+                    Path parent = localPath.getParent();
+                    if (parent != null) Files.createDirectories(parent);
+                } catch (Exception mkdirEx) {
+                    logger.warn("could not create parent dir for " + localPath + ": " + mkdirEx.getMessage());
+                    failedFiles.add(fileObject.filePath);
+                    continue;
+                }
+                if (rx == null) {
+                    rx = new SyncReceiver(plugin, logger, region, agent, pluginId, syncStreamBuffer, syncStreamIdleMs,
+                            syncStreamRounds, syncRpcTimeoutMs).open();
+                }
+                SyncReceiver.Result r = rx.fetch(fileObject.filePath, fileObject.filesize, fileObject.MD5, localPath);
+                if (r.ok) {
+                    syncFetched.incrementAndGet();
+                    logger.debug("Synced " + localPath);
+                } else {
+                    // one bad/slow file must not abort the batch: it is reported failed and offered again
+                    syncFetchFailed.incrementAndGet();
+                    if (r.verifyFailed) syncVerifyFailed.incrementAndGet();
+                    logger.warn("sync of " + fileObject.filePath + " failed, will retry next cycle: " + r.why);
+                    failedFiles.add(fileObject.filePath);
+                }
+            }
+        } catch (Exception ex) {
+            logger.error("sync of diff " + pending.transferId + " from " + repoId + " failed", ex);
+            // everything not yet fetched is reported failed, so the producer offers it again
+            for (FileObject f : remoteRepoFiles.values()) {
+                if (f != null && f.filePath != null && !failedFiles.contains(f.filePath)) failedFiles.add(f.filePath);
+            }
+        } finally {
+            if (rx != null) rx.close();
+        }
+
+        logger.debug("SENDING UPDATE " + repoId);
+        MsgEvent filesConfirm = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC,region,agent,pluginId);
+        filesConfirm.setParam("action", "repoconfirm");
+        filesConfirm.setParam("transfer_id", pending.transferId);
+        if (!failedFiles.isEmpty()) {
+            filesConfirm.setCompressedParam("failedfiles", gson.toJson(failedFiles));
+        }
+        if (!failedDeletes.isEmpty()) {
+            filesConfirm.setCompressedParam("faileddeletes", gson.toJson(failedDeletes));
+        }
+        plugin.msgOut(filesConfirm);
+    }
+
+    /**
+     * Apply a producer's delete: remove the local copy only if it is exactly the content the producer deleted, never
+     * outside the repository directory or in a live-tier root. A copy that is absent, or holds other content (landed
+     * here, or newer), is left alone and counts as applied. False when the delete should be offered again.
+     */
+    private boolean applyDelete(DeleteObject d, Path repoBase) {
+        if (d.fileName == null || d.MD5 == null) return false;
+        Path localPath = repoBase.resolve(d.fileName).normalize();
+        if (!localPath.startsWith(repoBase) || localPath.equals(repoBase)) {
+            logger.error("rejecting a delete escaping the repo dir: [" + d.fileName + "]");
+            return true;    // never applicable here: do not have it offered forever
+        }
+        String conflict = liveRootConflict(localPath);
+        if (conflict != null) {
+            logger.error("rejecting a delete: its target " + conflict);
+            return true;
+        }
+        if (!Files.exists(localPath, LinkOption.NOFOLLOW_LINKS)) return true;
+        if (!Files.isRegularFile(localPath, LinkOption.NOFOLLOW_LINKS)) {
+            logger.warn("not deleting " + localPath + ": not a regular file");
+            return true;
+        }
+        String held = plugin.getMD5(localPath.toString());
+        if (held == null) return false;
+        if (!d.MD5.equals(held)) {
+            logger.info("not deleting " + localPath + ": it holds other content than the producer deleted");
+            return true;
+        }
+        try {
+            Files.delete(localPath);
+            dbEngine.deleteFile(localPath.toFile().getAbsolutePath());
+            syncDeleted.incrementAndGet();
+            logger.debug("deleted " + localPath + " (deleted at the producer)");
+            return true;
+        } catch (IOException ex) {
+            logger.warn("could not delete " + localPath + ": " + ex.getMessage());
+            return false;
+        }
     }
 
     public Map<String,String> getFileInfo(String filePath) {
@@ -853,9 +1196,26 @@ public class RepoEngine {
         return dbEngine.getRepoCount();
     }
 
+    long getTombstoneCount() {
+        return dbEngine.getTombstoneCount();
+    }
+
     /** True if the Derby catalog is queryable (distinguishes a dead DB from an empty one). */
     public boolean isCatalogHealthy() {
         return dbEngine.isCatalogHealthy();
+    }
+
+    /** Diffs waiting for an updater, over every producer. */
+    int getSyncQueued() {
+        synchronized (lockPeerUpdateQueueMap) {
+            int n = 0;
+            for (Deque<PendingDiff> q : peerUpdateQueueMap.values()) n += q.size();
+            return n;
+        }
+    }
+
+    int getSyncActive() {
+        return syncPool.getActiveCount();
     }
 
     /**
@@ -869,6 +1229,7 @@ public class RepoEngine {
         facts.put("backing", "local");
         if (!subscriber) {
             facts.put("role", fileScanTimer != null ? "producer" : "on-demand");
+            if (deletesHeld > 0) facts.put("deletes_held", String.valueOf(deletesHeld));
             return RepoState.of(RepoState.ONLY_COPY, facts,
                     "the origin of what it holds: no producer refills it");
         }
@@ -884,7 +1245,8 @@ public class RepoEngine {
 
     /** What a clear did. */
     static final class Clear {
-        static final String CLEARED = "cleared", ONLY_COPY = "only-copy", BUSY = "busy", FAILED = "failed";
+        static final String CLEARED = "cleared", ONLY_COPY = "only-copy", BUSY = "busy", FAILED = "failed",
+                UNCONFIRMED = "unconfirmed", PROTECTED = "protected-dir", LIVE_ROOT = "live-root";
         final String outcome;
         // the state the clear decided on, under the gate; null when the gate was not had
         final RepoState state;
@@ -901,12 +1263,86 @@ public class RepoEngine {
     }
 
     /**
-     * Wipe the repository: every cataloged file and every regular file under the repository directory. Correct for a
-     * mirror, whose producer holds the same files; unrecoverable for an only copy, which is refused unless
-     * {@code force}. The repository gate is taken exclusively BEFORE the check and held through the delete, and every
-     * landing takes its shared side, so no file filerepo lands can arrive between the check and the delete.
+     * True when {@code confirm} names this repository's directory exactly: as configured (scan_dir, else repo_dir) or
+     * as its absolute path.
      */
+    boolean confirms(String confirm) {
+        if (confirm == null || confirm.isEmpty()) return false;
+        String configured = scanDirString != null ? scanDirString : repoDir;
+        if (confirm.equals(configured)) return true;
+        File dir = repoDirFile();
+        if (confirm.equals(dir.getAbsolutePath())) return true;
+        try {
+            return confirm.equals(dir.getCanonicalPath());
+        } catch (IOException ex) {
+            return false;
+        }
+    }
+
+    /** Directories a clear never wipes: equal to one of these, it is refused. */
+    private static final Set<String> SYSTEM_DIRS = new HashSet<>(Arrays.asList(
+            "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/var", "/opt", "/home", "/Users",
+            "/root", "/tmp", "/private", "/private/tmp", "/private/var", "/private/etc", "/System", "/Library",
+            "/Applications", "/Volumes", "/dev", "/proc", "/sys", "/boot", "/mnt", "/media", "/srv", "/run", "/snap",
+            "/usr/local", "/var/tmp", "/var/lib", "/var/log"));
+
+    /**
+     * Why {@code dir} may never be wiped, or null: it is the filesystem root, a system directory, or contains (or is)
+     * the home directory, the agent's working directory, its data directory, this plugin's data directory, or the JVM.
+     */
+    String protectedDir(File dir) {
+        try {
+            Path p = dir.getCanonicalFile().toPath();
+            if (p.getNameCount() == 0) return "it is the filesystem root";
+            if (SYSTEM_DIRS.contains(p.toString())) return "it is a system directory";
+            Map<String, String> own = new LinkedHashMap<>();
+            own.put("the home directory", System.getProperty("user.home"));
+            own.put("the agent's working directory", System.getProperty("user.dir"));
+            own.put("the JVM", System.getProperty("java.home"));
+            try {
+                own.put("the agent's data directory", plugin.getAgentService().getAgentDataDirectory());
+            } catch (Exception ignore) { }
+            try {
+                own.put("this plugin's data directory", plugin.getPluginDataDirectory());
+            } catch (Exception ignore) { }
+            for (Map.Entry<String, String> e : own.entrySet()) {
+                if (e.getValue() == null || e.getValue().isEmpty()) continue;
+                Path q = new File(e.getValue()).getCanonicalFile().toPath();
+                if (q.startsWith(p)) return "it is or contains " + e.getKey();
+            }
+            return null;
+        } catch (IOException ex) {
+            return "its canonical path cannot be resolved (" + ex.getMessage() + ")";
+        }
+    }
+
+    /** {@link #clearRepo(String, boolean)} with this repository's own directory as the confirmation (tests, internal). */
     public Clear clearRepo(boolean force) {
+        return clearRepo(repoDirFile().getAbsolutePath(), force);
+    }
+
+    /**
+     * Wipe the repository: every cataloged file and every regular file under the repository directory (FR-D2). It must
+     * be confirmed with the directory's exact name, is never done to a protected directory or one that is or holds a
+     * live-tier root (force or not), and is refused for an only copy unless {@code force}. Correct for a mirror, whose
+     * producer holds the same files. The repository gate is taken exclusively BEFORE the only-copy check and held through
+     * the delete, and every landing takes its shared side, so no file filerepo lands can arrive between the two.
+     */
+    public Clear clearRepo(String confirm, boolean force) {
+        if (!confirms(confirm)) {
+            return new Clear(Clear.UNCONFIRMED, null, 0,
+                    "confirm must name this repository's directory exactly (its scan_dir, or repo_dir when it has none)");
+        }
+        File dir = repoDirFile();
+        String protectedWhy = protectedDir(dir);
+        if (protectedWhy != null) {
+            logger.error("clearrepo refused for " + dir + ": " + protectedWhy);
+            return new Clear(Clear.PROTECTED, null, 0, "the repository directory is protected: " + protectedWhy);
+        }
+        String live = repoDirConflict();
+        if (live != null) {
+            return new Clear(Clear.LIVE_ROOT, null, 0, "this repository's directory " + live);
+        }
         boolean acquired = false;
         try {
             // a bounded wait for the gate: a running scan or landing finishes first
@@ -926,20 +1362,35 @@ public class RepoEngine {
             Runnable hook = afterClearCheck;
             if (hook != null) hook.run();
 
-            //List all files recorded in repo and remove them (never one in a live-tier root: only a drop removes those)
+            Path base = dir.getCanonicalFile().toPath();
+            //List all files recorded in repo and remove them: only inside the repository directory, and never one in a
+            //live-tier root (only a drop removes those); a stale row from elsewhere is forgotten, its file left alone
             List<Map<String,String>> repoFileList = dbEngine.getRepoList();
             for(Map<String,String> filerecord : repoFileList) {
-                File removeFile = Paths.get(filerecord.get("filepath")).toFile();
-                dbEngine.deleteFile(removeFile.getAbsolutePath());
-                if (liveRootConflict(removeFile.toPath()) == null) {
-                    removeFile.delete();
+                Path recorded = Paths.get(filerecord.get("filepath"));
+                dbEngine.deleteFile(filerecord.get("filepath"));
+                if (liveRootConflict(recorded) != null) continue;
+                try {
+                    Path parent = recorded.toAbsolutePath().getParent();
+                    Path real = parent == null ? null : parent.toFile().getCanonicalFile().toPath();
+                    if (real != null && real.startsWith(base)) {
+                        Files.deleteIfExists(recorded);
+                    }
+                } catch (IOException ex) {
+                    logger.warn("clearRepo: " + recorded + " not deleted: " + ex.getMessage());
                 }
             }
-            //delete any files or directories not recorded in repo dir (close the walk stream)
+            //delete any files not recorded in repo dir (close the walk stream); links are removed, never followed
             long remaining = 0;
-            try (java.util.stream.Stream<Path> walk = Files.walk(Paths.get(getRepoDir().getAbsolutePath()))) {
+            try (java.util.stream.Stream<Path> walk = Files.walk(dir.toPath())) {
                 for (Path p : (Iterable<Path>) walk::iterator) {
-                    if (Files.isRegularFile(p) && !p.toFile().delete()) remaining++;
+                    if (Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(p)) {
+                        try {
+                            Files.delete(p);
+                        } catch (IOException ex) {
+                            remaining++;
+                        }
+                    }
                 }
             }
             if (remaining == 0) {
@@ -1026,103 +1477,158 @@ public class RepoEngine {
         }
     }
 
+    /**
+     * Remove one file (file and catalog row), contained to the repository directory and never in a live-tier root. On
+     * a producer the removal is recorded as a delete for the subscribers (FR-D4: removefile used to leave every mirror
+     * holding the file). Takes the shared side of the repository gate, as a landing does.
+     */
     public Boolean removeFile(String fileRepoName, String fileName) {
-        boolean isRemoved = false;
+        if (fileName == null || fileName.isEmpty()) return false;
+        if (!enterGate()) return false;
         try {
-
             File repoRoot = getRepoDir();
-            File checkFile = new File(repoRoot, fileName).getCanonicalFile();
-            // path-traversal guard: the resolved target must stay inside the repo directory
-            if (!checkFile.toPath().startsWith(repoRoot.getCanonicalFile().toPath())) {
+            Path base = repoRoot.getCanonicalFile().toPath();
+            Path target = repoRoot.toPath().resolve(fileName).normalize();
+            Path parentReal = target.toAbsolutePath().getParent() == null ? null
+                    : target.toAbsolutePath().getParent().toFile().getCanonicalFile().toPath();
+            // path-traversal guard: the resolved target (its directory resolved as the filesystem does) must stay inside
+            if (parentReal == null || !parentReal.startsWith(base) || target.getFileName() == null
+                    || parentReal.resolve(target.getFileName()).equals(base)) {
                 logger.error("path traversal blocked in removeFile: " + fileName);
                 return false;
             }
-            if(checkFile.exists()) {
-                int deleteStatus = dbEngine.deleteFile(checkFile.getAbsolutePath());
-                logger.debug("delete status: " + deleteStatus);
-                isRemoved = checkFile.delete();
+            Path real = parentReal.resolve(target.getFileName());
+            if (liveRootConflict(real) != null) {
+                logger.error("removeFile refused: " + fileName + " lies in a live-tier root");
+                return false;
             }
-
-        } catch (Exception ex) {
-            logger.error("removeFile: " + ex.getMessage());
-            isRemoved = false;
-        }
-        return isRemoved;
-    }
-
-    public Boolean putFiles(List<String> fileList, String repoName, boolean overwrite, boolean isLocal) {
-
-        boolean isUploaded = false;
-        // the shared side of the repository gate: nothing lands between a clear's check and its delete
-        if (!enterGate()) {
-            return false;
-        }
-        try {
-
-            boolean isFault = false;
-
-            for(String incomingFileName : fileList) {
-
-                Path tmpFilePath = Paths.get(incomingFileName);
-
-                logger.info("incoming file: " + tmpFilePath);
-
-                String fileSavePath = getRepoDir().getAbsolutePath() + "/" + tmpFilePath.getFileName();
-                File checkFile = new File(fileSavePath);
-
-                if ((checkFile.exists() && overwrite) || (!checkFile.exists())) {
-
-                    // before the first byte lands: from here on, this repository holds files only it has
-                    markLanded();
-
-                    File fileSaved = new File(fileSavePath);
-
-                    //move file from temp to requested location
-                    if(fileSaved.exists()) {
-                        fileSaved.delete();
-                    }
-
-                    //if local copy, if remote move temp to correct
-                    if(isLocal) {
-                        Files.copy(tmpFilePath, fileSaved.toPath());
-                    } else {
-                        Files.move(tmpFilePath, fileSaved.toPath());
-                    }
-
-                    if (fileSaved.isFile()) {
-
-                        // Catalog the landed file when no scanner will pick it up. Keying on
-                        // enable_scan (default true) meant landing-only repos (which never schedule
-                        // the scan timer) never indexed received files -> getfile returned empty.
-                        if(fileScanTimer == null) {
-                            String filePath = fileSaved.getAbsolutePath();
-                            String MD5hash = plugin.getMD5(fileSavePath);
-                            long lastModified = fileSaved.lastModified();
-                            long filesize = fileSaved.length();
-
-                            dbEngine.addFile(filePath, MD5hash, lastModified, filesize);
-                        }
-
-                    } else {
-                        isFault = true;
-                    }
+            if (!Files.isRegularFile(real, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(real)) {
+                return false;
+            }
+            // the catalog keys a file by the absolute path it was found under
+            String abs = real.toFile().getAbsolutePath();
+            String cataloged = dbEngine.getFileInfo(abs) != null ? abs
+                    : dbEngine.getFileInfo(target.toAbsolutePath().toString()) != null ? target.toAbsolutePath().toString() : null;
+            Map<String, String> info = cataloged == null ? null : dbEngine.getFileInfo(cataloged);
+            Files.delete(real);
+            if (cataloged != null) {
+                if (fileScanTimer != null && scanDirString != null && info != null) {
+                    Path root = Paths.get(scanDirString).toAbsolutePath();
+                    Path p = Paths.get(cataloged);
+                    String name = p.startsWith(root) ? root.relativize(p).toString() : p.getFileName().toString();
+                    tombstonesRecorded.addAndGet(dbEngine.tombstone(Collections.singletonList(
+                            new DBEngine.Tombstone(cataloged, name, info.get("md5"), System.currentTimeMillis())), 1));
                 } else {
-                    logger.info("file " + checkFile.getAbsolutePath() + " exist : " + checkFile.exists() + " overwrite=" + overwrite);
+                    dbEngine.deleteFile(cataloged);
                 }
             }
-
-            if(!isFault) {
-                isUploaded = true;
-            }
-
-
-        } catch(Exception ex){
-            logger.error("filerepo error", ex);
+            return true;
+        } catch (Exception ex) {
+            logger.error("removeFile: " + ex.getMessage());
+            return false;
         } finally {
             exitGate();
         }
+    }
 
-        return isUploaded;
+    /** What a putfiles landed: by file name. */
+    static final class Put {
+        final List<String> stored = new ArrayList<>();
+        final List<String> unchanged = new ArrayList<>();
+        final List<String> skipped = new ArrayList<>();
+        final Map<String, String> failed = new LinkedHashMap<>();
+        boolean busy;
+
+        boolean allStored() {
+            return !busy && failed.isEmpty() && skipped.isEmpty();
+        }
+
+        String summary() {
+            return stored.size() + " stored, " + unchanged.size() + " unchanged, " + skipped.size()
+                    + " skipped (exist; overwrite=false), " + failed.size() + " failed";
+        }
+    }
+
+    public Boolean putFiles(List<String> fileList, String repoName, boolean overwrite, boolean isLocal) {
+        Map<String, String> hashes = new HashMap<>();
+        return putFiles(fileList, hashes, overwrite, isLocal, false).allStored();
+    }
+
+    /**
+     * Land pushed files (FR-D10). Each file is copied (local) or moved (remote) to a staging file beside its
+     * destination, its content hash checked against {@code expected} (required unless putfiles_require_hashes=false),
+     * then moved into place atomically: a partial or corrupt file is never visible under its name. A file that exists
+     * and is not to be overwritten is reported unchanged when it holds the expected content and skipped when it does
+     * not: never counted stored.
+     */
+    Put putFiles(List<String> fileList, Map<String, String> expected, boolean overwrite, boolean isLocal, boolean requireHashes) {
+        Put put = new Put();
+        // the shared side of the repository gate: nothing lands between a clear's check and its delete
+        if (!enterGate()) {
+            put.busy = true;
+            return put;
+        }
+        try {
+            Path repo = getRepoDir().toPath().toAbsolutePath();
+            for (String incomingFileName : fileList) {
+                Path src = Paths.get(incomingFileName);
+                String name = src.getFileName() == null ? null : src.getFileName().toString();
+                if (name == null || isStaging(name)) {
+                    put.failed.put(String.valueOf(name), "not a file name filerepo lands");
+                    continue;
+                }
+                String want = expected == null ? null : expected.get(name);
+                if (want == null && requireHashes && requirePutHashes) {
+                    put.failed.put(name, "no expected content hash (file_hashes)");
+                    continue;
+                }
+                logger.info("incoming file: " + src);
+                Path dest = repo.resolve(name);
+                if (Files.exists(dest, LinkOption.NOFOLLOW_LINKS) && !overwrite) {
+                    String held = Files.isRegularFile(dest, LinkOption.NOFOLLOW_LINKS) ? plugin.getMD5(dest.toString()) : null;
+                    if (want != null && want.equals(held)) put.unchanged.add(name);
+                    else put.skipped.add(name);
+                    continue;
+                }
+                // before the first byte lands: from here on, this repository holds files only it has
+                markLanded();
+                Path part = stagingFor(dest);
+                try {
+                    //if local copy, if remote move temp to correct
+                    if (isLocal) {
+                        Files.copy(src, part);
+                    } else {
+                        try {
+                            Files.move(src, part);
+                        } catch (IOException crossDevice) {
+                            Files.copy(src, part);
+                            Files.deleteIfExists(src);
+                        }
+                    }
+                    String got = plugin.getMD5(part.toString());
+                    if (got == null || (want != null && !want.equals(got))) {
+                        put.failed.put(name, "content hash mismatch");
+                        continue;
+                    }
+                    Files.move(part, dest, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                    // Catalog the landed file when no scanner will pick it up (landing-only repos never schedule the
+                    // scan timer); a replaced file gets its new content recorded, not a stale row
+                    if (fileScanTimer == null) {
+                        File saved = dest.toFile();
+                        dbEngine.upsertFile(saved.getAbsolutePath(), got, saved.lastModified(), saved.length());
+                    }
+                    put.stored.add(name);
+                } catch (Exception ex) {
+                    logger.error("putfiles: " + name + " not landed", ex);
+                    put.failed.put(name, ex.getClass().getSimpleName());
+                } finally {
+                    try { Files.deleteIfExists(part); } catch (Exception ignore) { }
+                }
+            }
+        } finally {
+            exitGate();
+        }
+        return put;
     }
 
 
@@ -1134,7 +1640,10 @@ public class RepoEngine {
 
                 //don't include self
                 if (!((plugin.getRegion().equals(incomingMap.get("repo_region_id"))) && (plugin.getAgent().equals(incomingMap.get("repo_agent_id"))) && (plugin.getPluginID().equals(incomingMap.get("repo_plugin_id"))))) {
-                    subMessage(fileRepoName, incomingMap.get("repo_region_id"), incomingMap.get("repo_agent_id"), incomingMap.get("repo_plugin_id"), "subscribe");
+                    rememberProducer(incomingMap.get("repo_region_id"), incomingMap.get("repo_agent_id"), incomingMap.get("repo_plugin_id"));
+                    if (isKnownProducer(incomingMap.get("repo_region_id"), incomingMap.get("repo_agent_id"), incomingMap.get("repo_plugin_id"))) {
+                        subMessage(fileRepoName, incomingMap.get("repo_region_id"), incomingMap.get("repo_agent_id"), incomingMap.get("repo_plugin_id"), "subscribe");
+                    }
                 }
 
             } else {
@@ -1147,42 +1656,33 @@ public class RepoEngine {
 
     }
 
-    private void createSubListener(String filerepoName) {
+    /** Handle a subscriber-side dataplane message (the producer's discover broadcast). */
+    void onSubscriberMessage(Map<String, String> incomingMap) {
+        if (incomingMap == null || !incomingMap.containsKey("action")) {
+            logger.error("createSubListener no action in message");
+            return;
+        }
+        if (!incomingMap.containsKey("filerepo_name")) {
+            logger.error("action called without filerepo_name");
+            return;
+        }
+        if ("discover".equals(incomingMap.get("action"))) {
+            updateSubscribe(incomingMap);
+        } else {
+            logger.error("unknown actionType: " + incomingMap.get("action"));
+        }
+    }
 
+    private void createSubListener(String filerepoName) {
 
         MessageListener ml = new MessageListener() {
             public void onMessage(Message msg) {
                 try {
-
                     if (msg instanceof TextMessage) {
                         logger.debug(" SUB REC MESSAGE:" + ((TextMessage) msg).getText());
-                        Map<String, String> incomingMap = gson.fromJson(((TextMessage) msg).getText(), mapType);
-                        if(incomingMap.containsKey("action")) {
-                            if(incomingMap.containsKey("filerepo_name")) {
-
-                                String actionType = incomingMap.get("action");
-                                switch (actionType) {
-                                    case "discover":
-                                        updateSubscribe(incomingMap);
-                                        break;
-
-                                    default:
-                                        logger.error("unknown actionType: " + actionType);
-                                        break;
-                                }
-
-
-                            } else {
-                                logger.error("action called without filerepo_name");
-                            }
-                        } else {
-                            logger.error("createSubListener no action in message");
-                            logger.error(incomingMap.toString());
-                        }
-
+                        onSubscriberMessage(gson.fromJson(((TextMessage) msg).getText(), mapType));
                     }
                 } catch(Exception ex) {
-
                     logger.error("filerepo error", ex);
                 }
             }
@@ -1252,43 +1752,39 @@ public class RepoEngine {
 
     }
 
+    /** Handle a producer-side dataplane message (a subscriber's subscribe or unsubscribe). */
+    void onRepoMessage(Map<String, String> incomingMap) {
+        if (incomingMap == null || !incomingMap.containsKey("action")) {
+            logger.error("createRepoSubListener no action in message");
+            return;
+        }
+        if (!incomingMap.containsKey("filerepo_name")) {
+            logger.error("action called without filerepo_name");
+            return;
+        }
+        switch (incomingMap.get("action")) {
+            case "subscribe":
+                addSubscribe(incomingMap);
+                break;
+            case "unsubscribe":
+                removeSubscribe(incomingMap);
+                break;
+            default:
+                logger.error("unknown actionType: " + incomingMap.get("action"));
+                break;
+        }
+    }
+
     private void createRepoSubListener(String filerepoName) {
 
         MessageListener ml = new MessageListener() {
             public void onMessage(Message msg) {
                 try {
-
                     if (msg instanceof TextMessage) {
                         logger.debug(" REPO REC MESSAGE:" + ((TextMessage) msg).getText());
-                        Map<String, String> incomingMap = gson.fromJson(((TextMessage) msg).getText(), mapType);
-                        if(incomingMap.containsKey("action")) {
-                            if(incomingMap.containsKey("filerepo_name")) {
-
-                                String actionType = incomingMap.get("action");
-                                switch (actionType) {
-                                    case "subscribe":
-                                        addSubscribe(incomingMap);
-                                        break;
-                                    case "unsubscribe":
-                                        removeSubscribe(incomingMap);
-                                        break;
-
-                                    default:
-                                        logger.error("unknown actionType: " + actionType);
-                                        break;
-                                }
-
-
-                            } else {
-                                logger.error("action called without filerepo_name");
-                            }
-                        } else {
-                            logger.error("createRepoSubListener no action in message");
-                        }
-
+                        onRepoMessage(gson.fromJson(((TextMessage) msg).getText(), mapType));
                     }
                 } catch(Exception ex) {
-
                     logger.error("filerepo error", ex);
                 }
             }
@@ -1302,20 +1798,10 @@ public class RepoEngine {
     }
 
     private String generateSubKey(Map<String, String> incomingMap) {
-        String subKey = null;
-        try {
-                if ((incomingMap.containsKey("sub_region_id")) && (incomingMap.containsKey("sub_agent_id")) && (incomingMap.containsKey("sub_plugin_id"))) {
-
-                    subKey = incomingMap.get("sub_region_id") + "_" + incomingMap.get("sub_agent_id") + "_" + incomingMap.get("sub_plugin_id");
-
-                }
-
-            } catch (Exception ex) {
-            logger.error("could not generate sub key");
-            logger.error(ex.getMessage());
+        if ((incomingMap.containsKey("sub_region_id")) && (incomingMap.containsKey("sub_agent_id")) && (incomingMap.containsKey("sub_plugin_id"))) {
+            return peerKey(incomingMap.get("sub_region_id"), incomingMap.get("sub_agent_id"), incomingMap.get("sub_plugin_id"));
         }
-
-        return subKey;
+        return null;
     }
 
     private void addSubscribe(Map<String, String> incomingMap) {
@@ -1330,9 +1816,13 @@ public class RepoEngine {
                             synchronized (lockSubscriberMap) {
                                 if (subscriberMap.containsKey(subKey)) {
                                     subscriberMap.get(subKey).put("ts", String.valueOf(System.currentTimeMillis()));
+                                } else if (subscriberMap.size() >= syncMaxPeers) {
+                                    logger.warn("subscriber " + subKey + " not added: already " + subscriberMap.size()
+                                            + " subscribers (sync_max_peers)");
                                 } else {
-                                    incomingMap.put("ts", String.valueOf(System.currentTimeMillis()));
-                                    subscriberMap.put(subKey, incomingMap);
+                                    Map<String, String> sub = new HashMap<>(incomingMap);
+                                    sub.put("ts", String.valueOf(System.currentTimeMillis()));
+                                    subscriberMap.put(subKey, sub);
                                 }
                             }
                         }
@@ -1379,47 +1869,28 @@ public class RepoEngine {
     }
 
     //utils
-    private File getRootRepoDir() {
-        File repoDir = null;
-        try {
-
-            String repoDirString =  plugin.getConfig().getStringParam("repo_dir", "filerepo");
-
-
-            File tmpRepo = new File(repoDirString);
-            if(tmpRepo.isDirectory()) {
-                repoDir = tmpRepo;
-            } else {
-                tmpRepo.mkdir();
-                repoDir = tmpRepo;
-            }
-
-        } catch(Exception ex) {
-            logger.error("filerepo error", ex);
-        }
-        return repoDir;
+    /**
+     * The repository directory as configured, without creating it: scan_dir, else repo_dir, else the absolute default
+     * {@code <plugin data dir>/repo} (FR-D9; the old default was the relative path "filerepo", wherever the JVM started,
+     * and putjar and the scanner disagreed on it).
+     */
+    File repoDirFile() {
+        String configured = scanDirString != null ? scanDirString : repoDir;
+        if (configured != null) return new File(configured).getAbsoluteFile();
+        return Paths.get(plugin.getPluginDataDirectory(), "repo").toAbsolutePath().toFile();
     }
 
+    /** The repository directory ({@link #repoDirFile()}), created if absent. One answer for every verb. */
     public File getRepoDir() {
-        File repoDir = null;
+        File dir = repoDirFile();
         try {
-
-            String rootRepo = plugin.getConfig().getStringParam("scan_dir");
-            if(rootRepo == null) {
-                rootRepo = getRootRepoDir().getAbsolutePath();
+            if (!dir.isDirectory() && !dir.mkdirs() && !dir.isDirectory()) {
+                logger.error("could not create the repository directory " + dir);
             }
-            File tmpRepo = new File(rootRepo);
-            if(tmpRepo.isDirectory()) {
-                repoDir = tmpRepo;
-            } else {
-                tmpRepo.mkdir();
-                repoDir = tmpRepo;
-            }
-
-        } catch(Exception ex) {
+        } catch (Exception ex) {
             logger.error("filerepo error", ex);
         }
-        return repoDir;
+        return dir;
     }
 
 

@@ -7,11 +7,11 @@ public class StreamObject {
 
     private String transferId;
 
-    private long bytesTransfered = 0;
+    private volatile long bytesTransfered = 0;
 
     private String filename;
 
-    private boolean isActive = true;
+    private volatile boolean isActive = true;
 
     public StreamObject(String transferId, String filename, long startByte, long byteLength) {
         this.transferId = transferId;

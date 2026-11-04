@@ -1,0 +1,455 @@
+package io.cresco.filerepo;
+
+import io.cresco.library.messaging.MsgEvent;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import jakarta.jms.Message;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * A producer and a subscriber on one stand-in fabric, syncing for real: discover and subscribe over the dataplane,
+ * paged offers, files pulled with the producer's own streamfile over the dataplane (FR-D7), every file verified
+ * (SHA-384 from the terminal frame and the offered content hash) before it is committed, deletes propagated with the
+ * mass-delete guard (FR-D4), and the bounded queues refusing as busy (FR-D5).
+ */
+class SyncOverDataplaneTest {
+
+    @TempDir Path tmp;
+    final Fabric fabric = new Fabric();
+    TestRig producer, subscriber;
+    Path scan, mirror;
+    final List<TestRig> extra = new ArrayList<>();
+
+    @BeforeEach
+    void up() throws Exception {
+        tmp = tmp.toRealPath();
+        scan = Files.createDirectories(tmp.resolve("scan"));
+        mirror = Files.createDirectories(tmp.resolve("mirror"));
+    }
+
+    @AfterEach
+    void down() {
+        for (TestRig r : extra) r.close();
+        if (subscriber != null) subscriber.close();
+        if (producer != null) producer.close();
+    }
+
+    TestRig producer(String... kv) throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put("filerepo_name", "fr");
+        cfg.put("scan_dir", scan.toString());
+        cfg.put("enable_scan", "true");
+        cfg.put("scan_delay", "3600000");
+        cfg.put("scan_period", "3600000");
+        for (int i = 0; i + 1 < kv.length; i += 2) cfg.put(kv[i], kv[i + 1]);
+        producer = new TestRig(tmp.resolve("agent"), cfg, null, "plugin-p", fabric);
+        producer.repo.start();
+        return producer;
+    }
+
+    TestRig subscriber(String... kv) throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put("filerepo_name", "fr");
+        cfg.put("repo_dir", mirror.toString());
+        cfg.put("sync_stream_buffer", "4096");
+        for (int i = 0; i + 1 < kv.length; i += 2) cfg.put(kv[i], kv[i + 1]);
+        subscriber = new TestRig(tmp.resolve("agent"), cfg, null, "plugin-s", fabric);
+        subscriber.repo.start();
+        return subscriber;
+    }
+
+    /** Discover and subscribe, as the broadcast timer and the subscriber's answer do. */
+    void subscribe() throws Exception {
+        producer.repo.repoBroadcast("fr", "discover", 0);
+        await(() -> producer.repo.isSubscriber(TestRig.REGION, TestRig.AGENT, "plugin-s"), "the subscriber subscribed");
+    }
+
+    static void await(BooleanSupplier cond, String what) throws Exception {
+        long deadline = System.currentTimeMillis() + 20_000;
+        while (!cond.getAsBoolean()) {
+            if (System.currentTimeMillis() > deadline) fail("timed out waiting: " + what);
+            Thread.sleep(20);
+        }
+    }
+
+    static byte[] random(int n, long seed) {
+        byte[] b = new byte[n];
+        new Random(seed).nextBytes(b);
+        return b;
+    }
+
+    boolean allConfirmed() {
+        return producer.db.getFilesNotInSync().isEmpty();
+    }
+
+    void syncedAndConfirmed() throws Exception {
+        assertTrue(producer.repo.scanOnce());
+        await(this::allConfirmed, "every offered file confirmed");
+    }
+
+    // ------------------------------------------------------------------ adds and updates
+
+    @Test
+    void filesSyncOverTheDataplaneVerifiedAndNestedDirectoriesKept() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        byte[] big = random(100_000, 1);
+        Files.write(scan.resolve("big.bin"), big);
+        Files.write(Files.createDirectories(scan.resolve("sub/deeper")).resolve("nested.txt"), "nested".getBytes());
+        Files.write(scan.resolve("empty.txt"), new byte[0]);
+
+        syncedAndConfirmed();
+
+        assertArrayEquals(big, Files.readAllBytes(mirror.resolve("big.bin")));
+        assertEquals("nested", Files.readString(mirror.resolve("sub/deeper/nested.txt")));
+        assertEquals(0, Files.size(mirror.resolve("empty.txt")));
+        // the bytes rode the dataplane: streamfile requests, never getfiledata/getfileinfo
+        assertTrue(fabric.routed.contains("streamfile"));
+        assertFalse(fabric.routed.contains("getfiledata"));
+        assertFalse(fabric.routed.contains("getfileinfo"));
+        assertTrue(subscriber.downloads.isEmpty(), "the control-plane download path is not used");
+        assertEquals(3, subscriber.repo.syncFetched.get());
+        assertNoStaging(mirror);
+
+        // a change is offered and fetched again; an unchanged file is not
+        Files.write(scan.resolve("big.bin"), random(100_000, 2));
+        Files.setLastModifiedTime(scan.resolve("big.bin"), java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() + 5000));
+        syncedAndConfirmed();
+        assertArrayEquals(Files.readAllBytes(scan.resolve("big.bin")), Files.readAllBytes(mirror.resolve("big.bin")));
+        assertEquals(4, subscriber.repo.syncFetched.get());
+    }
+
+    @Test
+    void aLostFrameIsAskedForAgainAndTheFileIsStillExact() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        byte[] data = random(40_000, 3);
+        Files.write(scan.resolve("lossy.bin"), data);
+        AtomicBoolean dropped = new AtomicBoolean();
+        fabric.drop = m -> isData(m, "4096") && dropped.compareAndSet(false, true);
+
+        syncedAndConfirmed();
+
+        assertTrue(dropped.get());
+        assertArrayEquals(data, Files.readAllBytes(mirror.resolve("lossy.bin")));
+        long rangeRequests = producer.sent.size() >= 0 ? subscriber.sent.stream()
+                .filter(m -> "streamfile".equals(m.getParam("action")) && !"0".equals(m.getParam("start_byte"))).count() : 0;
+        assertEquals(1, rangeRequests, "exactly the missing range was asked for again");
+    }
+
+    @Test
+    void aCorruptedFrameIsNeverCommittedAndTheNextOfferRepairsIt() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        byte[] data = random(20_000, 4);
+        Files.write(scan.resolve("tampered.bin"), data);
+        AtomicBoolean tampered = new AtomicBoolean();
+        fabric.drop = m -> {
+            if (isData(m, "8192") && tampered.compareAndSet(false, true)) {
+                FakeJms.State s = FakeJms.state(m);
+                byte[] body = s.written.toByteArray();
+                body[17] ^= 0x5a;
+                s.written.reset();
+                s.written.write(body, 0, body.length);
+                s.body = null;
+            }
+            return false;
+        };
+        assertTrue(producer.repo.scanOnce());
+        await(() -> subscriber.repo.syncVerifyFailed.get() == 1, "the corrupt file refused");
+        assertFalse(Files.exists(mirror.resolve("tampered.bin")), "never visible under its name");
+        assertNoStaging(mirror);
+        await(() -> subscriber.sent.stream().anyMatch(m -> "repoconfirm".equals(m.getParam("action"))
+                && m.getCompressedParam("failedfiles") != null), "reported failed");
+        assertFalse(allConfirmed(), "the producer keeps it unconfirmed");
+
+        // the next cycle offers it again (the failed confirm cleared its in-flight mark) and it arrives exact
+        syncedAndConfirmed();
+        assertArrayEquals(data, Files.readAllBytes(mirror.resolve("tampered.bin")));
+    }
+
+    @Test
+    void aLostTerminalFrameStallsAndTheWholeFileIsFetchedAgain() throws Exception {
+        producer();
+        subscriber("sync_stream_idle_ms", "300");
+        subscribe();
+        byte[] data = random(10_000, 5);
+        Files.write(scan.resolve("noend.bin"), data);
+        AtomicBoolean dropped = new AtomicBoolean();
+        fabric.drop = m -> isTerminal(m) && dropped.compareAndSet(false, true);
+        syncedAndConfirmed();
+        assertArrayEquals(data, Files.readAllBytes(mirror.resolve("noend.bin")));
+        assertTrue(fabric.routed.contains("streamfilecancel"), "the stalled transfer was cancelled");
+    }
+
+    @Test
+    void aFileChangedSinceTheOfferIsRefusedNotCommitted() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        Path f = Files.write(scan.resolve("moving.txt"), "version one".getBytes());
+        // the catalog takes version one; then the file changes, same size, before the subscriber fetches
+        subscriber.repo.beforeApplyDiff = () -> {
+            try {
+                Files.write(f, "version two".getBytes());
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        };
+        assertTrue(producer.repo.scanOnce());
+        await(() -> subscriber.repo.syncVerifyFailed.get() == 1, "refused by the offered content hash");
+        assertFalse(Files.exists(mirror.resolve("moving.txt")));
+    }
+
+    @Test
+    void offersArePagedAndEachPageConfirmed() throws Exception {
+        producer("sync_diff_page", "2");
+        subscriber();
+        subscribe();
+        for (int i = 0; i < 5; i++) Files.write(scan.resolve("f" + i + ".txt"), ("file " + i).getBytes());
+        syncedAndConfirmed();
+        assertEquals(3, fabric.routed.stream().filter("repolistin"::equals).count(), "5 files in pages of 2");
+        for (int i = 0; i < 5; i++) assertEquals("file " + i, Files.readString(mirror.resolve("f" + i + ".txt")));
+        // nothing unconfirmed is offered again while confirmed
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(3, fabric.routed.stream().filter("repolistin"::equals).count());
+    }
+
+    // ------------------------------------------------------------------ deletes (FR-D4)
+
+    @Test
+    void aDeleteAtTheProducerDeletesTheSubscribersCopyAndIsConfirmed() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        for (int i = 0; i < 4; i++) Files.write(scan.resolve("d" + i + ".txt"), ("keep " + i).getBytes());
+        syncedAndConfirmed();
+        assertTrue(Files.exists(mirror.resolve("d1.txt")));
+
+        Files.delete(scan.resolve("d1.txt"));
+        assertTrue(producer.repo.scanOnce());
+        await(() -> !Files.exists(mirror.resolve("d1.txt")), "the subscriber's copy deleted");
+        await(() -> producer.db.getTombstonesNotInSync(10).isEmpty(), "the delete confirmed");
+        assertNull(producer.repo.getFileInfo(scan.resolve("d1.txt").toString()), "no ghost row");
+        assertEquals(3, producer.repo.getRepoCount());
+        assertTrue(Files.exists(mirror.resolve("d0.txt")));
+        assertEquals(1, subscriber.repo.syncDeleted.get());
+    }
+
+    @Test
+    void removefileOnAProducerIsADeleteForItsSubscribers() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        Files.write(scan.resolve("withdrawn.jar"), "withdrawn".getBytes());
+        syncedAndConfirmed();
+        MsgEvent r = producer.call(TestRig.as(producer.requestTo("removefile", "repo_name", "fr", "file_name", "withdrawn.jar"), "admin"));
+        assertEquals("10", r.getParam("status"));
+        assertEquals(1, producer.db.getTombstonesNotInSync(10).size());
+        assertTrue(producer.repo.scanOnce());
+        await(() -> !Files.exists(mirror.resolve("withdrawn.jar")), "the withdrawn file left the mirror too");
+    }
+
+    @Test
+    void aSubscriberNeverDeletesContentTheProducerDidNotHave() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        Files.write(scan.resolve("same-name.txt"), "producer's".getBytes());
+        syncedAndConfirmed();
+        // the subscriber's copy is replaced by other content (landed there directly)
+        Files.write(mirror.resolve("same-name.txt"), "subscriber's own".getBytes());
+        Files.delete(scan.resolve("same-name.txt"));
+        assertTrue(producer.repo.scanOnce());
+        await(() -> producer.db.getTombstonesNotInSync(10).isEmpty(), "the delete settled");
+        assertEquals("subscriber's own", Files.readString(mirror.resolve("same-name.txt")));
+    }
+
+    @Test
+    void theMassDeleteGuardHoldsAnEmptiedScanDirUntilAnAdminReleasesIt() throws Exception {
+        producer();
+        subscriber();
+        subscribe();
+        for (int i = 0; i < 6; i++) Files.write(scan.resolve("m" + i + ".txt"), ("m" + i).getBytes());
+        syncedAndConfirmed();
+
+        // the scan dir is suddenly empty (an unmount looks like this)
+        for (int i = 0; i < 6; i++) Files.delete(scan.resolve("m" + i + ".txt"));
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(6, producer.repo.getDeletesHeld());
+        assertEquals(0, producer.repo.getTombstoneCount(), "nothing recorded");
+        assertEquals(6, producer.repo.getRepoCount(), "the catalog keeps the rows");
+        assertEquals("6", producer.call("repostate").getParam("deletes_held"));
+        for (int i = 0; i < 6; i++) assertTrue(Files.exists(mirror.resolve("m" + i + ".txt")));
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(6, producer.repo.getDeletesHeld(), "held every cycle, not released by waiting");
+
+        // released: refused without the exact directory, then confirmed
+        assertEquals("unconfirmed", producer.call(producer.requestTo("releasedeletes", "confirm", "/elsewhere")).getParam("refusal"));
+        MsgEvent rel = producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString()));
+        assertEquals("10", rel.getParam("status"));
+        assertEquals("6", rel.getParam("released"));
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(0, producer.repo.getDeletesHeld());
+        await(() -> producer.db.getTombstonesNotInSync(10).isEmpty() && producer.repo.getTombstoneCount() == 6, "applied");
+        for (int i = 0; i < 6; i++) assertFalse(Files.exists(mirror.resolve("m" + i + ".txt")));
+        assertEquals("9", producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString())).getParam("status"),
+                "nothing held, nothing released");
+    }
+
+    @Test
+    void theGuardHoldsALargeFractionButNotAFewDeletes() throws Exception {
+        producer("sync_delete_guard_min", "5", "sync_delete_guard_fraction", "0.5");
+        for (int i = 0; i < 12; i++) Files.write(scan.resolve("g" + i + ".txt"), ("g" + i).getBytes());
+        assertTrue(producer.repo.scanOnce());
+        Files.delete(scan.resolve("g0.txt"));
+        Files.delete(scan.resolve("g1.txt"));
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(0, producer.repo.getDeletesHeld(), "two of twelve: recorded");
+        assertEquals(2, producer.repo.getTombstoneCount());
+        for (int i = 2; i < 9; i++) Files.delete(scan.resolve("g" + i + ".txt"));
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(7, producer.repo.getDeletesHeld(), "seven of ten (over half, at least five): held");
+        // the files come back: nothing is held any more
+        for (int i = 2; i < 9; i++) Files.write(scan.resolve("g" + i + ".txt"), ("g" + i).getBytes());
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(0, producer.repo.getDeletesHeld());
+    }
+
+    @Test
+    void anIncompleteScanTakesNoFileForDeleted() throws Exception {
+        producer();
+        Path locked = Files.createDirectories(scan.resolve("locked"));
+        Files.write(locked.resolve("inside.txt"), "x".getBytes());
+        Files.write(scan.resolve("outside.txt"), "y".getBytes());
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(2, producer.repo.getRepoCount());
+        try {
+            assertTrue(locked.toFile().setReadable(false) && locked.toFile().setExecutable(false));
+            Files.delete(scan.resolve("outside.txt"));
+            assertTrue(producer.repo.scanOnce());
+            assertEquals(0, producer.repo.getTombstoneCount(), "a scan that could not read part of the tree deletes nothing");
+            assertEquals(2, producer.repo.getRepoCount());
+        } finally {
+            locked.toFile().setReadable(true);
+            locked.toFile().setExecutable(true);
+        }
+        assertTrue(producer.repo.scanOnce());
+        assertEquals(1, producer.repo.getTombstoneCount(), "once readable, the delete is seen");
+    }
+
+    // ------------------------------------------------------------------ sources and bounds (FR-D5)
+
+    @Test
+    void aDiffFromAnAgentThatIsNotASubscribedProducerIsRefused() throws Exception {
+        subscriber();
+        MsgEvent in = subscriber.requestTo("repolistin", "transfer_id", "1");
+        in.setCompressedParam("repolistin", "{\"/etc/passwd\":{\"fileName\":\"x\",\"MD5\":\"a\",\"filePath\":\"/etc/passwd\",\"lastModified\":1,\"filesize\":3}}");
+        MsgEvent r = subscriber.call(in);
+        assertEquals("9", r.getParam("status_code"));
+        Thread.sleep(200);
+        assertTrue(subscriber.sent.isEmpty(), "nothing fetched, nothing confirmed");
+        assertEquals(1, subscriber.repo.syncRefused.get());
+    }
+
+    @Test
+    void aConfirmFromANonSubscriberIsIgnored() throws Exception {
+        producer("sync_rpc_timeout_ms", "300");
+        subscriber();
+        subscribe();
+        fabric.dropRoute = m -> "repolistin".equals(m.getParam("action"));   // the real subscriber never hears it
+        Files.write(scan.resolve("c.txt"), "c".getBytes());
+        assertTrue(producer.repo.scanOnce());
+        assertFalse(allConfirmed());
+        // someone else claims to hold every file of every recent transfer
+        for (int t = 1; t <= 3; t++) {
+            MsgEvent forged = new MsgEvent(MsgEvent.Type.EXEC, TestRig.REGION, TestRig.AGENT, "intruder",
+                    TestRig.REGION, TestRig.AGENT, "plugin-p", false, false);
+            forged.setParam("action", "repoconfirm");
+            forged.setParam("transfer_id", String.valueOf(t));
+            producer.call(forged);
+        }
+        assertFalse(allConfirmed(), "still offered: no subscriber confirmed it");
+    }
+
+    @Test
+    void diffsBeyondTheBoundsAreRefusedAsBusy() throws Exception {
+        subscriber("sync_pending_per_peer", "1", "sync_threads", "1", "sync_queue_max", "1");
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger entered = new AtomicInteger();
+        subscriber.repo.beforeApplyDiff = () -> {
+            entered.incrementAndGet();
+            try {
+                release.await(20, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+            }
+        };
+        for (String p : new String[]{"pA", "pB", "pC"}) subscriber.repo.rememberProducer(TestRig.REGION, TestRig.AGENT, p);
+        // producer A: its updater runs (blocked), one more diff waits, the next is busy
+        assertEquals("10", diff("pA", "1"));
+        await(() -> entered.get() == 1, "A's updater running");
+        assertEquals("10", diff("pA", "2"));
+        assertEquals("11", diff("pA", "3"), "one waiting per producer");
+        // producer B's updater waits in the pool's queue (one thread); producer C finds the pool full
+        assertEquals("10", diff("pB", "1"));
+        assertEquals("11", diff("pC", "1"), "the pool's queue is full");
+        assertEquals(2, subscriber.repo.syncRejected.get());
+        release.countDown();
+        await(() -> subscriber.repo.getSyncQueued() == 0 && subscriber.repo.getSyncActive() == 0, "drained");
+        assertEquals("10", diff("pC", "2"), "accepted once there is room");
+    }
+
+    private String diff(String producerId, String tid) {
+        MsgEvent in = new MsgEvent(MsgEvent.Type.EXEC, TestRig.REGION, TestRig.AGENT, producerId,
+                TestRig.REGION, TestRig.AGENT, "plugin-s", false, false);
+        in.setParam("action", "repolistin");
+        in.setParam("transfer_id", tid);
+        in.setCompressedParam("repolistin", "{}");
+        return subscriber.call(in).getParam("status_code");
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    static boolean isData(Message m, String offset) {
+        try {
+            return !"true".equals(m.getStringProperty("transfer_end")) && offset.equals(m.getStringProperty("offset"))
+                    && m.getStringProperty(SyncReceiver.IDENT_KEY) != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    static boolean isTerminal(Message m) {
+        try {
+            return "true".equals(m.getStringProperty("transfer_end")) && m.getStringProperty(SyncReceiver.IDENT_KEY) != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    static void assertNoStaging(Path dir) throws Exception {
+        try (java.util.stream.Stream<Path> s = Files.walk(dir)) {
+            assertTrue(s.noneMatch(p -> RepoEngine.isStaging(p.getFileName().toString())), "no staging file is left");
+        }
+    }
+}

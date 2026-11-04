@@ -73,9 +73,10 @@ class NonLiveRepositoryTest {
         // putfiles: lands a copy, catalogs it (no scanner here), and confirms to the sender
         MsgEvent put = TestRig.request("putfiles", "repo_name", "fr", "transfer_id", "7");
         put.addFile(src.toString());
+        put.setCompressedParam("file_hashes", gson.toJson(Map.of("small.txt", Hashes.content("small file".getBytes()))));
         MsgEvent pr = rig.call(put);
         assertEquals("10", pr.getParam("status"));
-        assertEquals("putfiles stored", pr.getParam("status_desc"));
+        assertTrue(pr.getParam("status_desc").startsWith("putfiles stored"), pr.getParam("status_desc"));
         Path landed = repo.resolve("small.txt");
         assertTrue(Files.exists(landed));
         assertEquals(1, rig.repo.getRepoCount());
@@ -83,8 +84,11 @@ class NonLiveRepositoryTest {
         assertEquals("repoconfirm", rig.sent.get(0).getParam("action"));
         assertEquals("7", rig.sent.get(0).getParam("transfer_id"));
 
-        // putfiles again without overwrite: nothing replaced, still answered stored (as before)
-        assertEquals("10", rig.call(put).getParam("status"));
+        // putfiles again without overwrite: nothing replaced; the same content is answered unchanged, not stored
+        MsgEvent again = rig.call(put);
+        assertEquals("10", again.getParam("status"));
+        assertEquals("[\"small.txt\"]", again.getCompressedParam("unchanged"));
+        assertEquals("[]", again.getCompressedParam("stored"));
 
         // getfile: a cataloged file inline; an uncataloged path refused; an oversized one sent to streamfile
         MsgEvent got = rig.call("getfile", "file_path", landed.toAbsolutePath().toString());
@@ -95,6 +99,7 @@ class NonLiveRepositoryTest {
         Path big = Files.write(tmp.resolve("big.bin"), new byte[200]);
         MsgEvent putBig = TestRig.request("putfiles", "repo_name", "fr");
         putBig.addFile(big.toString());
+        putBig.setCompressedParam("file_hashes", gson.toJson(Map.of("big.bin", Hashes.content(new byte[200]))));
         assertEquals("10", rig.call(putBig).getParam("status"));
         assertEquals("5", rig.call("getfile", "file_path", repo.resolve("big.bin").toAbsolutePath().toString()).getParam("status"));
 
@@ -117,17 +122,17 @@ class NonLiveRepositoryTest {
         assertNotNull(inv.getCompressedParam("repolist"));
         assertNull(inv.getParam("refusal"));
 
-        // putjar: md5-verified as before; a mismatch is deleted and refused
-        Path probe = Files.write(tmp.resolve("probe.jar"), "jar bytes".getBytes());
-        MsgEvent jar = TestRig.request("putjar", "pluginname", "p", "md5", rig.plugin.getMD5(probe.toString()),
+        // putjar: a signed jar is accepted (its supplied hash checked); a hash mismatch is deleted and refused
+        byte[] signed = JarSigning.signedJar("p", "jar bytes");
+        MsgEvent jar = TestRig.request("putjar", "pluginname", "p", "md5", Hashes.content(signed),
                 "jarfile", "p.jar", "version", "1");
-        jar.setDataParam("jardata", "jar bytes".getBytes());
+        jar.setDataParam("jardata", signed);
         MsgEvent jr = rig.call(jar);
-        assertEquals("10", jr.getParam("status"));
+        assertEquals("10", jr.getParam("status"), jr.getParams().toString());
         assertEquals("p", jr.getParam("uploaded"));
         assertNull(jr.getParam("jardata"));
         MsgEvent bad = TestRig.request("putjar", "pluginname", "q", "md5", "0000", "jarfile", "q.jar", "version", "1");
-        bad.setDataParam("jardata", "other bytes".getBytes());
+        bad.setDataParam("jardata", JarSigning.signedJar("q", "other bytes"));
         assertEquals("9", rig.call(bad).getParam("status"));
         assertFalse(Files.exists(repo.resolve("q.jar")));
         assertEquals("7", rig.call("putjar", "pluginname", "p").getParam("status"), "missing params, as before");
