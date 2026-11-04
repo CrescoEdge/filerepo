@@ -26,7 +26,9 @@ import java.util.Set;
  *   {@code subtreeMin} files AND more than {@code subtreeFraction} of the catalog: what a nested volume going away
  *   looks like where device ids cannot tell it, while an ordinary {@code rm -rf} of a small directory goes through;</li>
  *   <li>everything, when the loss (beyond the above) is at least {@code min} files AND more than {@code fraction} of
- *   the catalog.</li>
+ *   the catalog, counting the deletes recorded within the last {@code windowMs} too: a loss spread over several cycles
+ *   (a deletion still running when a scan reads the tree, a slow drip) is held once it adds up, so what gets through
+ *   unheld is bounded by the threshold.</li>
  * </ul>
  * What is held is identified by a digest of exactly those deletes. An admin's release must name that digest, is
  * spent by the next evaluation whatever it finds, and expires: it never applies to a later or another loss.
@@ -55,6 +57,9 @@ final class DeleteGuard {
     private final int subtreeMin;
     private final double subtreeFraction;
     private final long releaseTtlMs;
+    private final long windowMs;
+    // deletes recorded (not held) recently: {when, how many}, oldest first
+    private final java.util.ArrayDeque<long[]> recent = new java.util.ArrayDeque<>();
 
     // the hold now in force (from the last evaluation), and an admin's armed release
     private volatile String holdId;
@@ -63,11 +68,24 @@ final class DeleteGuard {
     private volatile long releaseExpires;
 
     DeleteGuard(double fraction, int min, int subtreeMin, double subtreeFraction, long releaseTtlMs) {
+        this(fraction, min, subtreeMin, subtreeFraction, releaseTtlMs, 0L);
+    }
+
+    DeleteGuard(double fraction, int min, int subtreeMin, double subtreeFraction, long releaseTtlMs, long windowMs) {
         this.fraction = fraction;
         this.min = Math.max(1, min);
         this.subtreeMin = Math.max(1, subtreeMin);
         this.subtreeFraction = subtreeFraction;
         this.releaseTtlMs = releaseTtlMs;
+        this.windowMs = Math.max(0L, windowMs);
+    }
+
+    /** Deletes recorded within the window before {@code now}. */
+    private int recentlyRecorded(long now) {
+        while (!recent.isEmpty() && now - recent.peekFirst()[0] > windowMs) recent.pollFirst();
+        int n = 0;
+        for (long[] r : recent) n += (int) r[1];
+        return n;
     }
 
     int heldCount() {
@@ -153,15 +171,18 @@ final class DeleteGuard {
             if (n > 0) why.add("the whole subtree " + root.relativize(d) + " (" + n + " files)");
         }
 
-        // 3. an empty scan dir, or a large fraction of the catalog
+        // 3. an empty scan dir, or a large fraction of the catalog (with what was recorded within the window)
         int rest = byPath.size() - held.size();
         boolean empty = seen == 0 && !catalogUnderRoot.isEmpty();
-        // at least min files and more than the fraction of the catalog
-        boolean large = rest >= min && rest > fraction * catalogUnderRoot.size();
+        int earlier = windowMs > 0 ? recentlyRecorded(now) : 0;
+        int loss = rest + earlier;
+        // at least min files and more than the fraction of the catalog (as it was before the window's deletes)
+        boolean large = loss >= min && loss > fraction * (catalogUnderRoot.size() + earlier);
         if (empty || (rest > 0 && large)) {
             held.addAll(byPath.keySet());
-            why.add(empty ? "the scan dir is empty" : rest + " of " + catalogUnderRoot.size() + " cataloged files (more than "
-                    + Math.round(fraction * 100) + "%)");
+            why.add(empty ? "the scan dir is empty" : rest + " of " + catalogUnderRoot.size() + " cataloged files"
+                    + (earlier > 0 ? ", after " + earlier + " recorded in the last " + (windowMs / 60000) + " min" : "")
+                    + " (more than " + Math.round(fraction * 100) + "%)");
         }
 
         List<DBEngine.Tombstone> record = new ArrayList<>();
@@ -172,14 +193,17 @@ final class DeleteGuard {
         if (holding.isEmpty()) {
             holdId = null;
             heldCount = 0;
+            if (windowMs > 0 && !record.isEmpty()) recent.addLast(new long[]{now, record.size()});
             return new Decision(record, holding, null, null, false);
         }
         String id = digest(holding);
+        if (windowMs > 0 && !record.isEmpty() && !id.equals(armed)) recent.addLast(new long[]{now, record.size()});
         if (id.equals(armed)) {
-            // exactly the set an admin released: recorded, once
+            // exactly the set an admin released: recorded, once; the admin has seen the loss, so the window starts over
             holdId = null;
             heldCount = 0;
             record.addAll(holding);
+            recent.clear();
             return new Decision(record, List.of(), id, String.join("; ", why), true);
         }
         holdId = id;

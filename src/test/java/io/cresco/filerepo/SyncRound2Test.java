@@ -385,6 +385,31 @@ class SyncRound2Test {
         assertEquals(20, p.repo.getDeletesHeld());
     }
 
+    @Test
+    void aLossSpreadOverSeveralCyclesIsHeldOnceItAddsUp() throws Exception {
+        TestRig p = producer("plugin-p", scan);
+        for (int i = 0; i < 100; i++) write(scan.resolve("f" + i + ".txt"), "f" + i);
+        assertTrue(p.repo.scanOnce());
+        // a slow drip: 4 files a cycle, each cycle well under 10% of the catalog
+        int recorded = 0;
+        for (int cycle = 0; cycle < 5; cycle++) {
+            for (int i = 0; i < 4; i++) Files.delete(scan.resolve("f" + (cycle * 4 + i) + ".txt"));
+            assertTrue(p.repo.scanOnce());
+            recorded = (int) p.repo.getTombstoneCount();
+            if (p.repo.getDeletesHeld() > 0) break;
+        }
+        assertTrue(p.repo.getDeletesHeld() > 0, "a drip of deletes adds up within sync_delete_guard_window_ms");
+        assertTrue(recorded <= 10, "what got through unheld is bounded by the threshold: " + recorded);
+        // released by its id: the window starts over, an ordinary delete then goes through
+        String id = p.repo.getHoldId();
+        assertTrue(p.repo.releaseHeldDeletes(id) > 0);
+        assertTrue(p.repo.scanOnce());
+        assertEquals(0, p.repo.getDeletesHeld());
+        Files.delete(scan.resolve("f99.txt"));
+        assertTrue(p.repo.scanOnce());
+        assertEquals(0, p.repo.getDeletesHeld(), "after a release, one delete is ordinary again");
+    }
+
     // ------------------------------------------------------------------ resets, and subscribers kept for their deletes
 
     @Test

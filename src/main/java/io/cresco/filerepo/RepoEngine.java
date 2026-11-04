@@ -333,7 +333,8 @@ public class RepoEngine {
                 (int) clamp(longParam("sync_delete_guard_min", 2L), 1, Integer.MAX_VALUE),
                 (int) clamp(longParam("sync_delete_guard_subtree_min", 10L), 1, Integer.MAX_VALUE),
                 fractionParam("sync_delete_guard_subtree_fraction", 0.01),
-                clamp(longParam("sync_release_ttl_ms", 600_000L), 1_000L, Long.MAX_VALUE));
+                clamp(longParam("sync_release_ttl_ms", 600_000L), 1_000L, Long.MAX_VALUE),
+                clamp(longParam("sync_delete_guard_window_ms", 900_000L), 0L, Long.MAX_VALUE));
         rewriteFraction = fractionParam("sync_rewrite_guard_fraction", 0.25);
         rewriteMin = (int) clamp(longParam("sync_rewrite_guard_min", 10L), 1, Integer.MAX_VALUE);
         followLinks = plugin.getConfig().getBooleanParam("scan_follow_links", false);

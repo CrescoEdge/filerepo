@@ -162,8 +162,11 @@ producer's own `streamfile` **over the dataplane**, verifies it and moves it int
     catalog: a nested volume going away where device ids cannot tell it, while `rm -rf` of a small directory in a
     large repository goes through;
   - everything when the remaining loss is at least `sync_delete_guard_min` (2) files **and** more than
-    `sync_delete_guard_fraction` (10%) of the catalog. (In a small repository, a few deletes are a large fraction:
-    raise the fraction for a small, churny one.)
+    `sync_delete_guard_fraction` (10%) of the catalog, counting the deletes recorded in the last
+    `sync_delete_guard_window_ms` (15 min) too: a loss spread over cycles (a deletion still running while a scan reads
+    the tree, a slow drip) is held once it adds up, so what gets through unheld is bounded by the threshold. (In a small
+    repository, a few deletes are a large fraction: raise the fraction, or shorten the window, for a small churny one.)
+    A release starts the window over.
 
   The rows stay; `repostate` reports `deletes_held` and `deletes_hold_id`, the health check WARNs and
   `filerepo.sync.deletes.held` counts them, every cycle, until the files return or an admin sends `releasedeletes`
@@ -475,6 +478,7 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_offer_threads` | `8` | Subscribers a producer offers to at once. A cycle costs the slowest subscriber's answer, not the sum: a subscriber that went away costs one unanswered offer (`sync_rpc_timeout_ms`), concurrently with the others, and is then skipped until it subscribes again. |
 | `sync_tombstone_ttl_ms` | `604800000` (7 days) | How long a delete every kept subscriber applied is kept. |
 | `sync_delete_guard_min` / `sync_delete_guard_fraction` | `2` / `0.10` | The mass-delete guard: a loss of at least this many files and more than this fraction of the catalog is held. |
+| `sync_delete_guard_window_ms` | `900000` (15 min) | Deletes recorded this recently count with a cycle's loss for the fraction (`0`: each cycle alone). |
 | `sync_delete_guard_subtree_min` / `sync_delete_guard_subtree_fraction` | `10` / `0.01` | A whole subtree that lost all its cataloged files, at least this many and more than this fraction of the catalog, is held. (A vanished mount and an emptied scan dir are always held.) |
 | `sync_rewrite_guard_min` / `sync_rewrite_guard_fraction` | `10` / `0.25` | The rewrite guard: a cycle rewriting at least this many existing files and more than this fraction of the catalog is held. `1.0` turns it off. |
 | `sync_release_ttl_ms` | `600000` | How long an admin's release waits for the scan that applies it. |
