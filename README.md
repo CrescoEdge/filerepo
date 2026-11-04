@@ -220,25 +220,40 @@ producer's own `streamfile` **over the dataplane**, verifies it and moves it int
     `sync_delete_guard_window_ms` (15 min) too: a loss spread over cycles (a deletion still running while a scan reads
     the tree, a slow drip) is held once it adds up, so what gets through unheld is bounded by the threshold. (In a small
     repository, a few deletes are a large fraction: raise the fraction, or shorten the window, for a small churny one.);
-  - everything when the **originals** deleted or rewritten in the last 24 hours, with this cycle's, are at least the
-    minimum **and** more than `sync_delete_guard_day_fraction` (25%) of the originals: a slower drip is held within a
-    day;
-  - everything when the originals deleted or rewritten since the last admin acknowledgement, with this cycle's, are more
-    than `sync_delete_guard_total_fraction` (50%) of the originals: however slowly a catalog is drained or churned, never
+  - everything when the files deleted in the last 24 hours (**every** file, whenever it was added) and the originals
+    rewritten, with this cycle's, are at least the minimum **and** more than `sync_delete_guard_day_fraction` (25%) of
+    the day's base: a slower drip is held within a day;
+  - everything when the same since the last admin acknowledgement, with this cycle's, are more than
+    `sync_delete_guard_total_fraction` (50%) of the total's base: however slowly a catalog is drained or churned, never
     past half of it without an admin. Each longer budget is at least as large as the shorter ones (it follows a raised
     fraction), and `0` turns it off.
 
-  The day and the total count **gross**: every original deleted (and every original rewritten, which the rewrite guard
-  counts too) counts, whatever is added meanwhile, so deleting `x` and writing `x.locked` is caught however the
-  catalog's size moves. An **original** of a period is a file first cataloged before the period began (a day ago, or
-  the last acknowledgement if later; for the total, the last acknowledgement, which is the first scan until an admin
-  releases a hold); files added since neither count nor dilute the budget, and the period's originals are the budget's
-  base. What the guards let through is kept in the catalog (the `guardlog` table), so a restart forgets nothing, on the
-  guards' own clock: monotonic while the plugin runs (a jump of the wall clock never ages a record), and carried across
-  a restart, where the time down counts as elapsed only up to an hour (a wall clock behind the last record, or more than
-  an hour past it, is logged; no budget is ever cleared by a clock). A release consumes only the budgets that held what
-  it releases (the window, the day, the total) and acknowledges the deletes it releases (they count toward nothing);
-  every other budget keeps counting: releasing an unmounted volume's hold does not reset a drip's day.
+  The day and the total count **gross**, and every file: a file deleted counts whenever it was added (the newest data,
+  often the least backed up, is guarded like any), and a delete replaced by another file still counts, so deleting `x`
+  and writing `x.locked` is caught however the catalog's size moves. Their **base** never grows by additions: the
+  day's base is the files cataloged when the day began (a day ago, or its last acknowledgement if later); the total's is
+  the files cataloged at the last acknowledgement (the first scan until an admin releases a hold) and those added since
+  once they are a day old. So files added since the last release fall under the long-horizon cap after a day, and a
+  burst of additions (a thousand junk files) dilutes neither budget. In a repository's first day, or a day after a
+  release, its base is what was there then: deleting many of the files added since is held. (A rewritten file counts
+  when it was an original of the period.) What the guards let through is kept in the catalog (the `guardlog` table), so
+  a restart forgets nothing: one record per path for the last day, and, older than a day, folded into a count per guard
+  of what its total still counts, so the ledger holds a day of records and a few counters however long a repository runs
+  between releases. Records are on the guards' own clock: monotonic while the plugin runs (a jump of the wall clock
+  never ages a record), and carried across a restart, where the time down counts as elapsed only up to an hour (a wall
+  clock behind the last record, or more than an hour past it, is logged; no budget is ever cleared by a clock). A
+  release consumes only the budgets that held what it releases (the window, the day, the total, retention) and
+  acknowledges the deletes it releases (they count toward nothing); every other budget keeps counting: releasing an
+  unmounted volume's hold does not reset a drip's day.
+  - **Rolling retention** (`sync_retention_days`, an admin's: unset or 0 turns it off). A repository whose cleanup job
+    deletes files past an age is declared so: deletes of files filerepo first cataloged more than that many days ago
+    (by its own clock: not a file's mtime, which anyone who can write the file can set) are expected. They count
+    against none of the budgets above (nor hold a whole old subtree, such as an expired dated directory), only against
+    their own: within a rolling day, `sync_retention_fraction` (2) times what such a retention turns over in a day (the
+    catalog, or the day's base if larger, times a day over the retention age): a seven-day retention may delete up to
+    2/7 of the repository a day, ordinarily 1/7. Deletes of younger files count as any. So a rolling repository needs
+    no release, while a mass or drip loss of recent or arbitrary files is still held, and so is a burst of old ones
+    (a cleanup catching up after a long outage needs one release).
 
   The rows stay; `repostate` reports `deletes_held` and `deletes_hold_id`, the health check WARNs and
   `filerepo.sync.deletes.held` counts them, every cycle, until the files return or an admin sends `releasedeletes`
@@ -250,10 +265,11 @@ producer's own `streamfile` **over the dataplane**, verifies it and moves it int
   `sync_rewrite_guard_fraction` (25%) of the catalog (ransomware, the wrong volume or an old snapshot on the mount
   point) has those rewrites held: offered to no subscriber, new ones included, while every mirror keeps its copy.
   A held file changed again stays held; one changed back to the content the mirrors have is no longer held and offered
-  to nobody. The same longer horizons hold a slower rewrite: originals rewritten (each once) or deleted in the last 24
-  hours more than `sync_rewrite_guard_day_fraction` (25%) of the originals, or since the last acknowledgement (a
-  `releaserewrites`) more than `sync_rewrite_guard_total_fraction` (50%); each at least the minimum, kept across
-  restarts, and consumed by a release only for the budgets that held it, as for deletes. `repostate` reports `rewrites_held` and
+  to nobody. The same longer horizons hold a slower rewrite: originals rewritten (each once a day) and files deleted
+  (not retention) in the last 24 hours more than `sync_rewrite_guard_day_fraction` (25%) of the day's base, or since
+  the last acknowledgement (a `releaserewrites`) more than `sync_rewrite_guard_total_fraction` (50%) of the total's
+  base; each at least the minimum, kept across restarts, and consumed by a release only for the budgets that held it,
+  as for deletes. `repostate` reports `rewrites_held` and
   `rewrites_hold_id`, the health check WARNs, until an admin sends `releaserewrites` with `confirm` and that `hold_id`.
   A touch (a new time, the same content) is no change at all.
 - **Bounded.** A consumer keeps at most `sync_pending_per_peer` diffs per producer and `sync_max_peers` producers,
@@ -559,10 +575,12 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_tombstone_ttl_ms` | `604800000` (7 days) | How long a delete every kept subscriber applied is kept. |
 | `sync_delete_guard_min` / `sync_delete_guard_fraction` | `3` / `0.10` | The mass-delete guard: a loss of at least this many files and more than this fraction of the catalog is held. |
 | `sync_delete_guard_window_ms` | `900000` (15 min) | Deletes recorded this recently count with a cycle's loss for the fraction (`0`: each cycle alone). |
-| `sync_delete_guard_day_fraction` / `sync_delete_guard_total_fraction` | `0.25` / `0.5` | Originals deleted or rewritten in a rolling 24 h, and since the last acknowledgement, beyond which every delete is held (`0`: off). Gross, kept across restarts. |
+| `sync_delete_guard_day_fraction` / `sync_delete_guard_total_fraction` | `0.25` / `0.5` | Files deleted (any) and originals rewritten in a rolling 24 h, and since the last acknowledgement, beyond which every delete is held (`0`: off). Gross, against a base additions never enlarge, kept across restarts. |
+| `sync_retention_days` | *(unset: off)* | Rolling retention: deletes of files filerepo first cataloged more than this many days ago (fractions allowed) are expected; they count only against their own budget. |
+| `sync_retention_fraction` | `2` | Retention deletes allowed in a rolling 24 h, as a multiple of what the retention turns over in a day (catalog x a day / retention age); beyond it they are held. |
 | `sync_delete_guard_subtree_min` / `sync_delete_guard_subtree_fraction` | `10` / `0.01` | A whole subtree that lost all its cataloged files, at least this many and more than this fraction of the catalog, is held. (A vanished mount and an emptied scan dir are always held.) |
 | `sync_rewrite_guard_min` / `sync_rewrite_guard_fraction` | `10` / `0.25` | The rewrite guard: a cycle rewriting at least this many existing files and more than this fraction of the catalog is held. `1.0` turns it off. |
-| `sync_rewrite_guard_day_fraction` / `sync_rewrite_guard_total_fraction` | `0.25` / `0.5` | Originals rewritten (each once) or deleted in a rolling 24 h, and since the last `releaserewrites`, beyond which rewrites are held (`0`: off). |
+| `sync_rewrite_guard_day_fraction` / `sync_rewrite_guard_total_fraction` | `0.25` / `0.5` | Originals rewritten (each once a day) and files deleted (not retention) in a rolling 24 h, and since the last `releaserewrites`, beyond which rewrites are held (`0`: off). |
 | `sync_release_ttl_ms` | `600000` | How long an admin's release waits for the scan that applies it. |
 | `live_lease_max_ms` | `86400000` | The longest lease `liverealise` may ask for. |
 | `putfiles_require_hashes` | `true` | `putfiles` refuses a file without an expected hash. |
@@ -740,10 +758,12 @@ What an operator sees change, and what to do:
 - **Mass rewrites are held** like mass deletes (`rewrites_held`, `releaserewrites` with `hold_id`), also when spread
   over a day (25%) or since the last acknowledgement (50%). A job that legitimately regenerates most of a repository
   must be followed by a release, or set the rewrite fractions to `1.0` for that repository. Deletes have the same
-  longer budgets (25% a day, 50% since the last release). Both count originals gross (a file deleted and replaced by
-  another still counts), deletes and rewrites together, and keep their records in the catalog across restarts: a job
-  that deletes or regenerates more than a quarter of a repository's files in a day needs a release (or higher
-  fractions).
+  longer budgets (25% a day, 50% since the last release). Both count gross (every file deleted, whenever it was added;
+  a file deleted and replaced by another still counts), deletes and rewrites together, against a base additions never
+  enlarge, and keep their records in the catalog across restarts: a job that deletes or regenerates more than a quarter
+  of a repository's files in a day needs a release (or higher fractions). **A repository with a cleanup job that
+  deletes files past an age sets `sync_retention_days`** to that age (and, for a retention shorter than about two days,
+  may raise `sync_retention_fraction`): without it, its deletes count like any and eventually need a release.
 - **A mirror scans its own directory** (every `scan_period`): files its producer delivered that are gone are asked for
   again and refetched (`reporefill`, a new sync message: upgrade producers and mirrors of a name together).
 - **A mirror's directory carries a generation marker** (`.filerepo-staging/generation`). A mirror upgraded from a build

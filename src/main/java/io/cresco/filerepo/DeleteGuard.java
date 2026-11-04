@@ -25,27 +25,33 @@ import java.util.Set;
  *   <li>always, everything when the scan dir is suddenly empty;</li>
  *   <li>every file of a <b>whole subtree</b> that lost all its cataloged files, when they are at least
  *   {@code subtreeMin} files AND more than {@code subtreeFraction} of the catalog: what a nested volume going away
- *   looks like where device ids cannot tell it, while an ordinary {@code rm -rf} of a small directory goes through;</li>
+ *   looks like where device ids cannot tell it, while an ordinary {@code rm -rf} of a small directory goes through
+ *   (and a subtree whose files are all past the retention age goes through as retention);</li>
  *   <li>everything, when the loss (beyond the above) is at least {@code min} files AND more than {@code fraction} of
  *   the catalog, counting the deletes recorded within the last {@code windowMs} too;</li>
- *   <li>everything, when the deletes recorded and the rewrites offered within the last 24 hours, with this cycle's
- *   loss, are at least {@code min} AND more than {@code dayFraction} of the catalog's high-water mark: gross, so files
- *   deleted and replaced by others (x by x.locked) count, however the catalog's size moves;</li>
- *   <li>everything, when the deletes recorded and the rewrites offered since the last admin acknowledgement, with this
- *   cycle's loss, are more than {@code totalFraction} of the high-water mark: however slowly the catalog is drained or
- *   churned, never past that without an admin.</li>
+ *   <li>everything, when every file deleted within the last 24 hours (whenever it was added) and every original
+ *   rewritten, with this cycle's loss, are at least {@code min} AND more than {@code dayFraction} of the day's base:
+ *   the files cataloged when the day began. Gross, so a delete replaced by another file (x by x.locked) counts, and
+ *   files added during the day count when they are deleted but never enlarge the base;</li>
+ *   <li>everything, when the same since the last admin acknowledgement are more than {@code totalFraction} of the
+ *   total's base: the files cataloged at the acknowledgement, and those added since once they are a day old. However
+ *   slowly a catalog is drained or churned, never past that without an admin;</li>
+ *   <li>with a retention age configured (an admin's {@code sync_retention_days}), deletes of files filerepo first
+ *   cataloged longer ago than that are expected: they count against none of the above, only against a separate,
+ *   generous budget ({@code retentionFraction} of the day's base within a day); deletes of younger files count as
+ *   any.</li>
  * </ul>
  * What was let through is kept in the catalog ({@link GuardLedger}), on a clock that is monotonic while the plugin runs,
  * so neither a restart nor a jump of the wall clock clears a budget. What is held is identified by a digest of exactly
  * those deletes. An admin's release must name that digest, is spent by the next evaluation whatever it finds, and
  * expires: it never applies to a later or another loss. A release consumes only the budgets that held what it releases
- * (the 15-minute window, the day, the total since the last acknowledgement); the released deletes themselves are
- * acknowledged and count toward nothing; every other budget, and the rewrite guard's, keeps counting.
+ * (the 15-minute window, the day, the total since the last acknowledgement, the retention budget); the released deletes
+ * themselves are acknowledged and count toward nothing; every other budget, and the rewrite guard's, keeps counting.
  */
 final class DeleteGuard {
 
     /** Why a delete is held. */
-    enum Budget { MOUNT, SUBTREE, EMPTY, WINDOW, DAY, TOTAL }
+    enum Budget { MOUNT, SUBTREE, EMPTY, WINDOW, DAY, TOTAL, RETENTION }
 
     /** What one evaluation decided. */
     static final class Decision {
@@ -73,6 +79,9 @@ final class DeleteGuard {
     static final long DAY_MS = 24L * 3600 * 1000;
     private double dayFraction;
     private double totalFraction;
+    // deletes of files first cataloged longer ago than this are retention (0: no retention), against their own budget
+    private long retentionAgeMs;
+    private double retentionFraction;
 
     // the hold now in force (from the last evaluation), and an admin's armed release
     private volatile String holdId;
@@ -102,6 +111,16 @@ final class DeleteGuard {
 
     boolean totalOn() {
         return totalFraction > 0;
+    }
+
+    /**
+     * Rolling retention: deletes of files first cataloged at least {@code ageMs} ago (0: none) are expected, and count
+     * only against their own budget: within a rolling day, {@code fraction} times what such a retention turns over in a
+     * day (the catalog, or the day's base if larger, times a day over the retention age).
+     */
+    synchronized void setRetention(long ageMs, double fraction) {
+        this.retentionAgeMs = Math.max(0L, ageMs);
+        this.retentionFraction = fraction;
     }
 
     int heldCount() {
@@ -169,15 +188,28 @@ final class DeleteGuard {
             }
         }
 
-        // 2. whole subtrees that lost every cataloged file
-        Map<Path, int[]> dirs = new HashMap<>();   // dir -> {cataloged, gone}
+        // which of the deletes are retention: of files first cataloged at least the retention age ago
+        Set<String> retained = new HashSet<>();
+        if (retentionAgeMs > 0) {
+            for (String p : byPath.keySet()) {
+                Long b = catalogUnderRoot.get(p);
+                if (now - (b == null ? 0L : b) >= retentionAgeMs) retained.add(p);
+            }
+        }
+
+        // 2. whole subtrees that lost every cataloged file (unless every one of them is retention: an expired dated
+        // directory going away whole)
+        Map<Path, int[]> dirs = new HashMap<>();   // dir -> {cataloged, gone, gone and not retention}
         for (String p : catalogUnderRoot.keySet()) count(dirs, root, Paths.get(p), 0);
-        for (String p : byPath.keySet()) count(dirs, root, Paths.get(p), 1);
+        for (String p : byPath.keySet()) {
+            count(dirs, root, Paths.get(p), 1);
+            if (!retained.contains(p)) count(dirs, root, Paths.get(p), 2);
+        }
         List<Path> lost = new ArrayList<>();
         int size = catalogUnderRoot.size();
         for (Map.Entry<Path, int[]> e : dirs.entrySet()) {
             int[] c = e.getValue();
-            if (c[1] == c[0] && c[0] >= subtreeMin && c[0] > subtreeFraction * size) lost.add(e.getKey());
+            if (c[1] == c[0] && c[2] > 0 && c[0] >= subtreeMin && c[0] > subtreeFraction * size) lost.add(e.getKey());
         }
         lost.sort(Comparator.comparingInt(Path::getNameCount));
         List<Path> outermost = new ArrayList<>();
@@ -197,53 +229,72 @@ final class DeleteGuard {
             }
         }
 
-        // 3. an empty scan dir, or the budgets: what was recorded within the window, the day and since the last
-        // acknowledgement (from the ledger, kept across restarts), with this cycle's loss
-        int rest = byPath.size() - held.size();
-        boolean empty = seen == 0 && !catalogUnderRoot.isEmpty();
-        int earlier = windowMs > 0 ? ledger.count("D", Math.max(now - windowMs, ledger.ack(GuardLedger.WIN_D))) : 0;
-        int loss = rest + earlier;
-        // at least min files and more than the fraction of the catalog (as it was before the window's deletes)
-        boolean large = loss >= min && loss > fraction * (catalogUnderRoot.size() + earlier);
-        // the longer horizons count originals only: files first cataloged before the period began (a day ago, or the
-        // last acknowledgement), deleted (gross: a delete replaced by a new file still counts) or rewritten within it,
-        // against how many originals there were. Files added since neither count nor dilute the budget.
-        long dayStart = ledger.dayStart(GuardLedger.DAY_D), totStart = ledger.ack(GuardLedger.TOT_D);
-        int restDay = 0, restTot = 0;
+        // 3. an empty scan dir, or the budgets (what was let through is in the ledger, kept across restarts)
+        int rest = 0, restRetained = 0;
         for (String p : byPath.keySet()) {
             if (held.contains(p)) continue;
-            Long born = catalogUnderRoot.get(p);
-            long b = born == null ? 0L : born;
-            if (b <= dayStart) restDay++;
-            if (b <= totStart) restTot++;
+            if (retained.contains(p)) restRetained++;
+            else rest++;
         }
-        long dayOriginals = 0, totOriginals = 0;
-        int today = 0, sinceAck = 0;
-        if (dayFraction > 0 && restDay > 0) {
-            today = ledger.count("DR", dayStart, dayStart);
-            dayOriginals = ledger.originals(catalogUnderRoot, dayStart);
+        boolean empty = seen == 0 && !catalogUnderRoot.isEmpty();
+        // the 15-minute window: what it recorded, with this cycle's loss, against the catalog as it was before them
+        int earlier = windowMs > 0 && rest > 0 ? ledger.count("D", Math.max(now - windowMs, ledger.ack(GuardLedger.WIN_D))) : 0;
+        int loss = rest + earlier;
+        boolean large = rest > 0 && loss >= min && loss > fraction * (catalogUnderRoot.size() + earlier);
+        // the day: every file deleted (whenever it was added) and every original rewritten since the day began,
+        // against the files cataloged when it began: additions count when deleted, never enlarge the base
+        long dayStart = ledger.dayStart(GuardLedger.DAY_D);
+        long dayBase = 0;
+        int today = 0;
+        boolean dayLarge = false;
+        if (dayFraction > 0 && rest > 0) {
+            today = ledger.count("D", dayStart) + ledger.count("R", dayStart, dayStart);
+            dayBase = ledger.dayBase(catalogUnderRoot, dayStart);
+            dayLarge = rest + today >= min && rest + today > dayFraction * dayBase;
         }
-        if (totalFraction > 0 && restTot > 0) {
-            sinceAck = ledger.count("DR", totStart, totStart);
-            totOriginals = ledger.originals(catalogUnderRoot, totStart);
+        // the total since the last acknowledgement: the same, against the files cataloged then and those added since
+        // once a day old (so files added since the last release fall under it too, and fresh additions never dilute it)
+        long totAck = ledger.ack(GuardLedger.TOT_D), totCut = ledger.totalCut(GuardLedger.TOT_D);
+        long totBase = 0, sinceAck = 0;
+        boolean totalLarge = false;
+        if (totalFraction > 0 && rest > 0) {
+            sinceAck = ledger.count("D", totAck) + ledger.count("R", totAck, totCut)
+                    + ledger.folded('D', GuardLedger.DELETE) + ledger.folded('D', GuardLedger.REWRITE);
+            totBase = ledger.totalBase(catalogUnderRoot, 'D', totAck, totCut);
+            totalLarge = rest + sinceAck >= min && rest + sinceAck > totalFraction * totBase;
         }
-        int dayLoss = restDay + today, totalLoss = restTot + sinceAck;
-        boolean dayLarge = dayFraction > 0 && restDay > 0 && dayLoss >= min && dayLoss > dayFraction * dayOriginals;
-        boolean totalLarge = totalFraction > 0 && restTot > 0 && totalLoss >= min && totalLoss > totalFraction * totOriginals;
-        if (empty || (rest > 0 && (large || dayLarge || totalLarge))) {
+        // retention: deletes of files past the retention age within a day, against what a rolling retention turns over
+        // in a day (the catalog over the retention age in days), times retentionFraction
+        int retainedToday = 0;
+        long retBase = 0;
+        double retAllowance = 0;
+        boolean retentionLarge = false;
+        if (restRetained > 0) {
+            long retStart = Math.max(now - DAY_MS, ledger.ack(GuardLedger.RET_T));
+            retainedToday = ledger.count("T", retStart);
+            retBase = Math.max(ledger.dayBase(catalogUnderRoot, ledger.dayStart(GuardLedger.DAY_D)), catalogUnderRoot.size());
+            retAllowance = retentionFraction * retBase * (DAY_MS / (double) retentionAgeMs);
+            retentionLarge = restRetained + retainedToday >= min && restRetained + retainedToday > retAllowance;
+        }
+        if (empty || large || dayLarge || totalLarge || retentionLarge) {
             held.addAll(byPath.keySet());
             if (empty) budgets.add(Budget.EMPTY);
-            if (rest > 0 && large) budgets.add(Budget.WINDOW);
-            if (rest > 0 && dayLarge) budgets.add(Budget.DAY);
-            if (rest > 0 && totalLarge) budgets.add(Budget.TOTAL);
+            if (large) budgets.add(Budget.WINDOW);
+            if (dayLarge) budgets.add(Budget.DAY);
+            if (totalLarge) budgets.add(Budget.TOTAL);
+            if (retentionLarge) budgets.add(Budget.RETENTION);
             why.add(empty ? "the scan dir is empty"
                     : large ? rest + " of " + catalogUnderRoot.size() + " cataloged files"
                             + (earlier > 0 ? ", after " + earlier + " recorded in the last " + (windowMs / 60000) + " min" : "")
                             + " (more than " + Math.round(fraction * 100) + "%)"
-                    : dayLarge ? restDay + " now, after " + today + " deleted or rewritten in the last 24 h (more than "
-                            + Math.round(dayFraction * 100) + "% of the " + dayOriginals + " files cataloged before that day)"
-                    : restTot + " now, after " + sinceAck + " deleted or rewritten since the last acknowledgement (more than "
-                            + Math.round(totalFraction * 100) + "% of the " + totOriginals + " files cataloged then)");
+                    : dayLarge ? rest + " now, after " + today + " deleted or rewritten in the last 24 h (more than "
+                            + Math.round(dayFraction * 100) + "% of the " + dayBase + " files cataloged when the day began)"
+                    : totalLarge ? rest + " now, after " + sinceAck + " deleted or rewritten since the last acknowledgement"
+                            + " (more than " + Math.round(totalFraction * 100) + "% of the " + totBase + " files cataloged then,"
+                            + " or a day old)"
+                    : restRetained + " past the retention age now, after " + retainedToday + " in the last 24 h (more than "
+                            + Math.round(retAllowance) + ": " + retentionFraction + " times what a " + retentionAgeMs / 3_600_000.0
+                            + " h retention of " + retBase + " files turns over in a day)");
         }
 
         List<DBEngine.Tombstone> record = new ArrayList<>();
@@ -254,7 +305,7 @@ final class DeleteGuard {
         if (holding.isEmpty()) {
             holdId = null;
             heldCount = 0;
-            ledger.record(GuardLedger.DELETE, born(record, catalogUnderRoot));
+            note(ledger, record, catalogUnderRoot, retained);
             return new Decision(record, holding, null, null, false);
         }
         String id = digest(holding);
@@ -264,23 +315,27 @@ final class DeleteGuard {
             if (budgets.contains(Budget.WINDOW)) ledger.acknowledge(GuardLedger.WIN_D, now);
             if (budgets.contains(Budget.DAY)) ledger.acknowledge(GuardLedger.DAY_D, now);
             if (budgets.contains(Budget.TOTAL)) ledger.acknowledge(GuardLedger.TOT_D, now);
-            ledger.record(GuardLedger.DELETE, born(record, catalogUnderRoot));
+            if (budgets.contains(Budget.RETENTION)) ledger.acknowledge(GuardLedger.RET_T, now);
+            note(ledger, record, catalogUnderRoot, retained);
             holdId = null;
             heldCount = 0;
             record.addAll(holding);
             return new Decision(record, List.of(), id, String.join("; ", why) + " " + budgets, true);
         }
-        ledger.record(GuardLedger.DELETE, born(record, catalogUnderRoot));
+        note(ledger, record, catalogUnderRoot, retained);
         holdId = id;
         heldCount = holding.size();
         return new Decision(record, holding, id, String.join("; ", why), false);
     }
 
-    /** The deletes' paths, with when each file was first cataloged. */
-    private static Map<String, Long> born(List<DBEngine.Tombstone> ts, Map<String, Long> catalog) {
-        Map<String, Long> out = new LinkedHashMap<>();
-        for (DBEngine.Tombstone t : ts) out.put(t.filepath, catalog.getOrDefault(t.filepath, 0L));
-        return out;
+    /** Note the deletes recorded in the ledger: retention ones apart, each with when its file was first cataloged. */
+    private static void note(GuardLedger ledger, List<DBEngine.Tombstone> ts, Map<String, Long> catalog, Set<String> retained) {
+        Map<String, Long> regular = new LinkedHashMap<>(), retention = new LinkedHashMap<>();
+        for (DBEngine.Tombstone t : ts) {
+            (retained.contains(t.filepath) ? retention : regular).put(t.filepath, catalog.getOrDefault(t.filepath, 0L));
+        }
+        ledger.record(GuardLedger.DELETE, regular);
+        ledger.record(GuardLedger.RETAINED, retention);
     }
 
     private static void count(Map<Path, int[]> dirs, Path root, Path file, int slot) {
@@ -293,7 +348,7 @@ final class DeleteGuard {
         Path d = file.getParent();
         // every directory strictly under root that holds the file
         for (int i = rel.getNameCount() - 1; i >= 1 && d != null; i--) {
-            dirs.computeIfAbsent(d, k -> new int[2])[slot]++;
+            dirs.computeIfAbsent(d, k -> new int[3])[slot]++;
             d = d.getParent();
         }
     }

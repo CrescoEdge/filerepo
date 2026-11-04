@@ -523,6 +523,22 @@ public class RepoEngine {
                 clamp(longParam("sync_delete_guard_window_ms", 900_000L), 0L, Long.MAX_VALUE));
         guard.setBudgets(fractionOrZero("sync_delete_guard_day_fraction", 0.25),
                 fractionOrZero("sync_delete_guard_total_fraction", 0.5));
+        // rolling retention (an admin's): deletes of files first cataloged at least sync_retention_days ago are expected
+        double retentionDays = 0;
+        try {
+            Double d = plugin.getConfig().getDoubleParam("sync_retention_days");
+            if (d != null && d > 0) retentionDays = d;
+        } catch (Exception ignore) { }
+        double retentionFraction = 2.0;
+        try {
+            Double f = plugin.getConfig().getDoubleParam("sync_retention_fraction");
+            if (f != null && f > 0 && f <= 100) retentionFraction = f;
+        } catch (Exception ignore) { }
+        guard.setRetention((long) (retentionDays * DeleteGuard.DAY_MS), retentionFraction);
+        if (retentionDays > 0) {
+            logger.info("filerepo " + fileRepoName + ": rolling retention: deletes of files first cataloged over "
+                    + retentionDays + " day(s) ago are expected (up to " + retentionFraction + " times the turnover a day)");
+        }
         rewriteFraction = fractionParam("sync_rewrite_guard_fraction", 0.25);
         // a day allows at least what one cycle does, and the total at least what a day does (0 turns one off)
         double rd = fractionOrZero("sync_rewrite_guard_day_fraction", 0.25);
@@ -952,6 +968,11 @@ public class RepoEngine {
                     + ex.getMessage() + "): this producer serves no mirror until an admin restores it (or removes it, and"
                     + " re-pins every mirror to the new key)");
         }
+    }
+
+    /** The guards' ledger (tests: its clock moves a day forward). */
+    GuardLedger ledger() {
+        return ledger;
     }
 
     /** This producer's key fingerprint, or null. */
@@ -1801,19 +1822,24 @@ public class RepoEngine {
         int today = 0, sinceAck = 0;
         boolean dayLarge = false, totalLarge = false;
         if (!cycleLarge && rewriteDayFraction > 0) {
+            // originals (cataloged when the day began) rewritten, each once, and every file deleted within the day,
+            // against the files cataloged when it began
             long start = ledger.dayStart(GuardLedger.DAY_R);
             List<String> originals = originalsOf(rewrites, born, start);
             if (!originals.isEmpty()) {
-                today = ledger.count("DR", start, start) + originals.size() - ledger.known(GuardLedger.REWRITE, originals, start);
-                dayLarge = today >= rewriteMin && today > rewriteDayFraction * ledger.originals(born, start);
+                today = ledger.count("D", start) + ledger.count("R", start, start) + originals.size()
+                        - ledger.known(GuardLedger.REWRITE, originals, start);
+                dayLarge = today >= rewriteMin && today > rewriteDayFraction * ledger.dayBase(born, start);
             }
         }
         if (!cycleLarge && !dayLarge && rewriteTotalFraction > 0) {
-            long start = ledger.ack(GuardLedger.TOT_R);
-            List<String> originals = originalsOf(rewrites, born, start);
+            // the same since the last acknowledgement, against the files cataloged then and those since a day old
+            long ack = ledger.ack(GuardLedger.TOT_R), cut = ledger.totalCut(GuardLedger.TOT_R);
+            List<String> originals = originalsOf(rewrites, born, cut);
             if (!originals.isEmpty()) {
-                sinceAck = ledger.count("DR", start, start) + originals.size() - ledger.known(GuardLedger.REWRITE, originals, start);
-                totalLarge = sinceAck >= rewriteMin && sinceAck > rewriteTotalFraction * ledger.originals(born, start);
+                sinceAck = (int) (ledger.count("D", ack) + ledger.count("R", ack, cut) + ledger.folded('R', GuardLedger.DELETE)
+                        + ledger.folded('R', GuardLedger.REWRITE)) + originals.size() - ledger.known(GuardLedger.REWRITE, originals, ack);
+                totalLarge = sinceAck >= rewriteMin && sinceAck > rewriteTotalFraction * ledger.totalBase(born, 'R', ack, cut);
             }
         }
         boolean mass = cycleLarge || dayLarge || totalLarge;

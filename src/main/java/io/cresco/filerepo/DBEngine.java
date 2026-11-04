@@ -1201,15 +1201,16 @@ public class DBEngine {
     // ---- the guards' ledger (GuardLedger): deletes recorded and rewrites offered, by path, on the guards' clock ----
 
     /**
-     * Records of {@code kinds} ("D", "R" or "DR") made after {@code after}, of files first cataloged at or before
+     * Records of {@code kinds} (letters of D, T, R) made after {@code after}, of files first cataloged at or before
      * {@code bornBy}. Fails closed: unreadable counts as over every budget.
      */
     public int guardCount(String kinds, long after, long bornBy) {
-        String sql = kinds.length() == 1 ? "SELECT COUNT(*) FROM guardlog WHERE kind = ? AND atms > ? AND born <= ?"
-                : "SELECT COUNT(*) FROM guardlog WHERE atms > ? AND born <= ?";
+        StringBuilder in = new StringBuilder();
+        for (int i = 0; i < kinds.length(); i++) in.append(i == 0 ? "?" : ",?");
+        String sql = "SELECT COUNT(*) FROM guardlog WHERE kind IN (" + in + ") AND atms > ? AND born <= ?";
         try (Connection conn = ds.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
             int i = 1;
-            if (kinds.length() == 1) ps.setString(i++, kinds);
+            for (char k : kinds.toCharArray()) ps.setString(i++, String.valueOf(k));
             ps.setLong(i++, after);
             ps.setLong(i, bornBy);
             try (ResultSet rs = ps.executeQuery()) {
@@ -1218,6 +1219,32 @@ public class DBEngine {
         } catch (Exception ex) {
             logger.error("guardCount error (counted as over every budget)", ex);
             return Integer.MAX_VALUE / 4;
+        }
+    }
+
+    /** Records of {@code kind} made after {@code after} and at or before {@code upTo}. */
+    public int guardCountBetween(char kind, long after, long upTo) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM guardlog WHERE kind = ? AND atms > ? AND atms <= ?")) {
+            ps.setString(1, String.valueOf(kind));
+            ps.setLong(2, after);
+            ps.setLong(3, upTo);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        } catch (Exception ex) {
+            logger.error("guardCountBetween error", ex);
+            return 0;
+        }
+    }
+
+    /** All the guards' records (tests: the ledger stays bounded). */
+    public int guardRows() {
+        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM guardlog")) {
+            return rs.next() ? rs.getInt(1) : 0;
+        } catch (Exception ex) {
+            return -1;
         }
     }
 
