@@ -195,6 +195,13 @@ import io.cresco.library.capability.*;
         why = "Sync handshake; the producer is its stamped caller.",
         params = {@CrescoParam(name = "accepted", required = true), @CrescoParam(name = "filerepo_name"),
                   @CrescoParam(name = "sync_proto")}),
+    @CrescoAction(name = "reporefill", type = "EXEC", roles = {"plugin"},
+        summary = "A subscriber of this producer asks for files it lost: they are offered to it again (to it alone).",
+        why = "A mirror refills a partial loss; never a delete. Bounded per request and per subscriber.",
+        params = {@CrescoParam(name = "filerepo_name", required = true), @CrescoParam(name = "sync_gen", required = true),
+                  @CrescoParam(name = "names", required = true, compressed = true, type = "object",
+                          description = "JSON list of the names it lost (at most 1000)")},
+        returns = @CrescoReturn(name = "refill", description = "how many are offered again")),
     @CrescoAction(name = "repoconfirm", type = "EXEC", roles = {"plugin"},
         summary = "Acknowledge a subscriber received a transfer generation.", why = "Sync handshake.",
         params = @CrescoParam(name = "transfer_id", required = true)),
@@ -369,6 +376,8 @@ public class ExecutorImpl implements Executor {
                 metricEngine.setGauge("filerepo.sync.subscribers.dropped", "subscribers dropped after sync_subscriber_ttl_ms of silence", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
                 metricEngine.setGauge("filerepo.sync.unverified", "discovers, subscribes and answers refused for want of the sync_key's proof", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
                 metricEngine.setGauge("filerepo.rewrites.held", "rewrites the rewrite guard holds back from subscribers", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.refill.asked", "files a mirror found gone and asked its producer for again", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.refill.offered", "files a producer offered again to a subscriber that lost them", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
             }
             long fileCount = 0L;
             long tombstones = 0L;
@@ -394,6 +403,8 @@ public class ExecutorImpl implements Executor {
             metricEngine.updateLongGauge("filerepo.sync.subscribers.dropped", repoEngine.subscribersDropped.get());
             metricEngine.updateLongGauge("filerepo.sync.unverified", repoEngine.syncUnverified.get());
             metricEngine.updateLongGauge("filerepo.rewrites.held", repoEngine.getRewritesHeld());
+            metricEngine.updateLongGauge("filerepo.sync.refill.asked", repoEngine.syncRefillAsked.get());
+            metricEngine.updateLongGauge("filerepo.sync.refill.offered", repoEngine.syncRefillOffered.get());
             return gson.toJson(metricEngine.getAllMetrics());
         } catch (Exception ex) {
             logger.error("getMetricsJson() " + ex.getMessage(), ex);
@@ -489,6 +500,8 @@ public class ExecutorImpl implements Executor {
                 case "reposubscribed":
                     repoEngine.onSubscribed(incoming);
                     break;
+                case "reporefill":
+                    return repoEngine.onRefill(incoming);
                 case "getmetrics":
                     // B-2 unified metrics: filerepo catalog / transfer gauges
                     incoming.setParam("metrics", getMetricsJson());

@@ -178,6 +178,14 @@ producer's own `streamfile` **over the dataplane**, verifies it and moves it int
   delete is committed under the repository gate, only while the generation is the one the transfer was taken for),
   and its confirm settles nothing at the producer. A producer resets a subscriber for a new generation (everything
   offered again) at most a few times at once, then once per `sync_reset_interval_ms`.
+- **A partial loss is refilled.** A mirror scans too (at start, then every `scan_period` after `scan_delay`): its
+  generation marker, and the files its catalog says its pinned producer delivered (the claims, a page of
+  `sync_refill_check_batch` a run, going on where the last run stopped) that are gone from the directory (files deleted
+  by hand, `find -type f -delete`, a failed disk under one subtree, its directories kept). It asks that producer for
+  them (`reporefill`, at most 1000 names a request, each name at most once per `sync_offer_timeout_ms`); the producer
+  offers the ones it still catalogs again to that mirror alone (a burst of requests, then one a second), and they are
+  fetched and verified as any offer. A file gone from a mirror is never a delete: a mirror produces nothing.
+  `filerepo.sync.refill.asked` (mirror) and `filerepo.sync.refill.offered` (producer) count them.
 - **Several pinned producers of one name** (`sync_producers` listing several). A mirror records, per name, which
   producer's content it holds: a *fetched* claim (the bytes came from that producer) or a *matched* one (a producer
   offered exactly the content already there). The producer with the fetched claim updates and deletes the file; a
@@ -449,8 +457,8 @@ are base64 in the reply. A refusal of the live-tier and clear rules is `status 9
 
 Roles (`@CrescoAction(roles=...)`, enforced by the agent before filerepo runs; see the controller's
 `docs/caller-authorization.md`): **`clearrepo`, `putjar`, `removefile`, `putfiles`, `putfilesremote`,
-`releasedeletes`, `releaserewrites`, `syncpin` and `liverealise` need `infra` or `admin`**; `repolistin`, `repoconfirm`, `reposubscribe` and
-`reposubscribed` need `plugin` (another filerepo); every other action is open to callers of this agent's tenant and to
+`releasedeletes`, `releaserewrites`, `syncpin` and `liverealise` need `infra` or `admin`**; `repolistin`, `repoconfirm`, `reposubscribe`,
+`reposubscribed` and `reporefill` need `plugin` (another filerepo); every other action is open to callers of this agent's tenant and to
 `infra`. Wherever filerepo itself needs to know who called (the owner of a transfer, an admin's `force`, a sync peer)
 it reads only the stamped caller; a message without one is anonymous only in explicit insecure development mode
 (`broker_security_enabled=false` given to the agent), and otherwise refused. A refused call answers `status_code=403`.
@@ -479,6 +487,7 @@ it reads only the stamped caller; a message without one is anonymous only in exp
 | `reposubscribe` *(plugin)* | `filerepo_name`, `sync_gen`, `sync_proto` | — (answered with `reposubscribed`) | Sync protocol 2: a consumer asks a producer to serve it. |
 | `reposubscribed` *(plugin)* | `accepted`, `filerepo_name`, `sync_proto`, `refusal` | — | Sync protocol 2: a producer's answer. |
 | `repoconfirm` *(plugin)* | `transfer_id`, optional `failedfiles`, `faileddeletes` | — | Sync handshake ack (from a subscriber only). |
+| `reporefill` *(plugin)* | `filerepo_name`, `sync_gen`, `names` (json, at most 1000) | `refill` | A subscriber of this generation asks for files it lost: those still cataloged are offered to it again (to it alone). Never a delete. |
 | `getmetrics` | — | `metrics` (json) | Central metrics — `MeasurementEngine` gauges (see below). Folded into the controller's `getmetricinventory`. |
 | `getcapabilities` | — | `capabilities` (json) | Self-describing capability document (LLM tool specs). |
 
@@ -513,7 +522,7 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `filerepo_name` | *(unset)* | Logical repo name for mesh discovery/sync. |
 | `enable_scan` | `true` | Enable the periodic scan. |
 | `scan_delay` | `5000` ms | Delay before the first scan. |
-| `scan_period` | `15000` ms | Scan interval. |
+| `scan_period` | `15000` ms | Scan interval (a producer's scan, and a mirror's check of its own directory). |
 | `scan_recursive` | `true` | Recurse into subdirectories. |
 | `repo_dir` | `<agent data dir>/filerepo/repos/<filerepo_name, or "default">` | Repo directory for on-demand/consumer storage (absolute default, outside the plugin's data directory; configure an absolute path). |
 | `instance_id` | *(unset)* | Optional repo instance identifier surfaced in listings. |
@@ -540,6 +549,7 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_lag_alarm_ms` | `86400000` | A subscriber owing confirms this long is an alarm (ERROR a day, gauge, health WARN). |
 | `sync_holder_ttl_ms` | `2592000000` (30 days) | At a mirror: claims of a producer not heard from this long are orphaned: only it may replace those files, and deleting them needs an admin's `releasedeletes` at the mirror. |
 | `sync_reset_interval_ms` | `600000` | A subscriber's new generations (each re-offers the whole catalog) are taken a few at once, then one per this interval. |
+| `sync_refill_check_batch` | `10000` | A mirror's scan checks this many of its producer's files for loss a run (`scan_period`), going on where it stopped. |
 | `sync_offer_timeout_ms` | `600000` | An offered file is not offered again for this long unless confirmed or failed. |
 | `sync_stream_buffer` | `262144` | Chunk size a consumer asks for (4 KB - 768 KB). |
 | `sync_stream_idle_ms` | `30000` | A transfer with no frame for this long is cancelled and retried. |
@@ -732,6 +742,8 @@ What an operator sees change, and what to do:
   another still counts), deletes and rewrites together, and keep their records in the catalog across restarts: a job
   that deletes or regenerates more than a quarter of a repository's files in a day needs a release (or higher
   fractions).
+- **A mirror scans its own directory** (every `scan_period`): files its producer delivered that are gone are asked for
+  again and refetched (`reporefill`, a new sync message: upgrade producers and mirrors of a name together).
 - **A mirror's directory carries a generation marker** (`.filerepo-staging/generation`). A mirror upgraded from a build
   without one starts a new generation once (its producer offers everything; it holds what it has and fetches nothing
   twice).

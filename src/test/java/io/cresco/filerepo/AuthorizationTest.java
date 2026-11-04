@@ -56,7 +56,7 @@ class AuthorizationTest {
         // a lease extension as the node itself
         assertEquals(privileged, roles.get("liverealise"));
         // sync messages come from another filerepo
-        for (String sync : new String[]{"repolistin", "repoconfirm", "reposubscribe", "reposubscribed"}) {
+        for (String sync : new String[]{"repolistin", "repoconfirm", "reposubscribe", "reposubscribed", "reporefill"}) {
             assertEquals(Set.of("plugin"), roles.get(sync), sync);
         }
         // everything else: the default (same tenant, and infra)
@@ -64,7 +64,7 @@ class AuthorizationTest {
                 "streamfilecancel", "getscandir", "repostate", "liverelay", "getmetrics", "getcapabilities"}) {
             assertEquals(Set.of(), roles.get(open), open);
         }
-        assertEquals(24, roles.size(), "every action is declared: " + roles.keySet());
+        assertEquals(25, roles.size(), "every action is declared: " + roles.keySet());
     }
 
     @Test

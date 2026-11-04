@@ -137,6 +137,10 @@ public class RepoEngine {
         }
     });
 
+    static final int REFILL_BURST = 20;
+    /** Names one refill request carries at most. */
+    static final int REFILL_PAGE = 1000;
+
     /** A subscriber as the producer serves it. */
     static final class ActiveSub {
         final String key, region, agent, plugin;
@@ -149,6 +153,17 @@ public class RepoEngine {
         // resets (a new generation: everything offered again) allowed: a few at once, then one per sync_reset_interval_ms
         double resetTokens = 3;
         long resetRefilled = System.currentTimeMillis();
+        // refills (a mirror asking for files it lost): a burst, then one a second
+        double refillTokens = REFILL_BURST;
+        long refillRefilled = System.currentTimeMillis();
+
+        synchronized boolean takeRefill(long now) {
+            refillTokens = Math.min(REFILL_BURST, refillTokens + (now - refillRefilled) / 1000.0);
+            refillRefilled = now;
+            if (refillTokens < 1) return false;
+            refillTokens -= 1;
+            return true;
+        }
 
         ActiveSub(String key, String region, String agent, String plugin, String gen, long lastSeen) {
             this.key = key;
@@ -361,13 +376,15 @@ public class RepoEngine {
     /** A producer as a mirror knows it: who it is, whether it is this mirror's pinned producer, when last heard from. */
     static final class KnownProducer {
         final Identity id;
+        final String plugin;
         final boolean pinned;
         // the key its offers are signed with; null only for a producer a test remembers by its address
         final java.security.PublicKey key;
         volatile long lastSeen;
 
-        KnownProducer(Identity id, boolean pinned, java.security.PublicKey key, long lastSeen) {
+        KnownProducer(Identity id, String plugin, boolean pinned, java.security.PublicKey key, long lastSeen) {
             this.id = id;
+            this.plugin = plugin;
             this.pinned = pinned;
             this.key = key;
             this.lastSeen = lastSeen;
@@ -433,6 +450,7 @@ public class RepoEngine {
     private final long lagAlarmMs;
     private final long holderTtlMs;
     private final long resetIntervalMs;
+    private final int refillBatch;
     private final double rewriteFraction;
     private final int rewriteMin;
     private final double rewriteDayFraction;
@@ -526,6 +544,7 @@ public class RepoEngine {
         lagAlarmMs = clamp(longParam("sync_lag_alarm_ms", 24L * 3600 * 1000), 60_000L, Long.MAX_VALUE);
         holderTtlMs = clamp(longParam("sync_holder_ttl_ms", 30L * 24 * 3600 * 1000), 60_000L, Long.MAX_VALUE);
         resetIntervalMs = clamp(longParam("sync_reset_interval_ms", 600_000L), 1_000L, Long.MAX_VALUE);
+        refillBatch = (int) clamp(longParam("sync_refill_check_batch", 10_000L), 1, 1_000_000);
 
         String key = plugin.getConfig().getStringParam("sync_key");
         if (key != null && !key.isEmpty() && key.length() < 16) {
@@ -719,6 +738,154 @@ public class RepoEngine {
         writeGenerationMarker();
         logger.warn("mirror " + getRepoDir() + ": " + why + ": a new generation " + syncGen + " (was " + before
                 + "), so its producer offers it everything again; nothing is deleted");
+    }
+
+    // ---- a mirror's refill: what its pinned producer delivered here, gone from the directory, is asked for again ----
+    private volatile Timer mirrorCheckTimer;
+    // per pinned producer (holder): where the check of its claims goes on from (each run checks a page)
+    private final Map<String, String> refillCursor = new ConcurrentHashMap<>();
+    // per pinned producer (holder): names found missing and not yet asked for (bounded)
+    private final Map<String, Set<String>> refillWanted = new ConcurrentHashMap<>();
+    // holder|name -> when last asked for: a name is asked for again at most once per sync_offer_timeout_ms (bounded)
+    private final Map<String, Long> refillAsked = Collections.synchronizedMap(new LinkedHashMap<String, Long>() {
+        protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            return size() > 100_000;
+        }
+    });
+    final AtomicLong syncRefillAsked = new AtomicLong();
+    final AtomicLong syncRefillOffered = new AtomicLong();
+
+    /**
+     * A mirror's scan: the files its pinned producer(s) delivered here (the catalog's claims) that are no longer in the
+     * directory (a partial loss: files deleted by hand, a failed disk under one subtree, find -type f -delete) are asked
+     * for again from that producer, which offers them again to this mirror alone; they are fetched and verified as any
+     * offer. A missing file is never a delete (a mirror produces nothing). Each run checks a page of the claims
+     * (sync_refill_check_batch), going on from where the last stopped, so its cost is bounded whatever the size.
+     */
+    void checkMirroredFiles() {
+        if (!isMirror()) return;
+        Path repoBase = getRepoDir().toPath().toAbsolutePath().normalize();
+        Path realBase;
+        try {
+            realBase = repoBase.toRealPath();
+        } catch (IOException ex) {
+            return;
+        }
+        for (String holder : pinnedHolders()) {
+            String cursor = refillCursor.getOrDefault(holder, "");
+            List<String[]> page = dbEngine.claimsPage(holder, cursor, refillBatch);
+            refillCursor.put(holder, page.size() < refillBatch ? "" : page.get(page.size() - 1)[0]);
+            int missing = 0;
+            Set<String> wanted = refillWanted.computeIfAbsent(holder, h -> ConcurrentHashMap.newKeySet());
+            for (String[] c : page) {
+                Target t = target(repoBase, realBase, c[1]);
+                if (t.why != null || Files.exists(t.path, LinkOption.NOFOLLOW_LINKS)) continue;
+                missing++;
+                if (wanted.size() < 100_000) wanted.add(c[1]);
+            }
+            if (missing > 0) {
+                logger.warn("mirror " + getRepoDir() + ": " + missing + " file(s) its producer delivered are gone from the"
+                        + " directory: asking the producer to offer them again (nothing is deleted anywhere)");
+            }
+        }
+        requestRefills();
+    }
+
+    /** Ask each pinned producer that is known now for the files found missing (pages of REFILL_PAGE names). */
+    private void requestRefills() {
+        long now = System.currentTimeMillis();
+        for (Map.Entry<String, Set<String>> e : refillWanted.entrySet()) {
+            String holder = e.getKey();
+            Set<String> wanted = e.getValue();
+            if (wanted.isEmpty()) continue;
+            String region = null, agent = null, pluginId = null;
+            for (Map.Entry<String, KnownProducer> k : knownProducers.entrySet()) {
+                KnownProducer kp = k.getValue();
+                if (kp.pinned && kp.holder().equals(holder) && now - kp.lastSeen <= peerTtlMs) {
+                    region = kp.id.region;
+                    agent = kp.id.agent;
+                    pluginId = kp.plugin;
+                }
+            }
+            if (pluginId == null) continue;   // asked once it answers
+            List<String> names = new ArrayList<>();
+            for (String n : new ArrayList<>(wanted)) {
+                wanted.remove(n);
+                Long asked = refillAsked.get(holder + "|" + n);
+                if (asked != null && now - asked < offerTimeoutMs) continue;
+                refillAsked.put(holder + "|" + n, now);
+                names.add(n);
+            }
+            for (int from = 0; from < names.size(); from += REFILL_PAGE) {
+                List<String> chunk = names.subList(from, Math.min(names.size(), from + REFILL_PAGE));
+                MsgEvent ask = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginId);
+                ask.setParam("action", "reporefill");
+                ask.setParam("filerepo_name", fileRepoName);
+                ask.setParam("sync_proto", SYNC_PROTO);
+                ask.setParam("sync_gen", syncGen);
+                ask.setCompressedParam("names", gson.toJson(chunk));
+                plugin.msgOut(ask);
+                syncRefillAsked.addAndGet(chunk.size());
+            }
+            if (!names.isEmpty()) {
+                logger.info("asked producer " + SyncAuth.addr(region, agent, pluginId) + " for " + names.size()
+                        + " file(s) gone from this mirror");
+            }
+        }
+    }
+
+    /**
+     * reporefill (a producer's side): a subscriber of this generation asks for files it lost. The names that are
+     * cataloged here become pending for that subscriber alone, and are offered (signed) in the next cycle. Bounded: at
+     * most REFILL_PAGE names a request, a burst of requests then one a second per subscriber. Never changes what other
+     * subscribers are offered, and never a delete.
+     */
+    MsgEvent onRefill(MsgEvent m) {
+        String[] from = Callers.plugin(m, insecure);
+        String refusal = null;
+        ActiveSub s = from == null ? null : subscribers.get(peerKey(from[0], from[1], from[2]));
+        List<String> names = null;
+        if (from == null) refusal = "no verified plugin caller";
+        else if (!isProducer()) refusal = "not a producer";
+        else if (!String.valueOf(fileRepoName).equals(m.getParam("filerepo_name"))) refusal = "a producer of another filerepo_name";
+        else if (s == null) refusal = "not a subscriber of this producer";
+        else if (!String.valueOf(s.gen).equals(m.getParam("sync_gen"))) refusal = "another generation: subscribe again";
+        else if (!s.takeRefill(System.currentTimeMillis())) refusal = "busy: too many refill requests, ask again later";
+        else {
+            try {
+                names = gson.fromJson(m.getCompressedParam("names"), stringListType);
+            } catch (Exception bad) {
+                names = null;
+            }
+            if (names == null || names.size() > REFILL_PAGE) refusal = "names: a JSON list of at most " + REFILL_PAGE;
+        }
+        if (m.getParams().containsKey("names")) m.removeParam("names");
+        if (refusal != null) {
+            m.setParam("status", "9");
+            m.setParam("status_code", "9");
+            m.setParam("status_desc", "refused: " + refusal);
+            logger.info("reporefill from " + (from == null ? "?" : SyncAuth.addr(from[0], from[1], from[2])) + " refused: " + refusal);
+            return m;
+        }
+        Path root = Paths.get(scanDirString).toAbsolutePath();
+        List<String> paths = new ArrayList<>();
+        for (String name : names) {
+            if (name == null) continue;
+            Path p = root.resolve(name).normalize();
+            if (!p.startsWith(root) || p.equals(root)) continue;
+            String path = p.toString();
+            if (dbEngine.getFileInfo(path) == null || offerable(root, path) != null) continue;
+            paths.add(path);
+        }
+        int n = dbEngine.markPendingFor(s.key, paths);
+        for (String path : paths) inFlight.remove(s.key + "|" + path);
+        s.reachable = true;
+        syncRefillOffered.addAndGet(n);
+        logger.info("subscriber " + s.key + " lost " + names.size() + " file(s): " + n + " offered to it again");
+        m.setParam("status", "10");
+        m.setParam("status_code", "10");
+        m.setParam("refill", String.valueOf(n));
+        return m;
     }
 
     private static boolean hasAnyFile(Path dir) throws IOException {
@@ -1008,7 +1175,23 @@ public class RepoEngine {
                         + " by its key, with adopt=true to hand it what that one delivered"));
             }
             checkGenerationMarker(true);
+            checkMirroredFiles();
             createSubListener(fileRepoName);
+            // the mirror's own scan: its generation marker, and the files its producer delivered that are gone
+            TimerTask mirrorCheck = new TimerTask() {
+                public void run() {
+                    try {
+                        if (plugin.isActive()) {
+                            checkGenerationMarker(false);
+                            checkMirroredFiles();
+                        }
+                    } catch (Exception ex) {
+                        logger.error("filerepo mirror check error", ex);
+                    }
+                }
+            };
+            mirrorCheckTimer = new Timer("filerepo-mirror-check", true);
+            mirrorCheckTimer.scheduleAtFixedRate(mirrorCheck, Math.max(1000L, delay), Math.max(1000L, period));
         }
 
     }
@@ -1118,6 +1301,11 @@ public class RepoEngine {
 
     public void shutdown() {
         stopping = true;
+        Timer mc = mirrorCheckTimer;
+        if (mc != null) {
+            mc.cancel();
+            mirrorCheckTimer = null;
+        }
 
         if(repoBroadcastTimer != null) {
             repoBroadcastTimer.cancel();
@@ -2303,7 +2491,7 @@ public class RepoEngine {
                 return;
             }
         }
-        knownProducers.put(addr, new KnownProducer(id, pinned, key, now));
+        knownProducers.put(addr, new KnownProducer(id, pluginId, pinned, key, now));
         // a pinned producer heard from now: its claims are live (an orphaned claim is not taken back by this; see decide)
         if (pinned) {
             dbEngine.touchHolder(id.holder(), now);
@@ -2441,6 +2629,8 @@ public class RepoEngine {
 
     /** After a pin or a hand-over: producers are asked again, and the new generation makes the producer offer everything. */
     private void renewAfterPin() {
+        refillWanted.clear();
+        refillCursor.clear();
         knownProducers.clear();
         attempts.clear();
         unpinnedSeen.clear();
@@ -2616,6 +2806,8 @@ public class RepoEngine {
             warnUnpinned(id);
         }
         rememberProducer(from[0], from[1], from[2], id, pinned, signed ? pk : null);
+        // what this mirror lost of that producer's files, asked for now that it answered
+        if (pinned) requestRefills();
         if ("dropped-for-lag".equals(m.getParam("notice"))) {
             logger.error("producer " + key + " had dropped this mirror for lagging: it may hold files deleted at the"
                     + " producer since; clear it (clearrepo) to make it exact");

@@ -662,6 +662,38 @@ public class DBEngine {
         markPending(paths, batchSize, "pending", "pendingdel");
     }
 
+    /** Offer these cataloged files to one subscriber again (a mirror that lost them asked): pending for it alone. */
+    public int markPendingFor(String subkey, List<String> paths) {
+        if (paths.isEmpty()) return 0;
+        int n = 0;
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement clear = conn.prepareStatement("DELETE FROM pending WHERE subkey = ? AND pathhash = ?");
+                 PreparedStatement add = conn.prepareStatement("INSERT INTO pending (subkey, pathhash, filepath) VALUES (?,?,?)")) {
+                for (String path : paths) {
+                    String h = pathKey(path);
+                    clear.setString(1, subkey);
+                    clear.setString(2, h);
+                    clear.executeUpdate();
+                    add.setString(1, subkey);
+                    add.setString(2, h);
+                    add.setString(3, path);
+                    n += add.executeUpdate();
+                }
+                conn.commit();
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("markPendingFor failed: " + ex.getMessage());
+                return 0;
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("markPendingFor error", ex);
+        }
+        return n;
+    }
+
     /** Deleted files: a pending delete for every known subscriber, and no longer a pending file. */
     public void markDeleted(List<String> paths, int batchSize) {
         markPending(paths, batchSize, "pendingdel", "pending");
@@ -923,6 +955,27 @@ public class DBEngine {
             }
         } catch (Exception ex) {
             logger.error("holdings error", ex);
+        }
+        return out;
+    }
+
+    /**
+     * A page of {@code producer}'s claims in key order after {@code afterRelhash}: {relhash, relpath, md5}. An index
+     * range (the primary key), never a scan.
+     */
+    public List<String[]> claimsPage(String producer, String afterRelhash, int limit) {
+        List<String[]> out = new ArrayList<>();
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT relhash, relpath, md5 FROM mirrored WHERE producer = ?"
+                     + " AND relhash > ? ORDER BY relhash FETCH FIRST ? ROWS ONLY")) {
+            ps.setString(1, producer);
+            ps.setString(2, afterRelhash);
+            ps.setInt(3, Math.max(1, limit));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(new String[]{rs.getString(1), rs.getString(2), rs.getString(3)});
+            }
+        } catch (Exception ex) {
+            logger.error("claimsPage error", ex);
         }
         return out;
     }

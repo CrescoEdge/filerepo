@@ -232,4 +232,33 @@ class ReviewRound4Test {
                 + " by a .locked file) over " + windows + " windows with no hold");
     }
 
+    // =================================================================== the mirror's generation marker
+
+    /**
+     * MED. The marker catches a missing marker or an entirely empty top level. A mirror that lost its files but kept its
+     * directories (find -type f -delete, a failed disk under one subtree) still lists entries at the top level and keeps
+     * its marker: its producer has everything settled for it, and nothing is ever offered again.
+     */
+    @Test
+    void aMirrorThatLostItsFilesButNotItsDirectoriesIsRefilled() throws Exception {
+        TestRig p = producer("plugin-p", scan);
+        TestRig s = subscriber("plugin-s", mirror);
+        subscribe(p, s);
+        for (int i = 0; i < 4; i++) write(scan.resolve("set" + i + "/model.bin"), "model " + i);
+        cycle(p, s);
+        assertTrue(Files.exists(mirror.resolve("set2/model.bin")));
+
+        s.close();
+        rigs.remove(s);
+        for (int i = 0; i < 4; i++) Files.delete(mirror.resolve("set" + i + "/model.bin"));
+        TestRig again = subscriber("plugin-s", mirror);
+        subscribe(p, again);
+        for (int i = 0; i < 3; i++) {
+            assertTrue(p.repo.scanOnce());
+            Thread.sleep(300);
+        }
+        assertTrue(within(3000, () -> Files.exists(mirror.resolve("set2/model.bin"))),
+                "the mirror lost every file (its directories remain) and is never refilled; pending at the producer "
+                        + p.db.pendingCount(subKey(again)));
+    }
 }

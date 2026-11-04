@@ -549,4 +549,79 @@ class SyncRound4Test {
         assertTrue(p.repo.scanOnce());
         assertEquals(3, p.repo.getDeletesHeld());
     }
+
+    // =================================================================== a mirror's partial loss
+
+    @Test
+    void aMirrorThatLostFilesWhileRunningAsksForThemAndGetsThemBack() throws Exception {
+        TestRig p = producer("plugin-p", scan);
+        TestRig s = subscriber("plugin-s", mirror);
+        subscribe(p, s);
+        for (int i = 0; i < 5; i++) write(scan.resolve("d" + i + "/f.bin"), "file " + i);
+        cycle(p, s);
+        Files.delete(mirror.resolve("d1/f.bin"));
+        Files.delete(mirror.resolve("d3/f.bin"));
+        long tombstones = p.repo.getTombstoneCount();
+        s.repo.checkMirroredFiles();
+        assertEquals(2, s.repo.syncRefillAsked.get());
+        assertEquals(2, p.repo.syncRefillOffered.get());
+        assertTrue(p.repo.scanOnce());
+        await(() -> "file 1".equals(read(mirror.resolve("d1/f.bin"))) && "file 3".equals(read(mirror.resolve("d3/f.bin"))),
+                "the lost files are back");
+        assertEquals(tombstones, p.repo.getTombstoneCount(), "a missing file at a mirror is never a delete");
+        assertEquals("file 0", read(scan.resolve("d0/f.bin")));
+        // asked once per sync_offer_timeout_ms: a name already asked for is not asked again at once
+        Files.delete(mirror.resolve("d1/f.bin"));
+        s.repo.checkMirroredFiles();
+        assertEquals(2, s.repo.syncRefillAsked.get());
+    }
+
+    @Test
+    void aMirrorsOwnScanFindsWhatItLostAndRefillsIt() throws Exception {
+        TestRig p = producer("plugin-p", scan);
+        TestRig s = subscriber("plugin-s", mirror, "scan_delay", "200", "scan_period", "300");
+        subscribe(p, s);
+        for (int i = 0; i < 3; i++) write(scan.resolve("set" + i + "/model.bin"), "model " + i);
+        cycle(p, s);
+        for (int i = 0; i < 3; i++) Files.delete(mirror.resolve("set" + i + "/model.bin"));
+        await(() -> s.repo.syncRefillAsked.get() == 3, "the mirror's scan asked for what it lost");
+        assertTrue(p.repo.scanOnce());
+        await(() -> Files.exists(mirror.resolve("set2/model.bin")), "refilled");
+    }
+
+    @Test
+    void aRefillIsTakenOnlyFromASubscriberOfThisGenerationAndOnlyForCatalogedFiles() throws Exception {
+        TestRig p = producer("plugin-p", scan);
+        TestRig s = subscriber("plugin-s", mirror);
+        subscribe(p, s);
+        write(scan.resolve("a.bin"), "a");
+        cycle(p, s);
+        // a plugin that is not a subscriber
+        MsgEvent stranger = p.requestTo("reporefill", "filerepo_name", "fr", "sync_gen", s.repo.getSyncGen(), "sync_proto",
+                RepoEngine.SYNC_PROTO);
+        stranger.setCompressedParam("names", gson.toJson(List.of("a.bin")));
+        Fabric.stamp(stranger, "plugin-x");
+        assertEquals("9", p.call(stranger).getParam("status"));
+        // the subscriber, for another generation
+        MsgEvent old = p.requestTo("reporefill", "filerepo_name", "fr", "sync_gen", "abcdef", "sync_proto", RepoEngine.SYNC_PROTO);
+        old.setCompressedParam("names", gson.toJson(List.of("a.bin")));
+        Fabric.stamp(old, "plugin-s");
+        assertEquals("9", p.call(old).getParam("status"));
+        // the subscriber: names outside the scan dir or not cataloged are ignored
+        MsgEvent ask = p.requestTo("reporefill", "filerepo_name", "fr", "sync_gen", s.repo.getSyncGen(), "sync_proto",
+                RepoEngine.SYNC_PROTO);
+        ask.setCompressedParam("names", gson.toJson(List.of("a.bin", "../mirror/x", "/etc/passwd", "nothing.bin")));
+        Fabric.stamp(ask, "plugin-s");
+        MsgEvent r = p.call(ask);
+        assertEquals("10", r.getParam("status"), r.getParams().toString());
+        assertEquals("1", r.getParam("refill"));
+        // and a request of more than a page is refused
+        List<String> many = new ArrayList<>();
+        for (int i = 0; i <= RepoEngine.REFILL_PAGE; i++) many.add("n" + i);
+        MsgEvent big = p.requestTo("reporefill", "filerepo_name", "fr", "sync_gen", s.repo.getSyncGen(), "sync_proto",
+                RepoEngine.SYNC_PROTO);
+        big.setCompressedParam("names", gson.toJson(many));
+        Fabric.stamp(big, "plugin-s");
+        assertEquals("9", p.call(big).getParam("status"));
+    }
 }
