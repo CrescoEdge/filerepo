@@ -1484,13 +1484,15 @@ public class RepoEngine {
             }
             //delete any files not recorded in repo dir (close the walk stream); links are removed, never followed
             long remaining = 0;
-            try (java.util.stream.Stream<Path> walk = Files.walk(dir.toPath())) {
-                for (Path p : (Iterable<Path>) walk::iterator) {
-                    if (Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(p)) {
-                        try {
-                            Files.delete(p);
-                        } catch (IOException ex) {
-                            remaining++;
+            if (dir.isDirectory()) {
+                try (java.util.stream.Stream<Path> walk = Files.walk(dir.toPath())) {
+                    for (Path p : (Iterable<Path>) walk::iterator) {
+                        if (Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(p)) {
+                            try {
+                                Files.delete(p);
+                            } catch (IOException ex) {
+                                remaining++;
+                            }
                         }
                     }
                 }

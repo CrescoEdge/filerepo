@@ -356,6 +356,17 @@ class RepositoryHardeningTest {
         assertEquals(0, rig.repo.getRepoCount());
     }
 
+    @Test
+    void aClearOfADirectoryThatDoesNotExistYetIsAnEmptyClear() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put("filerepo_name", "fr");
+        cfg.put("repo_dir", tmp.resolve("not-yet").toString());
+        rig = new TestRig(tmp.resolve("agent"), cfg, null);
+        MsgEvent r = clear("confirm", tmp.resolve("not-yet").toString());
+        assertEquals("10", r.getParam("status"), r.getParams().toString());
+        assertFalse(r.getParam("status_desc").contains(tmp.toString()), "no path in the reply");
+    }
+
     // ------------------------------------------------------------------ batched catalog writes (FR-D8)
 
     @Test
