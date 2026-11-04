@@ -63,7 +63,7 @@ import io.cresco.library.capability.*;
         params = {@CrescoParam(name = "action_pluginname", required = true, description = "plugin name"),
                   @CrescoParam(name = "action_pluginmd5", required = true, description = "plugin content hash (the inventory's md5 field)")},
         returns = @CrescoReturn(name = "jardata", type = "bytes", description = "the jar bytes")),
-    @CrescoAction(name = "putjar", type = "EXEC",
+    @CrescoAction(name = "putjar", type = "EXEC", roles = {"infra", "admin"},
         summary = "Store a plugin jar (inline bytes) in this repo. Accepted only if it is signed by a signer that chains to " +
                   "plugin_signing_truststore; the repo computes its SHA-384 itself.",
         why = "Publish a plugin bundle.",
@@ -75,7 +75,7 @@ import io.cresco.library.capability.*;
         returns = {@CrescoReturn(name = "uploaded", description = "plugin name on success"),
                    @CrescoReturn(name = "md5-confirm", description = "the content hash the repo computed"),
                    @CrescoReturn(name = "sha384", description = "the SHA-384 the repo computed")}),
-    @CrescoAction(name = "putfiles", type = "EXEC",
+    @CrescoAction(name = "putfiles", type = "EXEC", roles = {"infra", "admin"},
         summary = "Land pushed files (MsgEvent attachments) into a repo, each verified against its expected content hash.",
         why = "Receiving side of a file push.",
         params = {@CrescoParam(name = "repo_name", required = true),
@@ -87,7 +87,7 @@ import io.cresco.library.capability.*;
                    @CrescoReturn(name = "unchanged", type = "object", compressed = true),
                    @CrescoReturn(name = "skipped", type = "object", compressed = true),
                    @CrescoReturn(name = "failed", type = "object", compressed = true)}),
-    @CrescoAction(name = "putfilesremote", type = "EXEC",
+    @CrescoAction(name = "putfilesremote", type = "EXEC", roles = {"infra", "admin"},
         summary = "Push a set of files from this agent to another agent's repo.", why = "Distribute files across the mesh.",
         params = {@CrescoParam(name = "file_list", required = true, compressed = true, type = "object", description = "JSON list of paths"),
                   @CrescoParam(name = "dst_region", required = true), @CrescoParam(name = "dst_agent", required = true),
@@ -112,13 +112,13 @@ import io.cresco.library.capability.*;
     @CrescoAction(name = "getscandir", type = "EXEC",
         summary = "Return this repo's configured scan directory.", why = "Discover where the repo watches.",
         returns = @CrescoReturn(name = "scan_dir", description = "the scan directory")),
-    @CrescoAction(name = "removefile", type = "EXEC",
+    @CrescoAction(name = "removefile", type = "EXEC", roles = {"infra", "admin"},
         summary = "Remove a file from this repo (file + catalog row); a producer offers the delete to its subscribers.",
         why = "Delete an artifact.",
         params = {@CrescoParam(name = "repo_name", description = "when given, must name this repository"),
                   @CrescoParam(name = "file_name", required = true)},
         returns = @CrescoReturn(name = "status", description = "10 removed")),
-    @CrescoAction(name = "clearrepo", type = "EXEC",
+    @CrescoAction(name = "clearrepo", type = "EXEC", roles = {"infra", "admin"},
         summary = "Delete every file in this repository's directory. Must be confirmed with that directory's exact name. " +
                   "An only copy (repostate ONLY_COPY) is refused unless force=true, which needs the admin role; " +
                   "a protected directory or one holding a live-tier root is never cleared.",
@@ -127,7 +127,7 @@ import io.cresco.library.capability.*;
                   @CrescoParam(name = "repo_name", description = "when given, must name this repository"),
                   @CrescoParam(name = "force", type = "boolean", description = "clear an only copy anyway (admin only)")},
         returns = @CrescoReturn(name = "status", description = "10 cleared; 9 refused (see refusal) or not cleared")),
-    @CrescoAction(name = "releasedeletes", type = "EXEC",
+    @CrescoAction(name = "releasedeletes", type = "EXEC", roles = {"infra", "admin"},
         summary = "Release the deletes the mass-delete guard is holding, so the next scan offers them to subscribers.",
         why = "Confirm that many files really were deleted from a producer's scan dir.",
         params = @CrescoParam(name = "confirm", required = true, description = "this repository's directory, exactly"),
@@ -154,14 +154,14 @@ import io.cresco.library.capability.*;
         returns = {@CrescoReturn(name = "job_id", description = "the realise job"),
                    @CrescoReturn(name = "reply_status", description = "the realise reply's own status"),
                    @CrescoReturn(name = "status", description = "10 realise accepted; 8 bad params; 9 refused (see refusal); 11 the live-tier provider did not answer")}),
-    @CrescoAction(name = "repolistin", type = "EXEC",
+    @CrescoAction(name = "repolistin", type = "EXEC", roles = {"plugin"},
         summary = "Receive a producer's file-diff (and deletes) and pull changed files over the dataplane (sync consumer side).",
         why = "Directory-sync receiving half. Accepted only from a producer this repo subscribed to.",
         params = {@CrescoParam(name = "repolistin", required = true, compressed = true, type = "object", description = "JSON diff"),
                   @CrescoParam(name = "repodeletes", compressed = true, type = "object", description = "JSON list of deletes"),
                   @CrescoParam(name = "transfer_id", required = true)},
         returns = @CrescoReturn(name = "status_code", description = "10 accepted; 9 refused; 11 busy, offer again")),
-    @CrescoAction(name = "repoconfirm", type = "EXEC",
+    @CrescoAction(name = "repoconfirm", type = "EXEC", roles = {"plugin"},
         summary = "Acknowledge a subscriber received a transfer generation.", why = "Sync handshake.",
         params = @CrescoParam(name = "transfer_id", required = true)),
     @CrescoAction(name = "getmetrics", type = "EXEC",
@@ -260,13 +260,13 @@ public class ExecutorImpl implements Executor {
     }
 
     /**
-     * The production jar check: the library's plugin-signing policy (A's JarSignatures, through the PluginBuilder).
-     * Until that is in the library this build runs against, every jar is refused: fail closed.
+     * The production jar check: the agent's plugin-signing policy (JarSignatures against plugin_signing_truststore,
+     * through the PluginBuilder). Refuses an unsigned, partially signed, tampered or foreign-signed jar, and every jar
+     * when no trust store is configured; only plugin_signing_required=false (development) lets one through, with a
+     * WARNING. Returns the SHA-384 the library computed.
      */
     private JarVerifier defaultJarVerifier() {
-        return jar -> {
-            throw new SecurityException("jar signature verification is not available in this build; no jar is accepted");
-        };
+        return jar -> plugin.verifyJarSignature(jar);
     }
 
     /** The jar inventory (tests). */
@@ -1060,8 +1060,14 @@ public class ExecutorImpl implements Executor {
 
 
     private void confirmTransfer(MsgEvent incoming) {
+        // the subscriber is who the verified caller says, not what the message's source fields claim
+        String[] from = Callers.plugin(incoming);
+        if (from == null) {
+            logger.warn("repoconfirm ignored: the caller " + Callers.key(incoming) + " is not a plugin");
+            return;
+        }
         repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getCompressedParam("failedfiles"),
-                incoming.getCompressedParam("faileddeletes"), incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
+                incoming.getCompressedParam("faileddeletes"), from[0], from[1], from[2]);
     }
 
     private MsgEvent putFileRemote(MsgEvent incoming) {
@@ -1557,10 +1563,16 @@ public class ExecutorImpl implements Executor {
             String deletesIn = incoming.getCompressedParam("repodeletes");
             String transferId = incoming.getParam("transfer_id");
 
-            if((repoListStringIn != null) && (transferId != null)) {
+            // the producer is who the verified caller says, not what the message's source fields claim: the files are
+            // fetched from it
+            String[] from = Callers.plugin(incoming);
+            if (from == null) {
+                incoming.setParam("status_code","9");
+                incoming.setParam("status_desc","refused: a diff comes from a filerepo plugin, not " + Callers.key(incoming));
+            } else if((repoListStringIn != null) && (transferId != null)) {
 
                 RepoEngine.Accepted accepted = repoEngine.acceptDiff(repoListStringIn, deletesIn, transferId,
-                        incoming.getSrcRegion(), incoming.getSrcAgent(), incoming.getSrcPlugin());
+                        from[0], from[1], from[2]);
                 incoming.setParam("status_code", accepted.code);
                 incoming.setParam("status_desc", accepted.desc);
 

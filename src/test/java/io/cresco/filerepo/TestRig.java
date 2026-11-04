@@ -43,6 +43,9 @@ final class TestRig implements AutoCloseable {
     final List<String> downloads = Collections.synchronizedList(new ArrayList<>());
     /** Every warn and error line logged. */
     final List<String> log = Collections.synchronizedList(new ArrayList<>());
+    /** The agent's plugin-signing policy: the test CA's trust store unless a test says otherwise. */
+    volatile boolean signingTrustConfigured = true;
+    volatile boolean signingRequired = true;
 
     /** filerepo with {@code config} (pluginID added), its catalog under {@code agentDir}, and {@code live} (may be null). */
     TestRig(Path agentDir, Map<String, Object> config, LiveTierClient live) throws Exception {
@@ -61,8 +64,6 @@ final class TestRig implements AutoCloseable {
         this.db = new DBEngine(plugin);
         this.repo = new RepoEngine(plugin, db, live);
         this.exec = new ExecutorImpl(plugin, repo, live);
-        // jars are checked by the library's signing policy in production; tests choose their own verifier
-        this.exec.setJarVerifier(jar -> JarSigning.verifyForTests(jar));
         plugin.setIsActive(true);
         if (fabric != null) fabric.register(this);
     }
@@ -170,6 +171,9 @@ final class TestRig implements AutoCloseable {
                         case "getCLogger": return log;
                         case "getAgentDataDirectory": return agentDir.toString();
                         case "getDataPlaneService": return dp;
+                        case "getPluginSigningTrust": return signingTrustConfigured ? JarSigning.trustStore() : null;
+                        case "isPluginSigningRequired": return signingRequired;
+                        case "getTenant": return Fabric.TENANT;
                         case "msgOut":
                             sent.add((MsgEvent) a[1]);
                             if (fabric != null) fabric.route(this, (MsgEvent) a[1]);

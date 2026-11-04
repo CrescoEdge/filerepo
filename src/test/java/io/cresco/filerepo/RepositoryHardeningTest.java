@@ -106,20 +106,23 @@ class RepositoryHardeningTest {
     }
 
     @Test
-    void withoutTheLibrarysSigningCheckEveryJarIsRefused() throws Exception {
+    void withNoTrustStoreConfiguredEveryJarIsRefused() throws Exception {
         onDemand();
-        TestRig plain = rig;
-        ExecutorImpl production = new ExecutorImpl(plain.plugin, plain.repo, null);
-        try {
-            MsgEvent m = TestRig.request("putjar", "pluginname", "io.cresco.example", "jarfile", "x.jar");
-            m.setDataParam("jardata", JarSigning.signedJar("io.cresco.example", "v1"));
-            MsgEvent r = production.executeEXEC(m);
-            assertEquals("9", r.getParam("status"));
-            assertEquals("signature", r.getParam("refusal"), "fail closed until the signing policy is wired");
-            assertFalse(Files.exists(repo.resolve("x.jar")));
-        } finally {
-            production.cleanup();
-        }
+        rig.signingTrustConfigured = false;
+        MsgEvent r = putjar("io.cresco.example", "x.jar", JarSigning.signedJar("io.cresco.example", "v1"));
+        assertEquals("9", r.getParam("status"));
+        assertEquals("signature", r.getParam("refusal"), "fail closed without plugin_signing_truststore");
+        assertFalse(Files.exists(repo.resolve("x.jar")));
+    }
+
+    @Test
+    void onlyAnExplicitDevelopmentSettingLetsAnUnsignedJarThrough() throws Exception {
+        onDemand();
+        rig.signingRequired = false;
+        byte[] unsigned = JarSigning.unsignedJar("io.cresco.example", "dev build");
+        MsgEvent r = putjar("io.cresco.example", "dev.jar", unsigned);
+        assertEquals("10", r.getParam("status"), r.getParams().toString());
+        assertEquals(sha384(unsigned), r.getParam("sha384"), "the repo still computes its hash");
     }
 
     /** A signed jar with one entry's content changed after signing. */

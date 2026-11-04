@@ -170,43 +170,4 @@ final class JarSigning {
         return bos.toByteArray();
     }
 
-    /**
-     * A test stand-in for the library's JarSignatures.verify: every non-signature entry must carry a signer whose leaf
-     * the test CA issued. Returns the SHA-384; throws to refuse.
-     */
-    static String verifyForTests(Path jar) throws Exception {
-        init();
-        int signed = 0;
-        try (JarFile jf = new JarFile(jar.toFile(), true)) {
-            if (jf.getManifest() == null) throw new SecurityException("no manifest: not signed");
-            byte[] buf = new byte[8192];
-            Enumeration<JarEntry> en = jf.entries();
-            while (en.hasMoreElements()) {
-                JarEntry e = en.nextElement();
-                try (InputStream is = jf.getInputStream(e)) {
-                    while (is.read(buf) != -1) { }
-                }
-                String n = e.getName().toUpperCase();
-                if (e.isDirectory() || (n.startsWith("META-INF/") && !n.substring(9).contains("/"))) continue;
-                CodeSigner[] signers = e.getCodeSigners();
-                if (signers == null || signers.length == 0) throw new SecurityException("entry " + e.getName() + " is not signed");
-                boolean trusted = false;
-                for (CodeSigner s : signers) {
-                    X509Certificate leaf = (X509Certificate) s.getSignerCertPath().getCertificates().get(0);
-                    try {
-                        leaf.verify(ca.getPublicKey());
-                        leaf.checkValidity();
-                        trusted = true;
-                    } catch (Exception notOurs) {
-                        // try the next signer
-                    }
-                }
-                if (!trusted) throw new SecurityException("entry " + e.getName() + " is not signed by a trusted signer");
-                signed++;
-            }
-        }
-        if (signed == 0) throw new SecurityException("no signed content");
-        MessageDigest md = MessageDigest.getInstance("SHA-384");
-        return Hashes.hex(md.digest(Files.readAllBytes(jar)));
-    }
 }

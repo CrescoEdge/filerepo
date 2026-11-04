@@ -141,6 +141,18 @@ public class Plugin implements PluginService {
                             repoEngine.start();
                 }
 
+                // putjar's jar check is the agent's plugin-signing policy: say at boot what it will do
+                try {
+                    if (!pluginBuilder.getAgentService().isPluginSigningRequired()) {
+                        logger.warn("plugin_signing_required=false: putjar accepts jars that are unsigned or signed by an"
+                                + " untrusted signer. Development only.");
+                    } else if (pluginBuilder.getAgentService().getPluginSigningTrust() == null) {
+                        logger.warn("no plugin_signing_truststore is configured: every putjar is refused");
+                    }
+                } catch (Exception ex) {
+                    logger.warn("the plugin-signing policy could not be read: every putjar is refused (" + ex.getMessage() + ")");
+                }
+
                 // Register the central Felix HealthCheck (best-effort; must never break startup).
                 registerHealthCheck();
             }
