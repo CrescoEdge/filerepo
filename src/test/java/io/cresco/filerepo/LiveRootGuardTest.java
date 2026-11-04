@@ -219,7 +219,7 @@ class LiveRootGuardTest {
         Map<String, FileObject> diff = new LinkedHashMap<>();
         diff.put("/remote/new.txt", new FileObject("into/tenant-a/new.txt", "abc", "/remote/new.txt", 1L, 3L));
         diff.put("/remote/plain.txt", new FileObject("plain.txt", "def", "/remote/plain.txt", 1L, 3L));
-        MsgEvent in = TestRig.request("repolistin", "transfer_id", "5");
+        MsgEvent in = TestRig.request("repolistin", "transfer_id", "5", "sync_gen", rig.repo.getSyncGen());
         in.setCompressedParam("repolistin", gson.toJson(diff));
         Fabric.stamp(in, "caller");      // the producer, as infrastructure names it (1.3 hardening: never the source fields)
         assertEquals("10", rig.call(in).getParam("status_code"));

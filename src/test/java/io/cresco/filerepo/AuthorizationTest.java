@@ -51,6 +51,7 @@ class AuthorizationTest {
         // added by filerepo: pushing local files anywhere, and releasing held deletes
         assertEquals(privileged, roles.get("putfilesremote"));
         assertEquals(privileged, roles.get("releasedeletes"));
+        assertEquals(privileged, roles.get("releaserewrites"));
         // a lease extension as the node itself
         assertEquals(privileged, roles.get("liverealise"));
         // sync messages come from another filerepo
@@ -62,7 +63,7 @@ class AuthorizationTest {
                 "streamfilecancel", "getscandir", "repostate", "liverelay", "getmetrics", "getcapabilities"}) {
             assertEquals(Set.of(), roles.get(open), open);
         }
-        assertEquals(22, roles.size(), "every action is declared: " + roles.keySet());
+        assertEquals(23, roles.size(), "every action is declared: " + roles.keySet());
     }
 
     @Test
@@ -97,6 +98,7 @@ class AuthorizationTest {
         real.setParam("action", "repolistin");
         real.setParam("transfer_id", "3");
         real.setCompressedParam("repolistin", "{}");
+        real.setParam("sync_gen", rig.repo.getSyncGen());
         real.setParam(Callers.PARAM_CALLER, "plugin:tenant-a/" + TestRig.REGION + "/" + TestRig.AGENT + "/real-producer");
         real.setParam("cresco_caller_tenant", "tenant-a");
         real.setParam(Callers.PARAM_ROLES, "plugin");

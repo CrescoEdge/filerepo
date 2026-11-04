@@ -67,6 +67,22 @@ final class Hashes {
         }
     }
 
+    /** The content hash of everything an open channel reads (absolute reads: its position is not moved). */
+    static String content(java.nio.channels.FileChannel ch) throws IOException {
+        MessageDigest c = content();
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(1 << 16);
+        long pos = 0;
+        while (true) {
+            buf.clear();
+            int n = ch.read(buf, pos);
+            if (n < 0) break;
+            buf.flip();
+            c.update(buf);
+            pos += n;
+        }
+        return hex(c.digest());
+    }
+
     /** SHA-384 of a file, lowercase hex. */
     static String sha384(Path file) throws IOException {
         MessageDigest s = sha384();

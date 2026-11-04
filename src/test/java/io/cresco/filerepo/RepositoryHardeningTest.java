@@ -163,11 +163,12 @@ class RepositoryHardeningTest {
     // ------------------------------------------------------------------ the repository directory (FR-D9)
 
     @Test
-    void withNoDirectoryConfiguredTheRepositoryIsAbsoluteUnderThePluginsDataDirectory() throws Exception {
+    void withNoDirectoryConfiguredTheRepositoryIsAbsoluteUnderTheAgentsDataDirectory() throws Exception {
         rig = new TestRig(tmp.resolve("agent"), new HashMap<>(), null);
         File dir = rig.repo.getRepoDir();
         assertTrue(dir.isAbsolute());
-        assertEquals(tmp.resolve("agent/plugin-data/" + TestRig.PLUGIN_ID + "/repo").toFile(), dir);
+        // never under the plugin's data directory, which the controller deletes with the plugin
+        assertEquals(tmp.resolve("agent/filerepo/repos/default").toAbsolutePath().normalize().toFile(), dir);
         assertTrue(dir.isDirectory());
         assertEquals("10", putjar("io.cresco.example", "e.jar", JarSigning.signedJar("io.cresco.example", "v")).getParam("status"));
         assertTrue(new File(dir, "e.jar").isFile());

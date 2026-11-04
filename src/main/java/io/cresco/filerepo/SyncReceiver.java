@@ -9,6 +9,7 @@ import io.cresco.library.utilities.CLogger;
 import jakarta.jms.BytesMessage;
 import jakarta.jms.Message;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -120,12 +121,27 @@ final class SyncReceiver implements AutoCloseable {
         }
     }
 
+    /** Puts a verified staging file in place; false when it may not be any more (nothing is changed then). */
+    interface Committer {
+        boolean commit(Path part, Path destination) throws IOException;
+    }
+
+    /** A plain atomic move into place. */
+    static final Committer MOVE = (part, destination) -> {
+        Files.move(part, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        return true;
+    };
+
+    Result fetch(String remotePath, long size, String expectedHash, Path destination) {
+        return fetch(remotePath, size, expectedHash, destination, MOVE);
+    }
+
     /**
      * Pull {@code remotePath} ({@code size} bytes, content hash {@code expectedHash}) from the producer into
-     * {@code destination}. On success the verified file is in place; on failure nothing under {@code destination} has
-     * changed.
+     * {@code destination}, committed (once verified) by {@code committer}. On success the verified file is in place;
+     * on failure, or when the committer declines, nothing under {@code destination} has changed.
      */
-    Result fetch(String remotePath, long size, String expectedHash, Path destination) {
+    Result fetch(String remotePath, long size, String expectedHash, Path destination, Committer committer) {
         Path part = RepoEngine.stagingFor(destination);
         boolean committed = false;
         try {
@@ -133,7 +149,7 @@ final class SyncReceiver implements AutoCloseable {
                 Files.write(part, new byte[0], StandardOpenOption.CREATE_NEW);
                 String[] h = Hashes.both(part);
                 if (!expectedHash.equals(h[0])) return Result.unverified("an empty file does not have the offered content hash");
-                Files.move(part, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                if (!committer.commit(part, destination)) return Result.failed("not committed: superseded here meanwhile");
                 committed = true;
                 return Result.ok();
             }
@@ -205,7 +221,7 @@ final class SyncReceiver implements AutoCloseable {
             if (!h[0].equals(expectedHash)) {
                 return Result.unverified("the file differs from the content the producer offered (changed since the offer)");
             }
-            Files.move(part, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            if (!committer.commit(part, destination)) return Result.failed("not committed: superseded here meanwhile");
             committed = true;
             return Result.ok();
         } catch (InterruptedException ie) {

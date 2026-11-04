@@ -132,11 +132,19 @@ import io.cresco.library.capability.*;
                   @CrescoParam(name = "force", type = "boolean", description = "clear an only copy anyway (admin only)")},
         returns = @CrescoReturn(name = "status", description = "10 cleared; 9 refused (see refusal) or not cleared")),
     @CrescoAction(name = "releasedeletes", type = "EXEC", roles = {"infra", "admin"},
-        summary = "Release the deletes the mass-delete guard is holding, so the next scan offers them to subscribers.",
+        summary = "Release the deletes the mass-delete guard is holding, so the next scan offers them to subscribers. " +
+                  "Must name the held set (repostate deletes_hold_id): a release that names none, or another, is refused.",
         why = "Confirm that many files really were deleted from a producer's scan dir.",
         params = {@CrescoParam(name = "confirm", required = true, description = "this repository's directory, exactly"),
-                  @CrescoParam(name = "hold_id", description = "the held set to release (repostate deletes_hold_id); refused if it changed")},
+                  @CrescoParam(name = "hold_id", required = true, description = "the held set to release (repostate deletes_hold_id); refused if it changed")},
         returns = @CrescoReturn(name = "released", description = "how many held deletes the next scan records, if it finds exactly that set")),
+    @CrescoAction(name = "releaserewrites", type = "EXEC", roles = {"infra", "admin"},
+        summary = "Release the rewrites the rewrite guard is holding, so they are offered to subscribers. " +
+                  "Must name the held set (repostate rewrites_hold_id): a release that names none, or another, is refused.",
+        why = "Confirm that a producer really rewrote that many files at once.",
+        params = {@CrescoParam(name = "confirm", required = true, description = "this repository's directory, exactly"),
+                  @CrescoParam(name = "hold_id", required = true, description = "the held set to release (repostate rewrites_hold_id)")},
+        returns = @CrescoReturn(name = "released", description = "how many held rewrites are now offered")),
     @CrescoAction(name = "repostate", type = "EXEC",
         summary = "Report what this repo is: LIVE, WORKSPACE_CLEAN, WORKSPACE_DIRTY, MIRROR or ONLY_COPY.",
         why = "Know what would be lost with a repo before clearing, releasing or relying on it.",
@@ -262,12 +270,14 @@ public class ExecutorImpl implements Executor {
         int maxThreads = (int) Math.max(2L, plugin.getConfig().getLongParam("transfer_threads", 16L));
         int queueMax = (int) Math.max(1L, Math.min(100_000L, plugin.getConfig().getLongParam("transfer_queue_max", 64L)));
         int maxPerCaller = (int) Math.max(1L, plugin.getConfig().getLongParam("transfer_max_per_caller", 16L));
-        double fraction = 0.5;
+        double fraction = 0.5, syncFraction = 0.25;
         try {
             Double d = plugin.getConfig().getDoubleParam("transfer_caller_fraction");
             if (d != null && d > 0 && d < 1) fraction = d;
+            Double r = plugin.getConfig().getDoubleParam("transfer_sync_reserve");
+            if (r != null && r > 0 && r < 1) syncFraction = r;
         } catch (Exception ignore) { }
-        this.transfers = new TransferScheduler(maxThreads, fraction, maxPerCaller, queueMax);
+        this.transfers = new TransferScheduler(maxThreads, fraction, syncFraction, maxPerCaller, queueMax);
         this.liveLeaseMaxMs = Math.max(1L, plugin.getConfig().getLongParam("live_lease_max_ms", 86_400_000L));
         // Inline getfile returns the whole file in ONE control-plane RPC message, which the wss
         // frame caps at ~1MB (base64-inflated). Default the cap BELOW that so getfile can never
@@ -342,6 +352,10 @@ public class ExecutorImpl implements Executor {
                 metricEngine.setGauge("filerepo.sync.deletes.held", "deletes held by the mass-delete guard", "filerepo", CMetric.MeasureClass.GAUGE_INT);
                 metricEngine.setGauge("filerepo.sync.conflicts", "offers a mirror refused to protect its own content (landed, another producer's, case collision)", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
                 metricEngine.setGauge("filerepo.sync.subscribers", "subscribers this producer serves", "filerepo", CMetric.MeasureClass.GAUGE_INT);
+                metricEngine.setGauge("filerepo.sync.subscribers.lagging", "subscribers owing confirms for longer than sync_lag_alarm_ms", "filerepo", CMetric.MeasureClass.GAUGE_INT);
+                metricEngine.setGauge("filerepo.sync.subscribers.dropped", "subscribers dropped after sync_subscriber_ttl_ms of silence", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.sync.unverified", "discovers, subscribes and answers refused for want of the sync_key's proof", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
+                metricEngine.setGauge("filerepo.rewrites.held", "rewrites the rewrite guard holds back from subscribers", "filerepo", CMetric.MeasureClass.GAUGE_LONG);
             }
             long fileCount = 0L;
             long tombstones = 0L;
@@ -363,6 +377,10 @@ public class ExecutorImpl implements Executor {
             metricEngine.updateIntGauge("filerepo.sync.deletes.held", repoEngine.getDeletesHeld());
             metricEngine.updateLongGauge("filerepo.sync.conflicts", repoEngine.syncConflicts.get());
             metricEngine.updateIntGauge("filerepo.sync.subscribers", repoEngine.getSubscriberCount());
+            metricEngine.updateIntGauge("filerepo.sync.subscribers.lagging", repoEngine.getLaggingSubscribers());
+            metricEngine.updateLongGauge("filerepo.sync.subscribers.dropped", repoEngine.subscribersDropped.get());
+            metricEngine.updateLongGauge("filerepo.sync.unverified", repoEngine.syncUnverified.get());
+            metricEngine.updateLongGauge("filerepo.rewrites.held", repoEngine.getRewritesHeld());
             return gson.toJson(metricEngine.getAllMetrics());
         } catch (Exception ex) {
             logger.error("getMetricsJson() " + ex.getMessage(), ex);
@@ -416,6 +434,8 @@ public class ExecutorImpl implements Executor {
                     return clearRepo(incoming);
                 case "releasedeletes":
                     return releaseDeletes(incoming);
+                case "releaserewrites":
+                    return releaseRewrites(incoming);
                 case "getjar":
                     return getPluginJar(incoming);
                 case "getfile":
@@ -746,7 +766,8 @@ public class ExecutorImpl implements Executor {
         Path p = Paths.get(filePath);
         String lexical = repoEngine.liveRootConflict(p);
         if (lexical != null) throw new NotServed("9", "the file " + lexical, "live-root");
-        if (repoEngine.getFileInfo(filePath) == null) {
+        Map<String, String> cataloged = repoEngine.getFileInfo(filePath);
+        if (cataloged == null) {
             throw new NotServed("9", "file not in catalog", null);
         }
         Path base;
@@ -767,7 +788,28 @@ public class ExecutorImpl implements Executor {
         } catch (IOException ex) {
             throw new NotServed(missingStatus, "the repository directory cannot be opened", null);
         }
-        return openByPath(p, base, missingStatus);
+        Served byPath = openByPath(p, base, missingStatus);
+        // No descriptor-relative open here: a directory on the path swapped for a link in the instant between the path
+        // checks and the open is not seen by them. So what was opened is proven by what it holds: every byte is read
+        // through the open descriptor and must hash to the content the catalog holds for this file; anything else (a
+        // file outside the repository, or one changed since it was cataloged) is never served. The bytes then served
+        // come through that same descriptor. This costs one extra read of the file, on these platforms only.
+        boolean ok = false;
+        try {
+            String held = Hashes.content(byPath.channel);
+            if (!held.equals(cataloged.get("md5"))) {
+                throw new NotServed("9", "the file opened does not hold its cataloged content (changed since it was"
+                        + " cataloged, or not this repository's file)", null);
+            }
+            ok = true;
+            return byPath;
+        } catch (IOException ex) {
+            throw new NotServed(missingStatus, "file could not be read: " + ex.getClass().getSimpleName(), null);
+        } finally {
+            if (!ok) {
+                try { byPath.channel.close(); } catch (IOException ignore) { }
+            }
+        }
     }
 
     /** The descriptor-relative open (see openServable). */
@@ -825,8 +867,8 @@ public class ExecutorImpl implements Executor {
      * The open where no descriptor-relative open exists (macOS, Windows): the final component is opened without
      * following a link, and the file is checked by path around the open (same file key before and after, a regular
      * file, inside the repository and in no live-tier root once every link is resolved). A directory on the path that is
-     * swapped for a link in the instant between the check and the open is not caught here; the bytes sent are hashed in
-     * the terminal frame, and a sync receiver verifies them against the cataloged content.
+     * swapped for a link in the instant between the check and the open is not caught by these checks: openServable
+     * then proves the open file by its content (see there).
      */
     private Served openByPath(Path p, Path base, String missingStatus) throws NotServed {
         BasicFileAttributes before;
@@ -1054,7 +1096,9 @@ public class ExecutorImpl implements Executor {
                 final int buffer = reqBuf;
                 final FileChannel channel = served.channel;
                 so.setChannel(channel);
-                TransferScheduler.Admit admit = transfers.submit(owner, () -> stream(channel, so, key, tid, identKey, identId, buffer));
+                // a subscriber of this producer fetching what it was offered may use the threads kept for sync
+                boolean sync = repoEngine.isSubscriberCaller(incoming);
+                TransferScheduler.Admit admit = transfers.submit(owner, sync, () -> stream(channel, so, key, tid, identKey, identId, buffer));
                 if (admit == TransferScheduler.Admit.CALLER_FULL || admit == TransferScheduler.Admit.FULL) {
                     so.setChannel(null);
                     transferStreams.remove(key, so);
@@ -1199,8 +1243,13 @@ public class ExecutorImpl implements Executor {
             logger.warn("repoconfirm ignored: no verified plugin caller");
             return;
         }
+        String gen = incoming.getParam("sync_gen");
+        if (gen == null) {
+            logger.warn("repoconfirm ignored: no sync_gen (a subscriber of an earlier protocol build)");
+            return;
+        }
         repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getCompressedParam("failedfiles"),
-                incoming.getCompressedParam("faileddeletes"), from[0], from[1], from[2]);
+                incoming.getCompressedParam("faileddeletes"), gen, from[0], from[1], from[2]);
     }
 
     /**
@@ -1313,6 +1362,12 @@ public class ExecutorImpl implements Executor {
             return incoming;
         }
         int released = repoEngine.releaseHeldDeletes(incoming.getParam("hold_id"));
+        if (released == DeleteGuard.RELEASE_NEEDS_ID) {
+            incoming.setParam("status","9");
+            incoming.setParam("status_desc","refused: name the held set to release (hold_id: repostate's deletes_hold_id)");
+            incoming.setParam("refusal","hold-id-required");
+            return incoming;
+        }
         if (released < 0) {
             incoming.setParam("status","9");
             incoming.setParam("status_desc","refused: the held deletes changed; read repostate's deletes_hold_id again");
@@ -1325,6 +1380,34 @@ public class ExecutorImpl implements Executor {
                 + " if it finds exactly that set held; the release is spent by that scan whatever it finds"
                 : "no deletes are held");
         if (released > 0) incoming.setParam("hold_id", String.valueOf(repoEngine.getHoldId()));
+        return incoming;
+    }
+
+    /** releaserewrites: offer the rewrites the rewrite guard holds; confirmed like clearrepo, naming the held set. */
+    private MsgEvent releaseRewrites(MsgEvent incoming) {
+        if (!repoEngine.confirms(incoming.getParam("confirm"))) {
+            incoming.setParam("status","9");
+            incoming.setParam("status_desc","refused: confirm must name this repository's directory exactly");
+            incoming.setParam("refusal","unconfirmed");
+            return incoming;
+        }
+        int released = repoEngine.releaseHeldRewrites(incoming.getParam("hold_id"));
+        if (released == DeleteGuard.RELEASE_NEEDS_ID) {
+            incoming.setParam("status","9");
+            incoming.setParam("status_desc","refused: name the held set to release (hold_id: repostate's rewrites_hold_id)");
+            incoming.setParam("refusal","hold-id-required");
+            return incoming;
+        }
+        if (released < 0) {
+            incoming.setParam("status","9");
+            incoming.setParam("status_desc","refused: the held rewrites changed; read repostate's rewrites_hold_id again");
+            incoming.setParam("refusal","hold-changed");
+            return incoming;
+        }
+        incoming.setParam("released", String.valueOf(released));
+        incoming.setParam("status", released > 0 ? "10" : "9");
+        incoming.setParam("status_desc", released > 0 ? released + " held rewrite(s) released: offered to every subscriber"
+                : "no rewrites are held");
         return incoming;
     }
 
@@ -1660,7 +1743,7 @@ public class ExecutorImpl implements Executor {
             } else if((repoListStringIn != null) && (transferId != null)) {
 
                 RepoEngine.Accepted accepted = repoEngine.acceptDiff(repoListStringIn, deletesIn, transferId,
-                        from[0], from[1], from[2]);
+                        incoming.getParam("sync_gen"), from[0], from[1], from[2]);
                 incoming.setParam("status_code", accepted.code);
                 incoming.setParam("status_desc", accepted.desc);
 

@@ -24,6 +24,11 @@ import java.util.Map;
 final class TestRig implements AutoCloseable {
 
     static final String REGION = "region-1", AGENT = "agent-1", PLUGIN_ID = "plugin-0";
+    /**
+     * The sync_key an admin provisions for the test fabric's repositories (generated per run, never a fixed secret):
+     * every rig gets it unless its config says otherwise ("sync_key" present, even empty: no key).
+     */
+    static final String SYNC_KEY = SyncReceiver.token();
 
     final Path agentDir;
     final String pluginId;
@@ -60,6 +65,7 @@ final class TestRig implements AutoCloseable {
         Files.createDirectories(agentDir);
         this.config = new HashMap<>(config);
         this.config.put("pluginID", pluginId);
+        if (!this.config.containsKey("sync_key")) this.config.put("sync_key", SYNC_KEY);
         this.plugin = new PluginBuilder(agent(), "io.cresco.filerepo.Plugin", null, this.config);
         this.db = new DBEngine(plugin);
         this.repo = new RepoEngine(plugin, db, live);

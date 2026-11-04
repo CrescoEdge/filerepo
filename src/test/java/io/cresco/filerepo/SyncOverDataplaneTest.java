@@ -217,7 +217,10 @@ class SyncOverDataplaneTest {
             }
         };
         assertTrue(producer.repo.scanOnce());
-        await(() -> subscriber.repo.syncVerifyFailed.get() == 1, "refused by the offered content hash");
+        // refused by the offered content hash at the mirror; or, where the producer proves what it opened by its
+        // content (no descriptor-relative open: macOS), already refused by the producer
+        await(() -> subscriber.repo.syncVerifyFailed.get() == 1 || subscriber.repo.syncFetchFailed.get() >= 1,
+                "refused by the offered content hash");
         assertFalse(Files.exists(mirror.resolve("moving.txt")));
     }
 
@@ -365,15 +368,18 @@ class SyncOverDataplaneTest {
 
         // released: refused without the exact directory, then confirmed
         assertEquals("unconfirmed", producer.call(producer.requestTo("releasedeletes", "confirm", "/elsewhere")).getParam("refusal"));
-        MsgEvent rel = producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString()));
+        assertEquals("hold-id-required", producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString()))
+                .getParam("refusal"), "a release names the set it releases");
+        MsgEvent rel = producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString(),
+                "hold_id", producer.repo.getHoldId()));
         assertEquals("10", rel.getParam("status"));
         assertEquals("6", rel.getParam("released"));
         assertTrue(producer.repo.scanOnce());
         assertEquals(0, producer.repo.getDeletesHeld());
         await(() -> producer.db.getTombstonesNotInSync(10).isEmpty() && producer.repo.getTombstoneCount() == 6, "applied");
         for (int i = 0; i < 6; i++) assertFalse(Files.exists(mirror.resolve("m" + i + ".txt")));
-        assertEquals("9", producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString())).getParam("status"),
-                "nothing held, nothing released");
+        assertEquals("9", producer.call(producer.requestTo("releasedeletes", "confirm", scan.toString(), "hold_id", "0".repeat(32)))
+                .getParam("status"), "nothing held, nothing released");
     }
 
     @Test
@@ -624,6 +630,7 @@ class SyncOverDataplaneTest {
                 TestRig.REGION, TestRig.AGENT, "plugin-s", false, false);
         in.setParam("action", "repolistin");
         in.setParam("transfer_id", tid);
+        in.setParam("sync_gen", subscriber.repo.getSyncGen());
         in.setCompressedParam("repolistin", "{}");
         Fabric.stamp(in, producerId);
         return subscriber.call(in).getParam("status_code");

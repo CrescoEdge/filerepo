@@ -8,7 +8,21 @@ import org.apache.commons.pool2.impl.GenericObjectPool;
 
 import javax.sql.DataSource;
 import java.io.File;
+import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.sql.*;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -28,6 +42,11 @@ public class DBEngine {
     private ObjectPool<PoolableConnection> connectionPool;
     private PoolingDataSource<PoolableConnection> dataSource;
     private File dbsource;
+    // the repository's state directory and its lock: one plugin serves one repository directory at a time
+    private Path stateDir;
+    private FileChannel lockChannel;
+    private FileLock lock;
+    private volatile String openError;
     /** Transactions committed by the batched writers (tests: FR-D8 writes a scan in few commits, not one per file). */
     final java.util.concurrent.atomic.AtomicLong batchCommits = new java.util.concurrent.atomic.AtomicLong();
 
@@ -41,13 +60,31 @@ public class DBEngine {
             tablesNames = new ArrayList<>();
             tablesNames.add("filelist");
 
-            String dbName = "filerepo-db";
-            String dbPath = plugin.getPluginDataDirectory() + "/derbydb-home/" + dbName;
+            String jdbc = plugin.getConfig().getStringParam("db_jdbc");
+            stateDir = RepoPaths.stateDir(plugin);
+            ownerOnlyDirectories(stateDir);
+            // one plugin per repository directory: a second one (a duplicate pluginadd, two unnamed default
+            // repositories) would share a catalog under a second database engine and corrupt it
+            lockChannel = FileChannel.open(stateDir.resolve("lock"), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            try {
+                lock = lockChannel.tryLock();
+            } catch (OverlappingFileLockException inThisJvm) {
+                lock = null;
+            }
+            if (lock == null) {
+                lockChannel.close();
+                lockChannel = null;
+                openError = "the repository directory " + RepoPaths.repoDir(plugin) + " is already served by another"
+                        + " filerepo plugin on this agent";
+                logger.error(openError + ": this plugin serves nothing");
+                return;
+            }
 
-            dbsource = Paths.get(dbPath).toFile();
+            dbsource = stateDir.resolve("catalog").toFile();
+            if (jdbc == null) migrateLegacyCatalog(RepoPaths.legacyCatalog(plugin), dbsource.toPath());
 
             String dbDriver = plugin.getConfig().getStringParam("db_driver", "org.apache.derby.jdbc.EmbeddedDriver");
-            String dbConnectionString = plugin.getConfig().getStringParam("db_jdbc", "jdbc:derby:" + dbsource.getAbsolutePath()  + ";create=true");
+            String dbConnectionString = jdbc != null ? jdbc : "jdbc:derby:" + dbsource.getAbsolutePath() + ";create=true";
 
             Class.forName(dbDriver);
 
@@ -64,7 +101,84 @@ public class DBEngine {
             ensureSchema();
 
         } catch (Exception ex) {
+            openError = "the catalog could not be opened: " + ex.getMessage();
             logger.error("DBEngine init failed", ex);
+        }
+    }
+
+    /** Why the catalog is not open (another plugin serves the directory, or it failed), or null. */
+    String openError() {
+        return openError;
+    }
+
+    /** The repository's state directory (catalog and lock). */
+    Path stateDir() {
+        return stateDir;
+    }
+
+    private static void ownerOnlyDirectories(Path dir) throws IOException {
+        if (!Files.isDirectory(dir)) {
+            Files.createDirectories(dir);
+            try {
+                Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
+            } catch (UnsupportedOperationException noPosix) {
+                // not a POSIX filesystem
+            }
+        }
+    }
+
+    /**
+     * The catalog used to live in the plugin's data directory, which the controller deletes with the plugin: move it
+     * here once (a rename; a copy where a rename cannot be done, leaving the old one in place). Never deletes.
+     */
+    private void migrateLegacyCatalog(Path legacy, Path target) {
+        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS) || !Files.isDirectory(legacy, LinkOption.NOFOLLOW_LINKS)) return;
+        try {
+            try {
+                Files.move(legacy, target, StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.FileSystemException otherDevice) {
+                copyTree(legacy, target);
+            }
+            logger.warn("the catalog moved from " + legacy + " (the plugin's data directory, deleted with the plugin) to "
+                    + target);
+        } catch (Exception ex) {
+            logger.error("the catalog at " + legacy + " could not be moved to " + target + ": " + ex.getMessage()
+                    + "; a new catalog is started (the old one is left in place)");
+        }
+    }
+
+    private static void copyTree(Path from, Path to) throws IOException {
+        Files.walkFileTree(from, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                Files.createDirectories(to.resolve(from.relativize(dir)));
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                if (attrs.isRegularFile()) Files.copy(file, to.resolve(from.relativize(file)), StandardCopyOption.COPY_ATTRIBUTES);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    /**
+     * Rewrite the catalog's paths under {@code oldPrefix} to {@code newPrefix} (the default repository moved). The
+     * number of rows rewritten.
+     */
+    int rebasePaths(String oldPrefix, String newPrefix) {
+        String like = oldPrefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + File.separator + "%";
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "UPDATE filelist SET filepath = ? || SUBSTR(filepath, ?) WHERE filepath LIKE ? ESCAPE '\\'")) {
+            ps.setString(1, newPrefix);
+            ps.setInt(2, oldPrefix.length() + 1);
+            ps.setString(3, like);
+            return ps.executeUpdate();
+        } catch (Exception ex) {
+            logger.error("rebasePaths error", ex);
+            return -1;
         }
     }
 
@@ -96,6 +210,14 @@ public class DBEngine {
         } catch (Exception ex) {
             logger.error("DBEngine shutdown error", ex);
         }
+        try {
+            if (lock != null) lock.release();
+            if (lockChannel != null) lockChannel.close();
+        } catch (Exception ex) {
+            logger.error("DBEngine lock release error", ex);
+        }
+        lock = null;
+        lockChannel = null;
         return isShutdown;
     }
 
@@ -133,9 +255,29 @@ public class DBEngine {
                 if (!has) {
                     try (Statement stmt = conn.createStatement()) {
                         stmt.executeUpdate(t[1]);
+                        if ("HOLDERS".equals(t[0])) {
+                            // a catalog from before holders were tracked: every producer it records was seen now
+                            try (PreparedStatement ps = conn.prepareStatement("INSERT INTO holders (holder, last_seen)"
+                                    + " SELECT DISTINCT producer, ? FROM mirrored WHERE producer NOT LIKE '~%'")) {
+                                ps.setLong(1, System.currentTimeMillis());
+                                ps.executeUpdate();
+                            }
+                        }
                     } catch (Exception ex) {
                         logger.error("could not create " + t[0], ex);
                     }
+                }
+            }
+            // a mirrored table from before holdings had a kind: every claim it holds was fetched
+            boolean hasKind;
+            try (ResultSet rs = conn.getMetaData().getColumns(null, null, "MIRRORED", "KIND")) {
+                hasKind = rs.next();
+            }
+            if (!hasKind) {
+                try (Statement stmt = conn.createStatement()) {
+                    stmt.executeUpdate("ALTER TABLE mirrored ADD COLUMN kind char(1) DEFAULT 'S'");
+                } catch (Exception ex) {
+                    logger.error("could not add mirrored.kind", ex);
                 }
             }
         } catch (Exception ex) {
@@ -180,7 +322,11 @@ public class DBEngine {
             {"PENDINGDEL", "CREATE TABLE pendingdel (subkey varchar(256) NOT NULL, pathhash varchar(200) NOT NULL,"
                     + " filepath varchar(1000) NOT NULL, PRIMARY KEY (subkey, pathhash))"},
             {"MIRRORED", "CREATE TABLE mirrored (producer varchar(256) NOT NULL, relhash char(64) NOT NULL,"
-                    + " relpath varchar(1000) NOT NULL, md5 varchar(255), PRIMARY KEY (producer, relhash))"},
+                    + " relpath varchar(1000) NOT NULL, md5 varchar(255), kind char(1) DEFAULT 'S',"
+                    + " PRIMARY KEY (producer, relhash))"},
+            {"HOLDERS", "CREATE TABLE holders (holder varchar(256) primary key NOT NULL, last_seen bigint NOT NULL)"},
+            {"HELDCHANGE", "CREATE TABLE heldchange (pathhash varchar(200) primary key NOT NULL, filepath varchar(1000) NOT NULL,"
+                    + " prevmd5 varchar(255), md5 varchar(255))"},
     };
 
     /**
@@ -401,8 +547,10 @@ public class DBEngine {
     /** A pending file for a subscriber: its key and the catalog row (path, md5, lastmodified, filesize). */
     public List<String[]> pendingFiles(String subkey, String afterKey, int limit) {
         List<String[]> out = new ArrayList<>();
+        // a rewrite the guard holds is offered to nobody, whatever is pending
         String sql = "SELECT p.pathhash, f.filepath, f.md5, f.lastmodified, f.filesize FROM pending p"
                 + " JOIN filelist f ON f.filepath = p.filepath WHERE p.subkey = ? AND p.pathhash > ?"
+                + " AND NOT EXISTS (SELECT 1 FROM heldchange h WHERE h.pathhash = p.pathhash)"
                 + " ORDER BY p.pathhash FETCH FIRST ? ROWS ONLY";
         try (Connection conn = ds.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, subkey);
@@ -553,24 +701,246 @@ public class DBEngine {
     }
 
     public void recordMirrored(String producer, String relpath, String md5) {
+        recordMirrored(producer, relpath, md5, HOLD_FETCHED);
+    }
+
+    /** A claim on a name: fetched from that producer ('S'), or the same content it offers, held already ('W'). */
+    static final char HOLD_FETCHED = 'S';
+    static final char HOLD_MATCHED = 'W';
+    /** The prefix of a claim whose producer has not been heard from in sync_holder_ttl_ms. */
+    static final String ORPHAN = "~";
+
+    /** One producer's claim on a name in a mirror. */
+    static final class Holding {
+        final String md5;
+        final char kind;
+
+        Holding(String md5, char kind) {
+            this.md5 = md5;
+            this.kind = kind;
+        }
+    }
+
+    public void recordMirrored(String producer, String relpath, String md5, char kind) {
         try (Connection conn = ds.getConnection()) {
-            try (PreparedStatement up = conn.prepareStatement("UPDATE mirrored SET md5 = ?, relpath = ? WHERE producer = ? AND relhash = ?")) {
+            try (PreparedStatement up = conn.prepareStatement("UPDATE mirrored SET md5 = ?, relpath = ?, kind = ? WHERE producer = ? AND relhash = ?")) {
                 up.setString(1, md5);
                 up.setString(2, relpath);
-                up.setString(3, producer);
-                up.setString(4, sha256(relpath));
+                up.setString(3, String.valueOf(kind));
+                up.setString(4, producer);
+                up.setString(5, sha256(relpath));
                 if (up.executeUpdate() > 0) return;
             }
-            try (PreparedStatement in = conn.prepareStatement("INSERT INTO mirrored (producer, relhash, relpath, md5) VALUES (?,?,?,?)")) {
+            try (PreparedStatement in = conn.prepareStatement("INSERT INTO mirrored (producer, relhash, relpath, md5, kind) VALUES (?,?,?,?,?)")) {
                 in.setString(1, producer);
                 in.setString(2, sha256(relpath));
                 in.setString(3, relpath);
                 in.setString(4, md5);
+                in.setString(5, String.valueOf(kind));
                 in.executeUpdate();
             }
         } catch (Exception ex) {
             logger.error("recordMirrored error", ex);
         }
+    }
+
+    /** Every claim on {@code relpath}: producer -> what it holds there and how. */
+    public Map<String, Holding> holdings(String relpath) {
+        Map<String, Holding> out = new HashMap<>();
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT producer, md5, kind FROM mirrored WHERE relhash = ?")) {
+            ps.setString(1, sha256(relpath));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String k = rs.getString(3);
+                    out.put(rs.getString(1), new Holding(rs.getString(2), k == null || k.isEmpty() ? HOLD_FETCHED : k.charAt(0)));
+                }
+            }
+        } catch (Exception ex) {
+            logger.error("holdings error", ex);
+        }
+        return out;
+    }
+
+    /** After {@code producer}'s content {@code md5} landed under {@code relpath}: claims on other content there go. */
+    public void forgetOtherClaims(String relpath, String producer, String md5) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM mirrored WHERE relhash = ? AND producer <> ?"
+                     + " AND (md5 IS NULL OR md5 <> ?)")) {
+            ps.setString(1, sha256(relpath));
+            ps.setString(2, producer);
+            ps.setString(3, md5);
+            ps.executeUpdate();
+        } catch (Exception ex) {
+            logger.error("forgetOtherClaims error", ex);
+        }
+    }
+
+    /** A producer (by its stable key) was heard from now. */
+    public void touchHolder(String holder, long now) {
+        try (Connection conn = ds.getConnection()) {
+            try (PreparedStatement up = conn.prepareStatement("UPDATE holders SET last_seen = ? WHERE holder = ?")) {
+                up.setLong(1, now);
+                up.setString(2, holder);
+                if (up.executeUpdate() > 0) return;
+            }
+            try (PreparedStatement in = conn.prepareStatement("INSERT INTO holders (holder, last_seen) VALUES (?,?)")) {
+                in.setString(1, holder);
+                in.setLong(2, now);
+                in.executeUpdate();
+            }
+        } catch (Exception ex) {
+            logger.error("touchHolder error", ex);
+        }
+    }
+
+    /** A producer that is back takes back its claims that had been orphaned. The number taken back. */
+    public int unorphan(String holder) {
+        return rename(ORPHAN + holder, holder);
+    }
+
+    /**
+     * Claims of producers not heard from since {@code before} become orphans ({@code ~producer}): they still protect
+     * their files from any delete, but no longer block another verified producer of the name. The producers orphaned.
+     */
+    public List<String> orphanStale(long before) {
+        List<String> stale = new ArrayList<>();
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT holder FROM holders WHERE last_seen < ?")) {
+            ps.setLong(1, before);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) stale.add(rs.getString(1));
+            }
+        } catch (Exception ex) {
+            logger.error("orphanStale error", ex);
+            return stale;
+        }
+        for (String h : stale) {
+            rename(h, ORPHAN + h);
+            try (Connection conn = ds.getConnection();
+                 PreparedStatement ps = conn.prepareStatement("DELETE FROM holders WHERE holder = ?")) {
+                ps.setString(1, h);
+                ps.executeUpdate();
+            } catch (Exception ex) {
+                logger.error("orphanStale error", ex);
+            }
+        }
+        return stale;
+    }
+
+    /** Move every claim of {@code from} to {@code to} (a claim {@code to} already has wins). */
+    private int rename(String from, String to) {
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = conn.prepareStatement("DELETE FROM mirrored WHERE producer = ? AND relhash IN"
+                        + " (SELECT relhash FROM mirrored WHERE producer = ?)")) {
+                    ps.setString(1, from);
+                    ps.setString(2, to);
+                    ps.executeUpdate();
+                }
+                int n;
+                try (PreparedStatement ps = conn.prepareStatement("UPDATE mirrored SET producer = ? WHERE producer = ?")) {
+                    ps.setString(1, to);
+                    ps.setString(2, from);
+                    n = ps.executeUpdate();
+                }
+                conn.commit();
+                return n;
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("claims not moved from " + from + ": " + ex.getMessage());
+                return 0;
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("rename claims error", ex);
+            return 0;
+        }
+    }
+
+    // ---- the rewrite guard: changed files held from every subscriber until an admin releases them ----
+
+    /** Hold these changes (path, the content subscribers last had, the new content); an existing hold keeps its prevmd5. */
+    public void holdChanges(List<String[]> changes, int batchSize) {
+        if (changes.isEmpty()) return;
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement up = conn.prepareStatement("UPDATE heldchange SET md5 = ? WHERE pathhash = ?");
+                 PreparedStatement in = conn.prepareStatement("INSERT INTO heldchange (pathhash, filepath, prevmd5, md5) VALUES (?,?,?,?)")) {
+                int n = 0;
+                for (String[] c : changes) {
+                    up.setString(1, c[2]);
+                    up.setString(2, pathKey(c[0]));
+                    if (up.executeUpdate() == 0) {
+                        in.setString(1, pathKey(c[0]));
+                        in.setString(2, c[0]);
+                        in.setString(3, c[1]);
+                        in.setString(4, c[2]);
+                        in.executeUpdate();
+                    }
+                    if (++n % Math.max(1, batchSize) == 0) conn.commit();
+                }
+                conn.commit();
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("holdChanges failed: " + ex.getMessage());
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("holdChanges error", ex);
+        }
+    }
+
+    /** The held change of {@code path}: {prevmd5, md5}, or null. */
+    public String[] heldChange(String path) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT prevmd5, md5 FROM heldchange WHERE pathhash = ?")) {
+            ps.setString(1, pathKey(path));
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? new String[]{rs.getString(1), rs.getString(2)} : null;
+            }
+        } catch (Exception ex) {
+            logger.error("heldChange error", ex);
+            return null;
+        }
+    }
+
+    public void unholdChanges(List<String> paths) {
+        if (paths.isEmpty()) return;
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM heldchange WHERE pathhash = ?")) {
+            for (String p : paths) {
+                ps.setString(1, pathKey(p));
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        } catch (Exception ex) {
+            logger.error("unholdChanges error", ex);
+        }
+    }
+
+    public long heldChangeCount() {
+        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM heldchange")) {
+            return rs.next() ? rs.getLong(1) : 0;
+        } catch (Exception ex) {
+            return 0;
+        }
+    }
+
+    /** The held changes in path order: {filepath, md5}. */
+    public List<String[]> heldChanges() {
+        List<String[]> out = new ArrayList<>();
+        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT filepath, md5 FROM heldchange ORDER BY filepath")) {
+            while (rs.next()) out.add(new String[]{rs.getString(1), rs.getString(2)});
+        } catch (Exception ex) {
+            logger.error("heldChanges error", ex);
+        }
+        return out;
     }
 
     public void forgetMirrored(String producer, String relpath) {
@@ -817,9 +1187,10 @@ public class DBEngine {
 
     /** Forget confirmed tombstones deleted before {@code before} (epoch ms). Returns how many went. */
     public int purgeTombstones(long before) {
-        // never while a subscriber still has the delete pending
+        // per subscriber: never while any subscriber the producer keeps still has the delete pending (a subscriber is
+        // kept until it is dropped for lagging too long, with an alarm); older than the TTL and applied by every one
         try (Connection conn = ds.getConnection();
-             PreparedStatement ps = conn.prepareStatement("DELETE FROM tombstone WHERE insync = 1 AND deleted_at < ?"
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM tombstone WHERE deleted_at < ?"
                      + " AND NOT EXISTS (SELECT 1 FROM pendingdel d WHERE d.filepath = tombstone.filepath)")) {
             ps.setLong(1, before);
             return ps.executeUpdate();

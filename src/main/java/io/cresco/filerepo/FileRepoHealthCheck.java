@@ -34,7 +34,9 @@ public class FileRepoHealthCheck implements HealthCheck {
             // A dead catalog (XSDB6 double-boot, missing FILELIST table, corrupted Derby) used to
             // read as "0 file(s) cataloged, OK" because getRepoCount() swallows errors and returns 0.
             if (!repoEngine.isCatalogHealthy()) {
-                return new Result(Result.Status.CRITICAL, "filerepo CRITICAL: catalog not queryable");
+                String why = repoEngine.catalogOpenError();
+                return new Result(Result.Status.CRITICAL, "filerepo CRITICAL: catalog not queryable"
+                        + (why == null ? "" : " (" + why + ")"));
             }
             if (repoEngine.isLiveBacked()) {
                 // no repo dir of its own to check: its files are the live row's, read only through the filesystem.
@@ -61,6 +63,17 @@ public class FileRepoHealthCheck implements HealthCheck {
                 return new Result(Result.Status.WARN, "filerepo WARN: the mass-delete guard holds " + held
                         + " delete(s) back from subscribers (hold " + repoEngine.getHoldId()
                         + "); an admin releases exactly them with releasedeletes if intended");
+            }
+            long rewrites = repoEngine.getRewritesHeld();
+            if (rewrites > 0) {
+                return new Result(Result.Status.WARN, "filerepo WARN: the rewrite guard holds " + rewrites
+                        + " rewritten file(s) back from subscribers (hold " + repoEngine.getRewriteHoldId()
+                        + "); an admin releases exactly them with releaserewrites if intended");
+            }
+            int lagging = repoEngine.getLaggingSubscribers();
+            if (lagging > 0) {
+                return new Result(Result.Status.WARN, "filerepo WARN: " + lagging + " subscriber(s) have owed confirms for"
+                        + " longer than sync_lag_alarm_ms (dropped after sync_subscriber_ttl_ms)");
             }
             return new Result(Result.Status.OK,
                     "filerepo OK: " + files + " file(s) cataloged, repo dir=" + repoDir.getName());

@@ -248,7 +248,7 @@ class StreamFileTest {
 
     @Test
     void oneCallersTransfersBeyondItsShareWaitWithoutHoldingAThread() throws Exception {
-        rig("transfer_threads", "4", "transfer_max_per_caller", "6");
+        rig("transfer_threads", "4", "transfer_max_per_caller", "6", "transfer_caller_fraction", "0.5");
         CountDownLatch hold = new CountDownLatch(1);
         java.util.concurrent.atomic.AtomicInteger started = new java.util.concurrent.atomic.AtomicInteger();
         rig.exec.beforeStream = () -> {
@@ -305,6 +305,9 @@ class StreamFileTest {
         assertEquals("9", stream(stray, 0, 5).getParam("status"));
         // getfile takes the same path
         assertEquals("9", rig.call("getfile", "file_path", link.toString()).getParam("status"));
+        // f now holds the swapped-in content: where the open is not descriptor-relative it is proven by its content,
+        // so the catalog must say what f holds for it to be served
+        rig.db.upsertFile(f.toString(), Hashes.content(f), Files.getLastModifiedTime(f).toMillis(), Files.size(f));
         assertEquals("10", rig.call("getfile", "file_path", f.toString()).getParam("status"));
     }
 
