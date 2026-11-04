@@ -624,4 +624,55 @@ class SyncRound4Test {
         Fabric.stamp(big, "plugin-s");
         assertEquals("9", p.call(big).getParam("status"));
     }
+
+    // =================================================================== a proof never reads a file that grew
+
+    @Test
+    void getfileAndStreamfileNeverReadAFileThatGrewSinceItsScan() throws Exception {
+        try (var ds = Files.newDirectoryStream(tmp)) {
+            org.junit.jupiter.api.Assumptions.assumeTrue(!(ds instanceof java.nio.file.SecureDirectoryStream), "the descriptor path is used here");
+        }
+        Path repo = Files.createDirectories(tmp.resolve("repo"));
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put("repo_dir", repo.toString());
+        TestRig r = rig(TestRig.PLUGIN_ID, cfg);
+        byte[] small = "ten bytes!".getBytes();
+        Path f = Files.write(repo.resolve("grown.bin"), small);
+        r.db.addFile(f.toString(), Hashes.content(small), Files.getLastModifiedTime(f).toMillis(), small.length);
+        // it grows after its scan: still under max_inline_bytes for getfile
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f.toFile(), "rw")) {
+            raf.setLength(400_000);
+        }
+        MsgEvent got = r.call("getfile", "file_path", f.toString());
+        assertEquals("9", got.getParam("status"), got.getParams().toString());
+        assertTrue(got.getParam("status_desc").contains("changed since it was cataloged"), got.getParam("status_desc"));
+        assertEquals(0, r.exec.proofs.get(), "getfile read a file whose size is not the catalog's");
+        // and a streamfile of its cataloged range, after it grew to 4 GB (sparse): refused without reading it
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f.toFile(), "rw")) {
+            raf.setLength(4L << 30);
+        }
+        MsgEvent st = r.requestTo("streamfile", "file_path", f.toString(), "start_byte", "0", "byte_length",
+                String.valueOf(small.length), "ident_key", "stream_name", "ident_id", "rx", "transfer_id", "g1");
+        st.setParam(Callers.PARAM_CALLER, "api:tenant-a/alice");
+        st.setParam("cresco_caller_tenant", "tenant-a");
+        st.setParam(Callers.PARAM_ROLES, "user");
+        long t0 = System.nanoTime();
+        assertEquals("10", r.call(st).getParam("status"));
+        jakarta.jms.Message end = null;
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (end == null && System.currentTimeMillis() < deadline) {
+            synchronized (r.dataplaneSent) {
+                for (Object o : r.dataplaneSent) {
+                    jakarta.jms.Message m = (jakarta.jms.Message) o;
+                    if ("true".equals(m.getStringProperty("transfer_end")) && "g1".equals(m.getStringProperty("transfer_id"))) end = m;
+                }
+            }
+            Thread.sleep(10);
+        }
+        assertNotNull(end, "no terminal frame");
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        assertEquals("9", end.getStringProperty("transfer_status"));
+        assertEquals(0, r.exec.proofs.get(), "streamfile read a file whose size is not the catalog's");
+        assertTrue(ms < 2000, "refused in " + ms + " ms");
+    }
 }

@@ -588,8 +588,10 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 - **Descriptor-relative opens** — where the platform has them (`SecureDirectoryStream`: Linux), `getfile` and
   `streamfile` open every directory from the repository root down, and the file, by descriptor without following a
   link; elsewhere the file is opened without following a final link, checked by path around the open, and then proven
-  by its content: every byte is read through the opened descriptor and must hash to the content the catalog holds for
-  it, so a directory swapped for a link mid-open can never make it serve a file outside the repository.
+  by its content: the opened descriptor's size (fstat) must be the cataloged size before anything is read, and exactly
+  that many bytes are read through it and must hash to the content the catalog holds for it, so a directory swapped for
+  a link mid-open can never make it serve a file outside the repository, and a file that grew since its scan is never
+  read whole.
 - **Only verified jars** — `repolist` and `getjar` consider only `*.jar` files, and list and serve only those that
   pass the agent's signing policy, however they reached the directory (verified once per size, mtime and file key).
 - **Arbitrary-read protection** — `getfile` only serves files present in the catalog (i.e. under the
@@ -753,7 +755,9 @@ What an operator sees change, and what to do:
   it once through its descriptor (it must hash to its cataloged content) before sending it: after the size check
   (getfile answers "too large" from the catalog without opening the file) and after the transfer is admitted (on its
   own thread). The proven descriptor is kept for a minute for the same caller and file version, so the next ranges of
-  that file are not read again. A file changed since the last scan is refused until rescanned. Linux opens
+  that file are not read again. A file changed since the last scan is refused until rescanned: first by the size of
+  the opened descriptor (fstat), which must be the cataloged size, before a byte is read (a file that grew since its
+  scan is never read whole); then a proof reads exactly the cataloged size, never more. Linux opens
   descriptor-relative and reads once.
 - **`streamfile`**: `transfer_id` is optional and validated; `ident_key` must be a property name; chunks carry
   `offset`; every transfer ends with an empty terminal frame (`transfer_end=true`, `sha384` on success). A client that

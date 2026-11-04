@@ -83,6 +83,26 @@ final class Hashes {
         return hex(c.digest());
     }
 
+    /**
+     * The content hash of exactly the first {@code size} bytes an open channel reads (absolute reads); null when it ends
+     * before them. Never reads past {@code size}.
+     */
+    static String content(java.nio.channels.FileChannel ch, long size) throws IOException {
+        MessageDigest c = content();
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(1 << 16);
+        long pos = 0;
+        while (pos < size) {
+            buf.clear();
+            buf.limit((int) Math.min(buf.capacity(), size - pos));
+            int n = ch.read(buf, pos);
+            if (n < 0) return null;
+            buf.flip();
+            c.update(buf);
+            pos += n;
+        }
+        return hex(c.digest());
+    }
+
     /** SHA-384 of a file, lowercase hex. */
     static String sha384(Path file) throws IOException {
         MessageDigest s = sha384();

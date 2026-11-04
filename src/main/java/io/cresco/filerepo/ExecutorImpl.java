@@ -779,23 +779,33 @@ public class ExecutorImpl implements Executor {
         final long size;
         final boolean needsProof;
         final String md5;
+        // the size the catalog holds for it (what a proof reads, and no more); -1 when unknown
+        final long catalogSize;
 
         Served(FileChannel channel, long size) {
-            this(channel, size, false, null);
+            this(channel, size, false, null, -1L);
         }
 
-        Served(FileChannel channel, long size, boolean needsProof, String md5) {
+        Served(FileChannel channel, long size, boolean needsProof, String md5, long catalogSize) {
             this.channel = channel;
             this.size = size;
             this.needsProof = needsProof;
             this.md5 = md5;
+            this.catalogSize = catalogSize;
         }
     }
 
-    /** True when {@code ch} holds exactly the content hashed {@code md5} (read through the descriptor). */
-    private boolean holds(FileChannel ch, String md5) throws IOException {
+    /**
+     * True when {@code ch} holds exactly the content hashed {@code md5}: first its size, as the open descriptor reports
+     * it (fstat), must be the catalog's {@code size} (a file grown or shrunk since its scan is refused without reading a
+     * byte); then exactly that many bytes are read through the descriptor and hashed, and the size checked again (a file
+     * that grows while it is read is refused too). A proof never reads more than the cataloged size.
+     */
+    private boolean holds(FileChannel ch, String md5, long size) throws IOException {
+        if (md5 == null || size < 0 || ch.size() != size) return false;
         proofs.incrementAndGet();
-        return md5 != null && md5.equals(Hashes.content(ch));
+        String got = Hashes.content(ch, size);
+        return md5.equals(got) && ch.size() == size;
     }
 
     /** Whole-file proofs made on the fallback path (tests: a proven descriptor is reused, not re-read). */
@@ -907,7 +917,11 @@ public class ExecutorImpl implements Executor {
         // checks and the open is not seen by them. So what was opened must be proven by what it holds (every byte read
         // through the open descriptor hashes to the catalog's content for this file) before any of it is served: the
         // caller proves it, after its size checks and admission (getfile inline, a transfer on its own thread).
-        return new Served(byPath.channel, byPath.size, true, cataloged.get("md5"));
+        long catalogSize = -1L;
+        try {
+            catalogSize = Long.parseLong(cataloged.get("filesize"));
+        } catch (Exception ignore) { }
+        return new Served(byPath.channel, byPath.size, true, cataloged.get("md5"), catalogSize);
     }
 
     /** The descriptor-relative open (see openServable). */
@@ -1053,7 +1067,14 @@ public class ExecutorImpl implements Executor {
                     return incoming;
                 }
                 try (FileChannel ch = served.channel) {
-                    if (served.size <= maxInlineBytes && served.needsProof && !holds(ch, served.md5)) {
+                    if (served.needsProof && served.size != served.catalogSize) {
+                        // the open descriptor's own size is not the catalog's: changed since its scan; never read
+                        incoming.setParam("status","9");
+                        incoming.setParam("status_desc","the file changed since it was cataloged (" + served.size + " bytes,"
+                                + " the catalog holds " + served.catalogSize + "): it is served once rescanned");
+                        return incoming;
+                    }
+                    if (served.size <= maxInlineBytes && served.needsProof && !holds(ch, served.md5, served.catalogSize)) {
                         incoming.setParam("status","9");
                         incoming.setParam("status_desc","the file opened does not hold its cataloged content (changed since"
                                 + " it was cataloged, or not this repository's file)");
@@ -1213,8 +1234,9 @@ public class ExecutorImpl implements Executor {
                 boolean sync = repoEngine.isSubscriberCaller(incoming);
                 final String proofKey = served.needsProof ? owner + "|" + filePath + "|" + served.md5 : null;
                 final String md5 = served.md5;
+                final long catalogSize = served.catalogSize;
                 TransferScheduler.Admit admit = transfers.submit(owner, sync,
-                        () -> stream(channel, proofKey, md5, so, key, tid, identKey, identId, buffer));
+                        () -> stream(channel, proofKey, md5, catalogSize, so, key, tid, identKey, identId, buffer));
                 if (admit == TransferScheduler.Admit.CALLER_FULL || admit == TransferScheduler.Admit.FULL) {
                     so.setChannel(null);
                     transferStreams.remove(key, so);
@@ -1245,8 +1267,8 @@ public class ExecutorImpl implements Executor {
     }
 
     /** The streamer: chunks with their offsets, then the terminal frame, whatever happened. */
-    private void stream(FileChannel channel, String proofKey, String md5, StreamObject so, String key, String transferId,
-                        String identKey, String identId, int bufferSize) {
+    private void stream(FileChannel channel, String proofKey, String md5, long catalogSize, StreamObject so, String key,
+                        String transferId, String identKey, String identId, int bufferSize) {
         DataPlaneService dp = plugin.getAgentService().getDataPlaneService();
         MessageDigest sha = Hashes.sha384();
         long sent = 0;
@@ -1265,7 +1287,7 @@ public class ExecutorImpl implements Executor {
                     try { channel.close(); } catch (IOException ignore) { }
                     ch = known;
                     shared = true;
-                } else if (!holds(channel, md5)) {
+                } else if (!holds(channel, md5, catalogSize)) {
                     status = "9";
                     desc = "the file opened does not hold its cataloged content (changed since it was cataloged, or not"
                             + " this repository's file)";
