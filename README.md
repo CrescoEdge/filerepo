@@ -161,7 +161,7 @@ producer's own `streamfile` **over the dataplane**, verifies it and moves it int
     `sync_delete_guard_subtree_min` (10) files **and** more than `sync_delete_guard_subtree_fraction` (1%) of the
     catalog: a nested volume going away where device ids cannot tell it, while `rm -rf` of a small directory in a
     large repository goes through;
-  - everything when the remaining loss is at least `sync_delete_guard_min` (2) files **and** more than
+  - everything when the remaining loss is at least `sync_delete_guard_min` (3) files **and** more than
     `sync_delete_guard_fraction` (10%) of the catalog, counting the deletes recorded in the last
     `sync_delete_guard_window_ms` (15 min) too: a loss spread over cycles (a deletion still running while a scan reads
     the tree, a slow drip) is held once it adds up, so what gets through unheld is bounded by the threshold. (In a small
@@ -477,7 +477,7 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_rpc_timeout_ms` | `30000` | Bound on a sync request (`repolistin`, `streamfile`). |
 | `sync_offer_threads` | `8` | Subscribers a producer offers to at once. A cycle costs the slowest subscriber's answer, not the sum: a subscriber that went away costs one unanswered offer (`sync_rpc_timeout_ms`), concurrently with the others, and is then skipped until it subscribes again. |
 | `sync_tombstone_ttl_ms` | `604800000` (7 days) | How long a delete every kept subscriber applied is kept. |
-| `sync_delete_guard_min` / `sync_delete_guard_fraction` | `2` / `0.10` | The mass-delete guard: a loss of at least this many files and more than this fraction of the catalog is held. |
+| `sync_delete_guard_min` / `sync_delete_guard_fraction` | `3` / `0.10` | The mass-delete guard: a loss of at least this many files and more than this fraction of the catalog is held. |
 | `sync_delete_guard_window_ms` | `900000` (15 min) | Deletes recorded this recently count with a cycle's loss for the fraction (`0`: each cycle alone). |
 | `sync_delete_guard_subtree_min` / `sync_delete_guard_subtree_fraction` | `10` / `0.01` | A whole subtree that lost all its cataloged files, at least this many and more than this fraction of the catalog, is held. (A vanished mount and an emptied scan dir are always held.) |
 | `sync_rewrite_guard_min` / `sync_rewrite_guard_fraction` | `10` / `0.25` | The rewrite guard: a cycle rewriting at least this many existing files and more than this fraction of the catalog is held. `1.0` turns it off. |
@@ -643,7 +643,7 @@ What an operator sees change, and what to do:
   version: an older consumer asks for `getfiledata`, an older producer sends no terminal frame.
 - **Deletes now propagate.** A file removed from a producer's scan dir (or with `removefile`) is deleted on its
   subscribers if they still hold that exact content from that producer. The mass-delete guard holds a vanished mount,
-  an emptied scan dir, a large lost subtree and any loss of 2+ files over 10% of the catalog; release it with
+  an emptied scan dir, a large lost subtree and any loss of 3+ files over 10% of the catalog (within 15 minutes); release it with
   `releasedeletes` and the `hold_id` from `repostate` (**required**) once intended. Check `repostate`
   (`deletes_held`) after an upgrade if the scan dir changed while filerepo was down.
 - **Mass rewrites are held** like mass deletes (`rewrites_held`, `releaserewrites` with `hold_id`). A job that

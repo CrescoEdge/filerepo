@@ -330,7 +330,7 @@ public class RepoEngine {
         offerTimeoutMs = clamp(longParam("sync_offer_timeout_ms", 600_000L), 1_000L, Long.MAX_VALUE);
         tombstoneTtlMs = clamp(longParam("sync_tombstone_ttl_ms", 7L * 24 * 3600 * 1000), 0L, Long.MAX_VALUE);
         guard = new DeleteGuard(fractionParam("sync_delete_guard_fraction", 0.10),
-                (int) clamp(longParam("sync_delete_guard_min", 2L), 1, Integer.MAX_VALUE),
+                (int) clamp(longParam("sync_delete_guard_min", 3L), 1, Integer.MAX_VALUE),
                 (int) clamp(longParam("sync_delete_guard_subtree_min", 10L), 1, Integer.MAX_VALUE),
                 fractionParam("sync_delete_guard_subtree_fraction", 0.01),
                 clamp(longParam("sync_release_ttl_ms", 600_000L), 1_000L, Long.MAX_VALUE),

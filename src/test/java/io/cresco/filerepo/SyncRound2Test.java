@@ -410,6 +410,22 @@ class SyncRound2Test {
         assertEquals(0, p.repo.getDeletesHeld(), "after a release, one delete is ordinary again");
     }
 
+    @Test
+    void twoOrdinaryDeletesInASmallRepositoryAreNotHeldAThirdSoonAfterIs() throws Exception {
+        TestRig p = producer("plugin-p", scan);
+        for (int i = 0; i < 6; i++) write(scan.resolve("s" + i + ".txt"), "s" + i);
+        assertTrue(p.repo.scanOnce());
+        Files.delete(scan.resolve("s0.txt"));
+        assertTrue(p.repo.scanOnce());
+        Files.delete(scan.resolve("s1.txt"));
+        assertTrue(p.repo.scanOnce());
+        assertEquals(0, p.repo.getDeletesHeld(), "two deletes, one at a time, in a six-file repository");
+        assertEquals(2, p.repo.getTombstoneCount());
+        Files.delete(scan.resolve("s2.txt"));
+        assertTrue(p.repo.scanOnce());
+        assertEquals(1, p.repo.getDeletesHeld(), "a third within sync_delete_guard_window_ms: half the repository is going");
+    }
+
     // ------------------------------------------------------------------ resets, and subscribers kept for their deletes
 
     @Test
