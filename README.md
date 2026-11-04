@@ -481,6 +481,43 @@ def stream_get(path, size):
     return b"".join(parts[k] for k in sorted(parts))           # reassemble by seq_num
 ```
 
+## Upgrade notes (1.3 hardening)
+
+What an operator sees change, and what to do:
+
+- **Roles.** `clearrepo`, `putjar`, `removefile`, `putfiles`, `putfilesremote` and `releasedeletes` now need the
+  `infra` or `admin` role; `repolistin` and `repoconfirm` need `plugin`. A refused call answers `status_code=403`.
+  With security explicitly off (development) the caller is `anonymous` with every role and nothing changes.
+- **`putfilesremote` across agents.** The push arrives at the remote filerepo as `putfiles` from a *plugin* caller,
+  which the contract does not allow to land files. Until the controller carries the originating admin across, push
+  with `putfiles` directly as an admin, or use watched-directory sync.
+- **`clearrepo`** needs `confirm=<the repository directory>` exactly (its `scan_dir`, or `repo_dir` when it has
+  none); `repo_name` must name this repository if given; `force=true` needs `admin`; protected directories and live
+  roots are never cleared. Scripts that cleared with just `repo_name` must add `confirm`.
+- **`putjar`** accepts only jars signed by a signer chaining to the agent's `plugin_signing_truststore`. Configure the
+  trust store on every agent that runs filerepo or repo **before upgrading**, and sign plugin jars (`jarsigner` with a
+  code-signing certificate issued under it). Without a trust store every `putjar` is refused, and filerepo says so at
+  start. `md5` is optional now; when sent it must match. `pluginname` must equal the jar's `Bundle-SymbolicName`.
+- **Repository directory.** With neither `scan_dir` nor `repo_dir` configured the repository is
+  `<plugin data dir>/repo`, no longer the relative `./filerepo`. Move anything landed there before (filerepo logs a
+  WARNING naming both paths). On a producer, `putjar` now lands in `scan_dir`, so the jar is scanned and synced.
+- **`putfiles`** requires `file_hashes` (file name → content hash); `putfilesremote` sends it. A file that already
+  exists with other content and `overwrite=false` is reported `skipped` with `status 9` (it used to be `10`).
+  `putfiles_require_hashes=false` restores landing without hashes.
+- **Sync** now moves file bytes over the dataplane with the producer's `streamfile`; the controller's `getfiledata`
+  is no longer used (and no longer needs `file_access_roots` for filerepo). Producer and consumer must both be this
+  version: an older consumer asks for `getfiledata`, an older producer sends no terminal frame.
+- **Deletes now propagate.** A file removed from a producer's scan dir (or with `removefile`) is deleted on its
+  subscribers if they still hold that exact content. The mass-delete guard holds an emptied scan dir or a large
+  fraction of deletes; release it with `releasedeletes` once intended. Check `repostate` (`deletes_held`) after an
+  upgrade if the scan dir changed while filerepo was down.
+- **`streamfile`**: `transfer_id` is optional and validated; `ident_key` must be a property name; chunks carry
+  `offset`; every transfer ends with an empty terminal frame (`transfer_end=true`, `sha384` on success). A client that
+  counts frames should skip the terminal one (it carries no payload). Busy is `status 11`.
+- **Symbolic links in a scan dir are no longer followed** (`scan_follow_links=true` restores it), and a file is
+  served only from inside the repository directory.
+- **New metrics** (`filerepo.transfer.*`, `filerepo.sync.*`) and a health WARN while deletes are held.
+
 ## Testing
 
 `mvn test` runs filerepo's JUnit 5 suite (part of every `package` build): the live-tier client against a real
