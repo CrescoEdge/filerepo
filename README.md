@@ -105,22 +105,32 @@ with the same key and checked by the mirror. Not its plugin id (a producer redep
 same key), not the directory it reports (shown to admins only), and not anything a holder of a shared secret could
 claim: another plugin on the producer's agent cannot sign as it. The producer's `repostate` shows its `producer_key`
 and the `producer_pin` to configure on its mirrors (`region/agent#<fingerprint>`); its log names it at the first start.
-Each mirror has a **pinned producer**, and only it may add, change or delete files there:
+Each mirror has a **pinned producer**, set only by an admin, and only it may add, change or delete files there; a
+mirror with no pin **syncs nothing**:
 
 - **`sync_producers`** (recommended): an admin's comma list of pins, `region/agent#<fingerprint>` (from the producer's
   `repostate`). The mirror asks only those nodes. A pin without a fingerprint (`region/agent`, `region/agent:/dir`,
   `region/agent/pluginid`, the round-2 and round-3 forms) pins nothing, with an ERROR: a node or a directory is no
   identity.
-- **Trust on first use** (no `sync_producers`): the first producer of the name that proves a key is pinned, recorded in
-  the catalog, and logged (a WARN naming it). Check `repostate`'s `pinned_producer` after the first sync. To change it an
-  admin sends **`syncpin`** to the mirror (`confirm=<the mirror's directory>`, `producer=region/agent#<fingerprint>`, and
-  `adopt=true` to hand the old producer's files to the new one; or `reset=true` to pin the next one); a new generation
-  follows, so the new producer offers everything.
-- Other producers of the name are still known (`repostate` counts `unpinned_producers`, a WARN an hour names them), and
-  so is a plugin that answers without a valid signature (it names no key and is never pinned), but everything they offer
-  is refused and everything they delete ignored: they settle at the producer (logged there as refused) and nothing at the
-  mirror changes. Any mirror, or any bundle on a mirror's or a producer's agent, can run a producer of the name; it is
-  never the pinned one.
+- **`syncpin`** (no `sync_producers`): an admin sends it to the mirror (`confirm=<the mirror's directory>`,
+  `producer=region/agent#<fingerprint>`); the pin is kept in the catalog. Nothing is ever pinned because it answered,
+  first or at all. Without `sync_producers` and before a `syncpin`, the mirror syncs nothing: it still asks the producers
+  of its name, and `repostate` lists those that answered and proved a key as `candidate_producers`
+  (`region/agent#<fingerprint> (directory)`), for the admin to choose from (a WARN an hour per producer names the
+  `syncpin` command too). `syncpin reset=true` forgets the pin: the mirror syncs nothing again until an admin pins one.
+  Changing the pin, or resetting it, orphans what the old producer delivered (kept, never deleted, changed by nobody
+  else) unless `adopt=true` hands it to the new producer (`from=` names the old producer, a pin or the holder
+  `repostate` shows, when it is not the previous pin). A new generation follows, so the new producer offers everything.
+- Other producers of the name are still known (`repostate` counts `unpinned_producers`), and so is a plugin that answers
+  without a valid signature (it names no key and is never pinned), but everything they offer is refused and everything
+  they delete ignored: they settle at the producer (logged there as refused) and nothing at the mirror changes. Any
+  mirror, or any bundle on a mirror's or a producer's agent, can run a producer of the name; it is never the pinned one.
+- **Orphaned content.** What a producer that is not pinned now delivered here (re-pinned or reset without `adopt`, a
+  producer that moved or lost its key, a pin by directory from an earlier build of this branch) is frozen: kept, never
+  deleted, and changed by nobody but that producer. `repostate` shows it: `orphaned_files` (counted up to 10000),
+  `orphaned_from` (each producer's holder and identity) and `orphaned_resolve`, the command that hands it to the pinned
+  producer (`syncpin confirm=<dir> adopt=true from=<holder> producer=<pin>`; where `sync_producers` is configured, this
+  hand-over to a configured producer is the one `syncpin` taken there).
 - **Keep the key.** A producer redeployed over the same directory keeps its key; a producer moved to another directory
   or node, or whose `producer.key` was lost, is a new producer: re-pin its mirrors (`adopt=true` carries the old content
   over). A key file that cannot be read is never replaced (the producer serves no mirror and says why, in its log and its
@@ -448,7 +458,7 @@ it reads only the stamped caller; a message without one is anonymous only in exp
 | `clearrepo` *(infra/admin)* | `confirm` *(req)*; optional `repo_name`, `force` | `status`, `state`, `refusal` | Delete every file in the repository directory. An only copy needs `force=true` (admin). |
 | `releasedeletes` *(infra/admin)* | `confirm` *(req)*, `hold_id` *(req)* | `released`, `hold_id` | On a producer: let the next scan record exactly the deletes the mass-delete guard holds. On a mirror: apply the held deletes of a silent producer's files. Refused without `hold_id`, or if it names another set. |
 | `releaserewrites` *(infra/admin)* | `confirm` *(req)*, `hold_id` *(req)* | `released` | Offer exactly the rewrites the rewrite guard holds (refused without `hold_id`, or if it names another set). |
-| `syncpin` *(infra/admin)* | `confirm` *(req)*, `producer` (`region/agent#<fingerprint>`) or `reset=true`, optional `adopt` | `pinned_producer` | A mirror's producer pin (trust on first use) replaced, or forgotten; a new generation follows. Refused where `sync_producers` is configured. |
+| `syncpin` *(infra/admin)* | `confirm` *(req)*, `producer` (`region/agent#<fingerprint>`) or `reset=true`, optional `adopt`, `from` | `pinned_producer` | Pin a mirror's producer, or forget the pin (the mirror then syncs nothing); `adopt=true` hands the previous (or the `from`) producer's content to the new one; a new generation follows. Where `sync_producers` is configured only `adopt=true from=... producer=<a configured pin>` is taken. |
 | `repostate` | — | `state`, `backing`, facts | What the repo is: `LIVE`, `WORKSPACE_CLEAN`, `WORKSPACE_DIRTY`, `MIRROR` or `ONLY_COPY`. |
 | `liverelay` | `request` (json, req) | `reply` (json), `reply_status` | Relay a request signed by its end user, unchanged, through the live-tier provider. |
 | `liverealise` *(infra/admin)* | optional `lease_ms` (at most `live_lease_max_ms`), `request_id` | `job_id`, `reply_status` | Realise a live-backed repo's copy again, as the node (keeps it live). |
@@ -508,7 +518,7 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_max_peers` | `256` | Producers syncing at once (and subscribers kept by a producer). |
 | `sync_diff_page` / `sync_delete_page` | `1000` / `1000` | Files / deletes per `repolistin` page. |
 | `sync_pages_per_cycle` | `8` | Pages a subscriber is offered per cycle beyond this cycle's changes (catch-up after a failure, a new or a cleared subscriber). `sync_full_pages_per_cycle` is the older name. |
-| `sync_producers` | *(unset)* | **A mirror's pinned producers**: `region/agent#<fingerprint of the producer's key>` (the producer's `repostate` `producer_pin`), comma-separated. Only they may change the mirror; it asks no other node. A pin without a fingerprint pins nothing. Unset: the first producer that proves a key is pinned (trust on first use; `syncpin` changes it). |
+| `sync_producers` | *(unset)* | **A mirror's pinned producers**: `region/agent#<fingerprint of the producer's key>` (the producer's `repostate` `producer_pin`), comma-separated. Only they may change the mirror; it asks no other node. A pin without a fingerprint pins nothing. Unset: the pin an admin sets with `syncpin`; until then the mirror syncs nothing (`repostate` lists `candidate_producers`). |
 | `sync_role` | *(from the directories)* | `producer`, `mirror` or `none`. A mirror never acts as a producer. |
 | `sync_key` | *(unset)* | An additional proof of membership (a secret of at least 16 characters, the same on a repository's producer(s) and mirrors): discovers, subscribes and answers without its proof are ignored. Never an identity. |
 | `sync_subscribe_retry_ms` | `10000` | A consumer asks one producer at most this often. |
@@ -652,10 +662,12 @@ What an operator sees change, and what to do:
 
 - **Pin each mirror's producer by its key.** Every producer makes its own signing key at its first start (logged, with
   the pin to use; also in its `repostate` as `producer_pin`). Set `sync_producers=region/agent#<fingerprint>` on every
-  mirror. Without it, a mirror pins the first producer that proves a key (trust on first use): check its `repostate`
-  (`pinned_producer`) after the first sync, and correct it with `syncpin` if needed. Only the pinned producer changes a
-  mirror; any other producer of the name is refused. Pins by node or directory (`region/agent`, `region/agent:/dir`)
-  from earlier builds of this branch pin nothing now. Back up each producer's state directory (`producer.key`): a
+  mirror, or send it `syncpin producer=region/agent#<fingerprint>`. **A mirror with no pin syncs nothing** (there is no
+  trust on first use): its `repostate` says so and lists the `candidate_producers` that answered. Only the pinned
+  producer changes a mirror; any other producer of the name is refused. Pins by node or directory (`region/agent`, `region/agent:/dir`)
+  from earlier builds of this branch pin nothing now, nor does a pin a mirror recorded then (taken on first use, by
+  directory): such a mirror syncs nothing until pinned by key, and `repostate` shows what that producer delivered as
+  orphaned content with the `syncpin ... adopt=true` command that hands it on. Back up each producer's state directory (`producer.key`): a
   producer that loses its key, or moves to another directory or node, must be re-pinned on its mirrors (`syncpin
   ... adopt=true` keeps what the old one delivered). `sync_key` is optional (an extra proof of membership).
   `sync_role=mirror` keeps a mirror from ever producing.

@@ -119,6 +119,31 @@ class ReviewRound4Test {
     // =================================================================== pinning
 
     /**
+     * HIGH (default configuration). With no sync_producers (and sync_key now only extra proof), a mirror pins the first
+     * verified producer that answers, on first start (and after syncpin reset=true). Round 3's default synced nothing;
+     * now any plugin of the tenant that broadcasts a discover before the real producer does -- every 100 ms, against
+     * the producer's scan_period -- is pinned for good, and the real producer is refused at every new mirror.
+     */
+    @Test
+    void aNewMirrorNeverPinsWhicheverPluginAnswersFirst() throws Exception {
+        TestRig s = subscriber("plugin-s", mirror, "sync_key", "");
+        Path rogueDir = Files.createDirectories(tmp.resolve("rogue"));
+        write(rogueDir.resolve("release.bin"), "MALICIOUS release");
+        TestRig rogue = producer("plugin-x", rogueDir, "sync_key", "");
+        subscribe(rogue, s);                       // the rogue's discover arrives first
+        cycle(rogue, s);
+
+        TestRig p = producer("plugin-p", scan, "sync_key", "");
+        write(scan.resolve("release.bin"), "good release");
+        subscribe(p, s);
+        assertTrue(p.repo.scanOnce());
+        Thread.sleep(1000);
+        assertEquals("good release", read(mirror.resolve("release.bin")),
+                "the new mirror pinned whichever plugin answered first (" + s.repo.pinnedProducers()
+                        + ") and refuses its real producer");
+    }
+
+    /**
      * MED-HIGH. A producer's identity is its stamped NODE plus the directory it REPORTS (producer_dir): the plugin id is
      * dropped, and the directory is the answerer's own claim (with a sync_key, a key holder can prove any directory).
      * Any plugin on the producer's agent answers reposubscribe with the producer's directory (repostate shows it as

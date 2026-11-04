@@ -139,13 +139,15 @@ import io.cresco.library.capability.*;
                   @CrescoParam(name = "hold_id", required = true, description = "the held set to release (repostate deletes_hold_id); refused if it changed")},
         returns = @CrescoReturn(name = "released", description = "how many held deletes the next scan records, if it finds exactly that set")),
     @CrescoAction(name = "syncpin", type = "EXEC", roles = {"infra", "admin"},
-        summary = "Pin a mirror's producer (region/agent#<its key fingerprint>), replacing the one trusted on first use, or " +
-                  "forget that pin (reset=true). With adopt=true what the previous producer delivered becomes the new one's.",
+        summary = "Pin a mirror's producer (region/agent#<its key fingerprint>), or forget the pin (reset=true: the mirror " +
+                  "syncs nothing until pinned again). With adopt=true what the previous (or the from) producer delivered " +
+                  "becomes the new one's. Where sync_producers is configured only such an adopt is taken.",
         why = "Move a mirror to another producer, or re-pin after the producer moved.",
         params = {@CrescoParam(name = "confirm", required = true, description = "this repository's directory, exactly"),
                   @CrescoParam(name = "producer", description = "region/agent#<fingerprint> (the producer's repostate producer_pin)"),
-                  @CrescoParam(name = "reset", type = "boolean", description = "forget the pin: the next verified producer is pinned"),
-                  @CrescoParam(name = "adopt", type = "boolean", description = "hand the previous producer's claims to the new one")},
+                  @CrescoParam(name = "reset", type = "boolean", description = "forget the pin: the mirror syncs nothing until pinned again"),
+                  @CrescoParam(name = "adopt", type = "boolean", description = "hand the previous producer's claims to the new one"),
+                  @CrescoParam(name = "from", description = "with adopt: the old producer (a pin, or a holder from repostate's orphaned_from)")},
         returns = @CrescoReturn(name = "pinned_producer", description = "the pin now")),
     @CrescoAction(name = "releaserewrites", type = "EXEC", roles = {"infra", "admin"},
         summary = "Release the rewrites the rewrite guard is holding, so they are offered to subscribers. " +
@@ -1525,8 +1527,8 @@ public class ExecutorImpl implements Executor {
 
     /**
      * syncpin (a mirror's admin): pin this mirror's producer ({@code producer=region/agent#fingerprint}), or with
-     * {@code reset=true} forget the pin taken on first use so the next verified producer is pinned; {@code adopt=true}
-     * hands what the previous producer delivered to the new one. Confirmed like clearrepo.
+     * {@code reset=true} forget the pin (the mirror then syncs nothing until pinned again); {@code adopt=true} hands what
+     * the previous producer (or the one {@code from} names) delivered to the new one. Confirmed like clearrepo.
      */
     private MsgEvent syncPin(MsgEvent incoming) {
         if (!repoEngine.confirms(incoming.getParam("confirm"))) {
@@ -1542,13 +1544,15 @@ public class ExecutorImpl implements Executor {
             return incoming;
         }
         boolean reset = "true".equalsIgnoreCase(incoming.getParam("reset"));
+        boolean adopt = "true".equalsIgnoreCase(incoming.getParam("adopt"));
         String producer = incoming.getParam("producer");
-        if (reset == (producer != null)) {
+        if (reset == (producer != null) || (reset && adopt)) {
             incoming.setParam("status","8");
-            incoming.setParam("status_desc","give producer=region/agent#<its key fingerprint>, or reset=true");
+            incoming.setParam("status_desc","give producer=region/agent#<its key fingerprint> (optionally adopt=true, and"
+                    + " from=<the old producer>), or reset=true");
             return incoming;
         }
-        String why = repoEngine.syncPin(reset ? null : producer, "true".equalsIgnoreCase(incoming.getParam("adopt")));
+        String why = repoEngine.syncPin(reset ? null : producer, adopt, incoming.getParam("from"));
         if (why != null) {
             incoming.setParam("status","9");
             incoming.setParam("status_desc","refused: " + why);
@@ -1558,7 +1562,8 @@ public class ExecutorImpl implements Executor {
         String pin = repoEngine.pinnedProducers();
         incoming.setParam("pinned_producer", pin == null ? "" : pin);
         incoming.setParam("status","10");
-        incoming.setParam("status_desc", reset ? "pin cleared: the next verified producer is pinned" : "pinned " + pin);
+        incoming.setParam("status_desc", reset ? "pin cleared: this mirror syncs nothing until an admin pins its producer"
+                : "pinned " + pin);
         return incoming;
     }
 

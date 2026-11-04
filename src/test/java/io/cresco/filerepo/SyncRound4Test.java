@@ -275,4 +275,126 @@ class SyncRound4Test {
         assertTrue(p.repo.scanOnce());
         await(() -> !Files.exists(mirror.resolve("a.bin")), "the producer's signed delete applied");
     }
+
+    // =================================================================== pinning: never by who answers
+
+    @Test
+    void aMirrorWithNoPinTakesNothingFromAnyoneAndListsWhoAnswered() throws Exception {
+        TestRig s = subscriber("plugin-s", mirror, "sync_producers", "");
+        Path rogueDir = Files.createDirectories(tmp.resolve("rogue"));
+        write(rogueDir.resolve("release.bin"), "MALICIOUS");
+        TestRig x = producer("plugin-x", rogueDir);
+        subscribe(x, s);
+        cycle(x, s);
+        TestRig p = producer("plugin-p", scan);
+        write(scan.resolve("release.bin"), "good");
+        subscribe(p, s);
+        cycle(p, s);
+        assertFalse(Files.exists(mirror.resolve("release.bin")), "an unpinned mirror took a file");
+        MsgEvent st = s.call("repostate");
+        assertTrue(st.getParam("pinned_producer").startsWith("none"), st.getParams().toString());
+        String candidates = st.getParam("candidate_producers");
+        assertTrue(candidates.contains(p.repo.producerPin()) && candidates.contains(x.repo.producerPin()), candidates);
+        assertTrue(s.log.stream().anyMatch(l -> l.contains("syncs nothing until an admin pins")), s.log.toString());
+        assertTrue(s.log.stream().anyMatch(l -> l.contains("syncpin confirm=") && l.contains(p.repo.producerPin())), s.log.toString());
+        // nothing survives a restart as a pin either
+        s.close();
+        rigs.remove(s);
+        TestRig again = subscriber("plugin-s", mirror, "sync_producers", "");
+        assertTrue(again.call("repostate").getParam("pinned_producer").startsWith("none"));
+    }
+
+    @Test
+    void sync_producersNamingNoKeyPinsNothing() throws Exception {
+        TestRig p = producer("plugin-p", scan);
+        write(scan.resolve("a.txt"), "a");
+        TestRig s = subscriber("plugin-s", mirror, "sync_producers", TestRig.REGION + "/" + TestRig.AGENT + ":" + scan
+                + "," + TestRig.REGION + "/" + TestRig.AGENT);
+        assertTrue(s.log.stream().anyMatch(l -> l.contains("pins nothing")), s.log.toString());
+        p.repo.repoBroadcast("fr", "discover", 0);
+        assertTrue(p.repo.scanOnce());
+        Thread.sleep(500);
+        assertFalse(Files.exists(mirror.resolve("a.txt")));
+        assertTrue(s.call("repostate").getParam("pinned_producer").startsWith("none"));
+        // and syncpin does not override configuration
+        assertEquals("pin", s.call(TestRig.as(s.requestTo("syncpin", "confirm", mirror.toString(), "producer",
+                p.repo.producerPin()), "admin")).getParam("refusal"));
+    }
+
+    // =================================================================== a producer that moved
+
+    @Test
+    void aMovedProducersContentIsFrozenAndShownUntilAnAdminHandsItOn() throws Exception {
+        TestRig p = producer("plugin-p", scan);
+        TestRig s = subscriber("plugin-s", mirror);
+        write(scan.resolve("m.bin"), "v1");
+        write(scan.resolve("keep.txt"), "keep");
+        subscribe(p, s);
+        cycle(p, s);
+        assertEquals("v1", read(mirror.resolve("m.bin")));
+        // the producer moves to another directory: a new key; the admin re-pins the mirror in its configuration
+        p.close();
+        rigs.remove(p);
+        Path moved = Files.createDirectories(tmp.resolve("moved"));
+        write(moved.resolve("m.bin"), "v1");
+        write(moved.resolve("keep.txt"), "keep");
+        TestRig p2 = producer("plugin-p2", moved);
+        assertNotEquals(TestRig.FABRIC_FINGERPRINT, p2.repo.signingFingerprint());
+        s.close();
+        rigs.remove(s);
+        TestRig s2 = subscriber("plugin-s", mirror, "sync_producers", p2.repo.producerPin());
+        Path f = write(moved.resolve("m.bin"), "v2");
+        Files.setLastModifiedTime(f, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis() + 10_000));
+        subscribe(p2, s2);
+        for (int i = 0; i < 2; i++) {
+            assertTrue(p2.repo.scanOnce());
+            Thread.sleep(300);
+        }
+        assertEquals("v1", read(mirror.resolve("m.bin")), "the old producer's content is frozen without adopt");
+        MsgEvent st = s2.call("repostate");
+        assertEquals("2", st.getParam("orphaned_files"), st.getParams().toString());
+        assertTrue(st.getParam("orphaned_from").contains(TestRig.FABRIC_PIN), st.getParam("orphaned_from"));
+        String resolve = st.getParam("orphaned_resolve");
+        assertTrue(resolve.contains("syncpin confirm=" + mirror) && resolve.contains("producer=" + p2.repo.producerPin()), resolve);
+        // the admin hands it on, by the old pin (or the holder repostate shows): the new producer updates it
+        String from = resolve.substring(resolve.indexOf("from=") + 5, resolve.indexOf(" producer="));
+        MsgEvent adopt = s2.call(TestRig.as(s2.requestTo("syncpin", "confirm", mirror.toString(), "adopt", "true", "from",
+                from, "producer", p2.repo.producerPin()), "admin"));
+        assertEquals("10", adopt.getParam("status"), adopt.getParams().toString());
+        subscribe(p2, s2);
+        assertTrue(p2.repo.scanOnce());
+        await(() -> "v2".equals(read(mirror.resolve("m.bin"))), "the moved producer's update applied after the adopt");
+        assertNull(s2.call("repostate").getParam("orphaned_files"));
+    }
+
+    @Test
+    void aPinAnEarlierBuildRecordedByDirectoryPinsNothingAndItsContentCanBeHandedOn() throws Exception {
+        TestRig s = subscriber("plugin-s", mirror, "sync_producers", "");
+        RepoEngine.Identity legacy = new RepoEngine.Identity(Fabric.TENANT, TestRig.REGION, TestRig.AGENT, "fr", null, scan.toString());
+        write(mirror.resolve("m.bin"), "v1");
+        s.db.recordMirrored(legacy.holder(), "m.bin", Hashes.content("v1".getBytes()), DBEngine.HOLD_FETCHED);
+        s.db.setMeta(RepoEngine.META_PRODUCER_PIN, legacy.full());
+        s.close();
+        rigs.remove(s);
+        TestRig p = producer("plugin-p", scan);
+        Path f = write(scan.resolve("m.bin"), "v2");
+        write(scan.resolve("keep.txt"), "keep");
+        TestRig again = subscriber("plugin-s", mirror, "sync_producers", "");
+        MsgEvent st = again.call("repostate");
+        assertTrue(st.getParam("pinned_producer").startsWith("none"), st.getParams().toString());
+        assertEquals("1", st.getParam("orphaned_files"));
+        assertTrue(st.getParam("orphaned_from").contains("by directory"), st.getParam("orphaned_from"));
+        subscribe(p, again);
+        assertTrue(p.repo.scanOnce());
+        Thread.sleep(500);
+        assertEquals("v1", read(mirror.resolve("m.bin")));
+        // the admin pins the producer by its key, adopting what the earlier pin delivered
+        MsgEvent pin = again.call(TestRig.as(again.requestTo("syncpin", "confirm", mirror.toString(), "adopt", "true",
+                "producer", p.repo.producerPin()), "admin"));
+        assertEquals("10", pin.getParam("status"), pin.getParams().toString());
+        subscribe(p, again);
+        assertTrue(p.repo.scanOnce());
+        await(() -> "v2".equals(read(mirror.resolve("m.bin"))), "updated once adopted");
+        assertEquals("keep", read(mirror.resolve("keep.txt")));
+    }
 }

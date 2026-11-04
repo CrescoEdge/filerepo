@@ -173,12 +173,17 @@ public class RepoEngine {
     // this repository's sync generation: new when it starts and when a clear starts; a producer that has not served it
     // offers it everything again (paced), and it skips what it holds
     private volatile String syncGen;
-    // producers an admin pinned (sync_producers: region/agent/plugin, comma-separated); null: none pinned
+    // producers an admin pinned in configuration (sync_producers: region/agent#fingerprint, comma-separated); null: not
+    // configured (an admin pins with syncpin); empty: configured, but naming no producer key (nothing syncs)
     private final List<Pin> configuredProducers;
     // sync_role: producer | mirror | none, or "" (from the directories configured: scan_dir a producer, repo_dir a mirror)
     private final String syncRole;
-    // the producer a mirror trusted on first use (catalog meta), when no sync_producers is configured
-    private volatile Identity tofuPin;
+    // the producer an admin pinned with syncpin (catalog meta), when no sync_producers is configured; null: none, and
+    // this mirror syncs nothing. Never taken from whoever answers first.
+    private volatile Identity adminPin;
+    // a pin an earlier build recorded (by directory, possibly taken on first use): it pins nothing; kept only so an
+    // admin's syncpin adopt=true can hand what that producer delivered to the producer it pins by key
+    private volatile Identity legacyPin;
     static final String META_PRODUCER_PIN = "producer_pin";
     // the admin-provisioned secret of this repository name (sync_key), shared by its producer(s) and mirrors; null: none.
     // A mirror takes a producer only when it proves this key (or an admin pinned it): with neither, it syncs nothing.
@@ -213,9 +218,15 @@ public class RepoEngine {
         }
     });
     private final Map<String, Long> lagAlarmed = new ConcurrentHashMap<>();
-    // verified producers of this name that are not this mirror's pinned producer (bounded): for repostate and warnings
+    // producers of this name that answered and are not this mirror's pinned producer (bounded): for repostate (the
+    // candidates an admin may pin) and warnings; identity -> when last heard from
     private final Map<String, Long> unpinnedSeen = Collections.synchronizedMap(new LinkedHashMap<String, Long>() {
         protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            return size() > 256;
+        }
+    });
+    private final Map<String, Identity> unpinnedIds = Collections.synchronizedMap(new LinkedHashMap<String, Identity>() {
+        protected boolean removeEldestEntry(Map.Entry<String, Identity> eldest) {
             return size() > 256;
         }
     });
@@ -592,9 +603,16 @@ public class RepoEngine {
             if (b != null) guard.setBaseline(Long.parseLong(b));
         } catch (Exception ignore) { }
         try {
-            tofuPin = Identity.parse(dbEngine.getMeta(META_PRODUCER_PIN));
+            Identity recorded = Identity.parse(dbEngine.getMeta(META_PRODUCER_PIN));
+            if (recorded != null && recorded.key == null) {
+                // round 3 pinned by directory, and pinned whoever answered first: not an identity, and not an admin's choice
+                legacyPin = recorded;
+                if (isMirror()) dbEngine.nameHolder(recorded.holder(), recorded.toString());
+            } else {
+                adminPin = recorded;
+            }
         } catch (Exception ex) {
-            tofuPin = null;
+            adminPin = null;
         }
 
         if (liveRow == null && scanDirString == null && repoDir == null) {
@@ -983,7 +1001,14 @@ public class RepoEngine {
         } else if (isMirror()) {
             logger.info("Start listening for filerepo: " + fileRepoName + (configuredProducers != null
                     ? " (producers pinned: " + configuredProducers + ")"
-                    : tofuPin != null ? " (producer pinned: " + tofuPin + ")" : " (the first verified producer will be pinned)"));
+                    : adminPin != null ? " (producer pinned: " + adminPin.pin() + ")" : ""));
+            if (pinnedProducers() == null) {
+                logger.warn("filerepo " + fileRepoName + ": no producer is pinned: this mirror syncs nothing until an admin"
+                        + " pins its producer (sync_producers=region/agent#<fingerprint>, or syncpin); repostate lists the"
+                        + " producers that answered (candidate_producers)" + (legacyPin == null ? "" : ". The pin an"
+                        + " earlier build recorded, " + legacyPin + ", names no key and pins nothing now: pin the producer"
+                        + " by its key, with adopt=true to hand it what that one delivered"));
+            }
             checkGenerationMarker(true);
             createSubListener(fileRepoName);
         }
@@ -2235,8 +2260,17 @@ public class RepoEngine {
         }
         knownProducers.put(addr, new KnownProducer(id, pinned, key, now));
         // a pinned producer heard from now: its claims are live (an orphaned claim is not taken back by this; see decide)
-        if (pinned) dbEngine.touchHolder(id.holder(), now);
+        if (pinned) {
+            dbEngine.touchHolder(id.holder(), now);
+            // named, so repostate can say whose content it is if this producer is unpinned later
+            if (id.key != null && !id.toString().equals(namedHolders.put(id.holder(), id.toString()))) {
+                dbEngine.nameHolder(id.holder(), id.toString());
+            }
+        }
     }
+
+    // holders named in the catalog this run (each written once)
+    private final Map<String, String> namedHolders = new ConcurrentHashMap<>();
 
     boolean isKnownProducer(String region, String agent, String pluginId) {
         return knownProducer(region, agent, pluginId) != null;
@@ -2248,48 +2282,64 @@ public class RepoEngine {
     }
 
     /**
-     * Is {@code id} this mirror's producer? With sync_producers, it must match one of the pins. Without, the first
-     * verified producer of this name is pinned (trust on first use, kept in the catalog; an admin changes it with
-     * syncpin), and only it.
+     * Is {@code id} this mirror's producer? With sync_producers, it must match one of the pins; without, the pin an admin
+     * set with syncpin. Nothing else: no producer is ever pinned because it answered (first, or at all).
      */
     private boolean isPinnedProducer(Identity id) {
+        if (id == null || id.key == null) return false;
         if (configuredProducers != null) {
             for (Pin p : configuredProducers) if (p.matches(id)) return true;
             return false;
         }
-        synchronized (this) {
-            if (tofuPin == null) {
-                try {
-                    dbEngine.setMeta(META_PRODUCER_PIN, id.full());
-                } catch (Exception ex) {
-                    logger.error("the producer pin could not be recorded: " + ex.getMessage() + "; not pinning " + id);
-                    return false;
-                }
-                tofuPin = id;
-                logger.warn("filerepo " + fileRepoName + ": pinned its producer " + id + " (trust on first use). Only it"
-                        + " may add, change or delete files here; an admin changes the pin with syncpin, or sets sync_producers");
-            }
-            return tofuPin.key != null && tofuPin.region.equals(id.region) && tofuPin.agent.equals(id.agent)
-                    && tofuPin.key.equals(id.key);
-        }
+        Identity pin = adminPin;
+        return pin != null && pin.key != null && pin.region.equals(id.region) && pin.agent.equals(id.agent)
+                && pin.key.equals(id.key);
     }
 
-    /** The producer pin(s), for repostate. */
+    /** The producer pin(s), for repostate; null when nothing is pinned (this mirror syncs nothing). */
     String pinnedProducers() {
-        if (configuredProducers != null) return configuredProducers.toString();
-        Identity t = tofuPin;
-        return t == null ? null : t.toString();
+        if (configuredProducers != null) return configuredProducers.isEmpty() ? null : configuredProducers.toString();
+        Identity t = adminPin;
+        return t == null ? null : t.pin();
+    }
+
+    /** The holders (claim keys) of the producers pinned now. */
+    private Set<String> pinnedHolders() {
+        Set<String> out = new HashSet<>();
+        if (configuredProducers != null) {
+            for (Pin p : configuredProducers) out.add(new Identity(null, p.region, p.agent, fileRepoName, p.key, null).holder());
+        } else if (adminPin != null) {
+            out.add(adminPin.holder());
+        }
+        return out;
+    }
+
+    private static final java.util.regex.Pattern HOLDER = java.util.regex.Pattern.compile("~?[kn]:[0-9a-f]{40}");
+
+    /** The holder {@code from} names: a holder as repostate shows it, or a pin ({@code region/agent#fingerprint}). */
+    private String holderOf(String from) {
+        if (from == null) return null;
+        from = from.trim();
+        if (HOLDER.matcher(from).matches()) return from.startsWith(DBEngine.ORPHAN) ? from.substring(1) : from;
+        Pin p = Pin.parse(from);
+        return p == null ? null : new Identity(null, p.region, p.agent, fileRepoName, p.key, null).holder();
     }
 
     /**
-     * syncpin (an admin's): pin {@code spec} ({@code region/agent#fingerprint}) as this mirror's producer, replacing the
-     * pin taken on first use, or (spec null) forget that pin, so the next verified producer is pinned. With
-     * {@code adopt}, what the previous producer delivered here becomes the new one's; otherwise its claims are orphaned:
-     * kept, protected from deletes, changed by nobody but it. A new generation follows: the producer offers everything.
-     * Null when it was done, otherwise why not.
+     * syncpin (an admin's). {@code spec} ({@code region/agent#fingerprint}) becomes this mirror's producer; or, with
+     * {@code spec} null (reset), the pin is forgotten and this mirror syncs nothing until an admin pins one again (it
+     * never falls back to whoever answers). What the previous producer delivered here is orphaned (kept, protected from
+     * deletes, changed by nobody but it), unless {@code adopt}: then it becomes the new producer's, from the producer
+     * {@code from} names (a pin, or a holder as repostate's orphaned_from shows it), or else from the previous pin. Where
+     * sync_producers is configured the pins are not changed here: only an adopt to one of the configured producers is
+     * taken (a producer that moved, re-pinned in configuration). A new generation follows: the producer offers
+     * everything. Null when it was done, otherwise why not.
      */
-    synchronized String syncPin(String spec, boolean adopt) {
-        if (configuredProducers != null) return "this mirror's producers come from sync_producers (configuration)";
+    synchronized String syncPin(String spec, boolean adopt, String from) {
+        if (from != null && holderOf(from) == null) {
+            return "from must be a producer pin (region/agent#<fingerprint>) or a holder as repostate's orphaned_from shows it";
+        }
+        if (from != null && !adopt) return "from is taken only with adopt=true";
         Identity next = null;
         if (spec != null) {
             String why = Pin.why(spec);
@@ -2301,30 +2351,57 @@ public class RepoEngine {
             } catch (Exception ignore) { }
             next = new Identity(tenant, pin.region, pin.agent, fileRepoName, pin.key, null);
         }
-        Identity before = tofuPin;
+        if (configuredProducers != null) {
+            if (next == null || !adopt || from == null) {
+                return "this mirror's producers come from sync_producers (configuration); here only adopt=true from=<the"
+                        + " old producer> producer=<one of the configured pins> is taken";
+            }
+            boolean configured = false;
+            for (Pin p : configuredProducers) if (p.matches(next)) configured = true;
+            if (!configured) return "producer " + next.pin() + " is not one of this mirror's sync_producers";
+            String fromHolder = holderOf(from);
+            int n = dbEngine.adoptClaims(fromHolder, next.holder());
+            dbEngine.nameHolder(next.holder(), next.toString());
+            logger.warn("syncpin: " + n + " claim(s) of " + from + " handed to " + next.pin() + ", as an admin asked");
+            renewAfterPin();
+            return null;
+        }
+        Identity before = adminPin;
         try {
             if (next == null) dbEngine.deleteMeta(META_PRODUCER_PIN);
             else dbEngine.setMeta(META_PRODUCER_PIN, next.full());
         } catch (Exception ex) {
             return "the pin could not be recorded: " + ex.getMessage();
         }
-        tofuPin = next;
-        if (before != null && (next == null || !before.full().equals(next.full()))) {
-            if (adopt && next != null) {
-                int n = dbEngine.adoptClaims(before.holder(), next.holder());
-                logger.warn("syncpin: " + n + " claim(s) of " + before + " handed to " + next);
-            } else {
-                int n = dbEngine.orphanHolder(before.holder());
-                logger.warn("syncpin: " + n + " claim(s) of " + before + " orphaned (kept, protected, frozen)");
-            }
+        adminPin = next;
+        if (next != null) dbEngine.nameHolder(next.holder(), next.toString());
+        String fromHolder = from != null ? holderOf(from)
+                : adopt ? (before != null ? before.holder() : legacyPin != null ? legacyPin.holder() : null) : null;
+        if (adopt && next != null && fromHolder != null && !fromHolder.equals(next.holder())) {
+            int n = dbEngine.adoptClaims(fromHolder, next.holder());
+            logger.warn("syncpin: " + n + " claim(s) of " + (from != null ? from : before != null ? before.pin() : legacyPin)
+                    + " handed to " + next.pin() + ", as an admin asked");
         }
+        if (before != null && (next == null || !before.holder().equals(next.holder()))
+                && !(next != null && adopt && before.holder().equals(fromHolder))) {
+            int n = dbEngine.orphanHolder(before.holder());
+            logger.warn("syncpin: " + n + " claim(s) of " + before.pin() + " orphaned (kept, protected, frozen; repostate"
+                    + " shows them as orphaned content)");
+        }
+        renewAfterPin();
+        logger.warn("syncpin: producer pin " + (next == null ? "cleared: this mirror syncs nothing until an admin pins its"
+                + " producer" : "is " + next.pin()) + "; a new generation " + syncGen);
+        return null;
+    }
+
+    /** After a pin or a hand-over: producers are asked again, and the new generation makes the producer offer everything. */
+    private void renewAfterPin() {
         knownProducers.clear();
         attempts.clear();
+        unpinnedSeen.clear();
+        unpinnedIds.clear();
         syncGen = newGen();
         writeGenerationMarker();
-        logger.warn("syncpin: producer pin " + (next == null ? "cleared (the next verified producer is pinned)" : "is " + next)
-                + "; a new generation " + syncGen);
-        return null;
     }
 
     /** This repository's sync generation, as its subscribe advertises it (tests). */
@@ -2490,6 +2567,7 @@ public class RepoEngine {
         boolean pinned = signed && isPinnedProducer(id);
         if (!pinned) {
             unpinnedSeen.put(id.full(), System.currentTimeMillis());
+            unpinnedIds.put(id.full(), id);
             warnUnpinned(id);
         }
         rememberProducer(from[0], from[1], from[2], id, pinned, signed ? pk : null);
@@ -2505,8 +2583,11 @@ public class RepoEngine {
         Long last = unpinnedWarned.get(id.full());
         if (last != null && now - last < 3_600_000L) return;
         unpinnedWarned.put(id.full(), now);
-        logger.warn("producer " + id + " of " + fileRepoName + " is not this mirror's pinned producer (" + pinnedProducers()
-                + "): what it offers is refused, what it deletes is ignored");
+        String pins = pinnedProducers();
+        logger.warn("producer " + id + " of " + fileRepoName + " is not this mirror's pinned producer ("
+                + (pins == null ? "none is pinned: this mirror syncs nothing" : pins) + "): what it offers is refused, what"
+                + " it deletes is ignored" + (id.key == null ? "" : ". An admin who trusts it pins it: syncpin confirm=<this"
+                + " mirror's directory> producer=" + id.pin() + " (or sync_producers)"));
     }
 
     public void getFileRepoDiff(String repoDiffString, String transferId, String region, String agent, String pluginId) {
@@ -3077,6 +3158,42 @@ public class RepoEngine {
     }
 
     /**
+     * Content this mirror holds from producers that are not pinned now (re-pinned without adopt, a producer that moved
+     * or lost its key, a pin by directory from an earlier build): frozen here, kept, never deleted, and changed by nobody
+     * but that producer. repostate says so, by whom, and with the command that hands it to the pinned producer. A few
+     * index probes per producer this mirror ever recorded, never a walk.
+     */
+    private void orphanedFacts(Map<String, String> facts) {
+        Set<String> pinned = pinnedHolders();
+        long total = 0;
+        List<String> from = new ArrayList<>();
+        String first = null;
+        for (Map.Entry<String, String> e : dbEngine.holderIds().entrySet()) {
+            String h = e.getKey();
+            if (pinned.contains(h)) continue;
+            long n = dbEngine.claimCount(h, 10_001);
+            if (n == 0) {
+                dbEngine.forgetHolderId(h);
+                continue;
+            }
+            total += n;
+            if (first == null) first = h;
+            if (from.size() < 4) {
+                from.add(h + " (" + (e.getValue() == null ? "a producer recorded by an earlier build" : e.getValue()) + ": "
+                        + (n > 10_000 ? "over 10000" : String.valueOf(n)) + " file(s))");
+            }
+        }
+        if (total == 0) return;
+        String to = configuredProducers != null && !configuredProducers.isEmpty() ? configuredProducers.get(0).toString()
+                : adminPin != null ? adminPin.pin() : "<region/agent#fingerprint of the producer to pin>";
+        facts.put("orphaned_files", total > 10_000 ? "over 10000" : String.valueOf(total));
+        facts.put("orphaned_from", String.join("; ", from));
+        facts.put("orphaned_resolve", "frozen: kept, never deleted, changed by nobody else. To hand it to the pinned"
+                + " producer: syncpin confirm=" + repoDirFile().getAbsolutePath() + " adopt=true from=" + first
+                + " producer=" + to);
+    }
+
+    /**
      * MIRROR or ONLY_COPY, from configuration and the catalog: a subscriber mirror is MIRROR until filerepo lands
      * files in it directly (putfiles, putjar), and every other repository is the origin of what it holds. Costs one
      * catalog lookup and one index probe, whatever the repository's size; never a walk. A subscriber's synced files are
@@ -3112,8 +3229,20 @@ public class RepoEngine {
         }
         facts.put("role", "subscriber");
         String pin = pinnedProducers();
-        facts.put("pinned_producer", pin == null ? "none yet (the first verified producer will be pinned)" : pin);
+        facts.put("pinned_producer", pin == null ? "none: this mirror syncs nothing until an admin pins its producer"
+                + " (sync_producers=region/agent#<fingerprint>, or syncpin producer=...)" : pin);
         if (!unpinnedSeen.isEmpty()) facts.put("unpinned_producers", String.valueOf(unpinnedSeen.size()));
+        // the producers that answered and proved a key, most recent first: what an admin may pin
+        List<String> candidates = new ArrayList<>();
+        synchronized (unpinnedIds) {
+            List<Identity> ids = new ArrayList<>(unpinnedIds.values());
+            Collections.reverse(ids);
+            for (Identity id : ids) {
+                if (id.key != null && candidates.size() < 8 && !candidates.contains(id.toString())) candidates.add(id.toString());
+            }
+        }
+        if (!candidates.isEmpty()) facts.put("candidate_producers", String.join(", ", candidates));
+        orphanedFacts(facts);
         String mirrorHold = mirrorHoldId;
         int mirrorHolding = mirrorHeldCount;
         if (mirrorHolding > 0 && mirrorHold != null) {

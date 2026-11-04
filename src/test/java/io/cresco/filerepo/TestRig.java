@@ -30,6 +30,29 @@ final class TestRig implements AutoCloseable {
      */
     static final String SYNC_KEY = SyncReceiver.token();
 
+    /**
+     * The test fabric's producer, and its admin's provisioning: the producer key of plugin-p (made per run, never a
+     * fixed key) is placed in its state directory before it starts, as restoring a backup of that directory would, and
+     * every mirror is configured with the pin of that key (sync_producers) unless its config says otherwise
+     * ("sync_producers" present, even empty: no pin). A mirror takes a producer only by such an admin's pin, never by
+     * who answers; any other producer on the fabric (plugin-q, plugin-x, ...) makes its own key, which nothing pins.
+     */
+    static final String FABRIC_PRODUCER = "plugin-p";
+    static final Path FABRIC_KEY_DIR;
+    static final String FABRIC_FINGERPRINT;
+    static final String FABRIC_PIN;
+    static {
+        try {
+            FABRIC_KEY_DIR = Files.createTempDirectory("filerepo-fabric-key");
+            FABRIC_FINGERPRINT = ProducerKey.loadOrCreate(FABRIC_KEY_DIR).key.fingerprint;
+            FABRIC_PIN = REGION + "/" + AGENT + "#" + FABRIC_FINGERPRINT;
+            FABRIC_KEY_DIR.toFile().deleteOnExit();
+            FABRIC_KEY_DIR.resolve(ProducerKey.FILE).toFile().deleteOnExit();
+        } catch (Exception e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
     final Path agentDir;
     final String pluginId;
     final Fabric fabric;
@@ -68,8 +91,17 @@ final class TestRig implements AutoCloseable {
         this.config = new HashMap<>(config);
         this.config.put("pluginID", pluginId);
         if (!this.config.containsKey("sync_key")) this.config.put("sync_key", SYNC_KEY);
+        boolean mirrorConfig = this.config.get("filerepo_name") != null && this.config.get("repo_dir") != null
+                && this.config.get("scan_dir") == null && this.config.get("live_row") == null;
+        if (mirrorConfig && !this.config.containsKey("sync_producers")) this.config.put("sync_producers", FABRIC_PIN);
         this.plugin = new PluginBuilder(agent(), "io.cresco.filerepo.Plugin", null, this.config);
         this.db = new DBEngine(plugin);
+        if (FABRIC_PRODUCER.equals(pluginId) && this.config.get("scan_dir") != null && db.openError() == null
+                && db.stateDir() != null && !Files.exists(db.stateDir().resolve(ProducerKey.FILE))) {
+            Path key = db.stateDir().resolve(ProducerKey.FILE);
+            Files.copy(FABRIC_KEY_DIR.resolve(ProducerKey.FILE), key);
+            Files.setPosixFilePermissions(key, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        }
         this.repo = new RepoEngine(plugin, db, live);
         this.exec = new ExecutorImpl(plugin, repo, live);
         plugin.setIsActive(true);

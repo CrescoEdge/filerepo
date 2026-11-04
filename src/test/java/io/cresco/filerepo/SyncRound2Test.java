@@ -121,40 +121,68 @@ class SyncRound2Test {
     // ------------------------------------------------------------------ the binding (sync_key, sync_producers)
 
     @Test
-    void aMirrorWithoutPinsTrustsItsFirstVerifiedProducerAndOnlyItUntilAnAdminRepins() throws Exception {
+    void aMirrorWithoutPinsSyncsNothingAndListsWhoAnsweredUntilAnAdminPinsItsProducerByKey() throws Exception {
         TestRig p = producer("plugin-p", scan, "sync_key", "");
-        TestRig s = subscriber("plugin-s", mirror, "sync_key", "");
+        // no pin configured, none set by an admin
+        TestRig s = subscriber("plugin-s", mirror, "sync_key", "", "sync_producers", "");
         write(scan.resolve("a.txt"), "from p");
         subscribe(p, s);
         cycle(p, s);
-        assertEquals("from p", read(mirror.resolve("a.txt")));
-        String pin = s.call("repostate").getParam("pinned_producer");
-        assertTrue(pin.startsWith(p.repo.producerPin()), pin);
-        // another producer of the name: verified, known, but not pinned: nothing it offers lands
+        assertFalse(Files.exists(mirror.resolve("a.txt")), "a mirror without a pin took a file from the first producer that answered");
+        MsgEvent st = s.call("repostate");
+        assertTrue(st.getParam("pinned_producer").startsWith("none"), st.getParam("pinned_producer"));
+        assertTrue(st.getParam("candidate_producers").contains(p.repo.producerPin()), st.getParam("candidate_producers"));
+        // another producer of the name answers too: listed, nothing taken from either
         Path other = Files.createDirectories(tmp.resolve("other"));
         write(other.resolve("b.txt"), "from q");
         TestRig q = producer("plugin-q", other, "sync_key", "");
         subscribe(q, s);
         cycle(q, s);
         assertFalse(Files.exists(mirror.resolve("b.txt")), "an unpinned producer added a file");
-        assertEquals("1", s.call("repostate").getParam("unpinned_producers"));
-        // an admin re-pins the mirror to q, handing it what p delivered: a new generation, q offers everything
-        assertEquals("unconfirmed", s.call(TestRig.as(s.requestTo("syncpin", "producer", q.repo.producerPin()), "admin"))
+        st = s.call("repostate");
+        assertEquals("2", st.getParam("unpinned_producers"));
+        assertTrue(st.getParam("candidate_producers").contains(q.repo.producerPin()), st.getParam("candidate_producers"));
+        // an admin pins p by its key (confirmed with the mirror's directory): a new generation, p offers everything
+        assertEquals("unconfirmed", s.call(TestRig.as(s.requestTo("syncpin", "producer", p.repo.producerPin()), "admin"))
                 .getParam("refusal"));
         // a directory is no identity: a pin names the producer's key
         assertEquals("pin", s.call(TestRig.as(s.requestTo("syncpin", "confirm", mirror.toString(), "producer",
-                TestRig.REGION + "/" + TestRig.AGENT + ":" + other), "admin")).getParam("refusal"));
+                TestRig.REGION + "/" + TestRig.AGENT + ":" + scan), "admin")).getParam("refusal"));
         MsgEvent pinned = s.call(TestRig.as(s.requestTo("syncpin", "confirm", mirror.toString(), "producer",
-                q.repo.producerPin(), "adopt", "true"), "admin"));
+                p.repo.producerPin()), "admin"));
         assertEquals("10", pinned.getParam("status"), pinned.getParams().toString());
+        subscribe(p, s);
+        cycle(p, s);
+        assertEquals("from p", read(mirror.resolve("a.txt")));
+        // re-pinned to q, handing it what p delivered: q offers everything; p is now the unpinned one
+        MsgEvent repin = s.call(TestRig.as(s.requestTo("syncpin", "confirm", mirror.toString(), "producer",
+                q.repo.producerPin(), "adopt", "true"), "admin"));
+        assertEquals("10", repin.getParam("status"), repin.getParams().toString());
         subscribe(q, s);
         cycle(q, s);
         assertEquals("from q", read(mirror.resolve("b.txt")));
-        // and p is now the unpinned one: its new file never lands
         write(scan.resolve("c.txt"), "p again");
         subscribe(p, s);
         cycle(p, s);
         assertFalse(Files.exists(mirror.resolve("c.txt")));
+        // reset: back to syncing nothing, never to whoever answers next
+        MsgEvent reset = s.call(TestRig.as(s.requestTo("syncpin", "confirm", mirror.toString(), "reset", "true"), "admin"));
+        assertEquals("10", reset.getParam("status"), reset.getParams().toString());
+        write(other.resolve("d.txt"), "q after the reset");
+        write(scan.resolve("e.txt"), "p after the reset");
+        subscribe(p, s);
+        cycle(p, s);
+        subscribe(q, s);
+        cycle(q, s);
+        assertFalse(Files.exists(mirror.resolve("d.txt")) || Files.exists(mirror.resolve("e.txt")), "a producer was taken after a reset");
+        // what q held here (a.txt, adopted from p, and b.txt) is kept, frozen, and shown with the command that hands it on
+        st = s.call("repostate");
+        assertTrue(st.getParam("pinned_producer").startsWith("none"), st.getParam("pinned_producer"));
+        assertEquals("2", st.getParam("orphaned_files"), st.getParams().toString());
+        assertTrue(st.getParam("orphaned_from").contains(q.repo.producerPin()), st.getParam("orphaned_from"));
+        assertTrue(st.getParam("orphaned_resolve").contains("adopt=true from="), st.getParam("orphaned_resolve"));
+        assertEquals("from p", read(mirror.resolve("a.txt")));
+        assertEquals("from q", read(mirror.resolve("b.txt")));
     }
 
     @Test

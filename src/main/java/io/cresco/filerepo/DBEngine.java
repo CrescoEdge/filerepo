@@ -387,6 +387,13 @@ public class DBEngine {
                 if (!has) {
                     try (Statement stmt = conn.createStatement()) {
                         stmt.executeUpdate(t[1]);
+                        if ("HOLDERIDS".equals(t[0])) {
+                            // a catalog from before: every producer whose claims it records (orphaned or not), unnamed
+                            try (Statement st = conn.createStatement()) {
+                                st.executeUpdate("INSERT INTO holderids (holder) SELECT DISTINCT CASE WHEN producer LIKE '~%'"
+                                        + " THEN SUBSTR(producer, 2) ELSE producer END FROM mirrored");
+                            }
+                        }
                         if ("HOLDERS".equals(t[0])) {
                             // a catalog from before holders were tracked: every producer it records was seen now
                             try (PreparedStatement ps = conn.prepareStatement("INSERT INTO holders (holder, last_seen)"
@@ -460,6 +467,7 @@ public class DBEngine {
             {"HELDCHANGE", "CREATE TABLE heldchange (pathhash varchar(200) primary key NOT NULL, filepath varchar(1000) NOT NULL,"
                     + " prevmd5 varchar(255), md5 varchar(255))"},
             {"REWRITTEN", "CREATE TABLE rewritten (pathhash varchar(200) primary key NOT NULL)"},
+            {"HOLDERIDS", "CREATE TABLE holderids (holder varchar(256) primary key NOT NULL, ident varchar(2000))"},
     };
 
     /**
@@ -946,6 +954,64 @@ public class DBEngine {
             ps.executeUpdate();
         } catch (Exception ex) {
             logger.error("orphanHolder error", ex);
+        }
+        return n;
+    }
+
+    /** Name a producer whose claims this mirror records (its identity, for repostate). */
+    public void nameHolder(String holder, String ident) {
+        try (Connection conn = ds.getConnection()) {
+            try (PreparedStatement up = conn.prepareStatement("UPDATE holderids SET ident = ? WHERE holder = ?")) {
+                up.setString(1, ident);
+                up.setString(2, holder);
+                if (up.executeUpdate() > 0) return;
+            }
+            try (PreparedStatement in = conn.prepareStatement("INSERT INTO holderids (holder, ident) VALUES (?,?)")) {
+                in.setString(1, holder);
+                in.setString(2, ident);
+                in.executeUpdate();
+            }
+        } catch (Exception ex) {
+            logger.error("nameHolder error", ex);
+        }
+    }
+
+    /** Every producer this mirror has recorded claims for: holder -> its identity (null when unknown). */
+    public Map<String, String> holderIds() {
+        Map<String, String> out = new java.util.LinkedHashMap<>();
+        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT holder, ident FROM holderids ORDER BY holder")) {
+            while (rs.next()) out.put(rs.getString(1), rs.getString(2));
+        } catch (Exception ex) {
+            logger.error("holderIds error", ex);
+        }
+        return out;
+    }
+
+    public void forgetHolderId(String holder) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM holderids WHERE holder = ?")) {
+            ps.setString(1, holder);
+            ps.executeUpdate();
+        } catch (Exception ex) {
+            logger.error("forgetHolderId error", ex);
+        }
+    }
+
+    /** The claims {@code holder} has (live or orphaned), counted up to {@code limit} (an index range, never a scan). */
+    public long claimCount(String holder, int limit) {
+        long n = 0;
+        for (String h : new String[]{holder, ORPHAN + holder}) {
+            try (Connection conn = ds.getConnection();
+                 PreparedStatement ps = conn.prepareStatement("SELECT 1 FROM mirrored WHERE producer = ? FETCH FIRST ? ROWS ONLY")) {
+                ps.setString(1, h);
+                ps.setInt(2, Math.max(1, limit));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) n++;
+                }
+            } catch (Exception ex) {
+                logger.error("claimCount error", ex);
+            }
         }
         return n;
     }
