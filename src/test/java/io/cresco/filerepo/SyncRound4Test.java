@@ -675,4 +675,16 @@ class SyncRound4Test {
         assertEquals(0, r.exec.proofs.get(), "streamfile read a file whose size is not the catalog's");
         assertTrue(ms < 2000, "refused in " + ms + " ms");
     }
+
+    @Test
+    void aSecondPluginOverTheProducersDirectoryStartsNothingAndHoldsNoKey() throws Exception {
+        TestRig p = producer("plugin-p", scan);
+        Path alias = Files.createSymbolicLink(tmp.resolve("alias"), scan);
+        TestRig twin = producer("plugin-twin", alias);
+        assertNotNull(twin.db.openError());
+        assertFalse(twin.repo.isScanScheduled(), "a plugin whose catalog is closed scans nothing");
+        assertNull(twin.repo.signingFingerprint(), "and never reads or makes the producer's key");
+        assertNotNull(p.repo.signingFingerprint());
+        assertTrue(twin.dataplaneSent.isEmpty() && twin.listeners.isEmpty(), "and neither broadcasts nor listens");
+    }
 }

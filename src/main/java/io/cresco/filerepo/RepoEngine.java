@@ -752,6 +752,8 @@ public class RepoEngine {
             return size() > 100_000;
         }
     });
+    // per pinned producer (holder): the last count of missing files said, and when
+    private final Map<String, long[]> refillLogged = new ConcurrentHashMap<>();
     final AtomicLong syncRefillAsked = new AtomicLong();
     final AtomicLong syncRefillOffered = new AtomicLong();
 
@@ -783,9 +785,16 @@ public class RepoEngine {
                 missing++;
                 if (wanted.size() < 100_000) wanted.add(c[1]);
             }
-            if (missing > 0) {
+            // said when it changes, and at most every ten minutes while it does not (a producer that is away, or no
+            // longer has the files: the names are asked for again at most once per sync_offer_timeout_ms)
+            long now = System.currentTimeMillis();
+            long[] last = refillLogged.get(holder);
+            if (missing > 0 && (last == null || last[0] != missing || now - last[1] > 600_000L)) {
+                refillLogged.put(holder, new long[]{missing, now});
                 logger.warn("mirror " + getRepoDir() + ": " + missing + " file(s) its producer delivered are gone from the"
                         + " directory: asking the producer to offer them again (nothing is deleted anywhere)");
+            } else if (missing == 0 && page.size() < refillBatch) {
+                refillLogged.remove(holder);
             }
         }
         requestRefills();
@@ -1146,6 +1155,11 @@ public class RepoEngine {
 
     public void start() {
 
+        if (dbEngine.openError() != null) {
+            // another plugin serves this directory (or its catalog failed): no scan, no broadcast, no subscription
+            logger.error("filerepo " + fileRepoName + ": no scan and no sync: " + dbEngine.openError());
+            return;
+        }
         if (liveRow != null) {
             // read-only and recreatable: nothing here is scanned, broadcast, offered or subscribed to
             logger.info("live-backed repository (row " + liveRow + "): no scan, no sync");
