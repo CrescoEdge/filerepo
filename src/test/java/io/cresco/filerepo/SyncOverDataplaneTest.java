@@ -559,6 +559,40 @@ class SyncOverDataplaneTest {
     }
 
     @Test
+    void subscribersThatWentAwayNeverStallTheOthersForMoreThanOneTimeout() throws Exception {
+        producer("sync_rpc_timeout_ms", "1500");
+        subscriber();
+        for (String id : new String[]{"plugin-d1", "plugin-d2", "plugin-d3"}) {
+            Map<String, Object> cfg = new HashMap<>();
+            cfg.put("filerepo_name", "fr");
+            cfg.put("repo_dir", Files.createDirectories(tmp.resolve("mirror-" + id)).toString());
+            TestRig r = new TestRig(tmp.resolve("agent"), cfg, null, id, fabric);
+            r.repo.start();
+            extra.add(r);
+        }
+        producer.repo.repoBroadcast("fr", "discover", 0);
+        for (String id : new String[]{"plugin-s", "plugin-d1", "plugin-d2", "plugin-d3"}) {
+            await(() -> producer.repo.isSubscriber(TestRig.REGION, TestRig.AGENT, id), id + " subscribed");
+        }
+        // three subscribers go away: their offers are never answered
+        fabric.dropRoute = m -> "repolistin".equals(m.getParam("action")) && m.getDstPlugin().startsWith("plugin-d");
+        Files.write(scan.resolve("a.txt"), "a".getBytes());
+        long t0 = System.nanoTime();
+        assertTrue(producer.repo.scanOnce());
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        // one after the other they would cost 3 x 1.5 s; concurrently, the slowest one
+        assertTrue(ms < 2_900, "the cycle took " + ms + " ms: the unanswered offers ran one after the other");
+        await(() -> Files.isRegularFile(mirror.resolve("a.txt")), "the subscriber still there received a.txt");
+        // the next cycle skips them (until they subscribe again) and costs nothing like a timeout
+        Files.write(scan.resolve("b.txt"), "b".getBytes());
+        t0 = System.nanoTime();
+        assertTrue(producer.repo.scanOnce());
+        ms = (System.nanoTime() - t0) / 1_000_000;
+        assertTrue(ms < 1_000, "the next cycle took " + ms + " ms");
+        await(() -> Files.isRegularFile(mirror.resolve("b.txt")), "b.txt arrived");
+    }
+
+    @Test
     void diffsBeyondTheBoundsAreRefusedAsBusy() throws Exception {
         subscriber("sync_pending_per_peer", "1", "sync_threads", "1", "sync_queue_max", "1");
         CountDownLatch release = new CountDownLatch(1);

@@ -26,6 +26,10 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -196,6 +200,10 @@ public class RepoEngine {
     // and at most sync_queue_max waiting (FR-D5). A diff that finds both full is refused as busy (status 11) and the
     // producer offers it again next cycle: back-pressure instead of an unbounded backlog.
     private final ThreadPoolExecutor syncPool;
+    // Offers go out to subscribers concurrently, at most sync_offer_threads at once: a cycle costs the slowest
+    // subscriber's answer, not the sum of all of them, so subscribers that went away (each costs one unanswered RPC,
+    // then is skipped until it subscribes again) never stall the scan or the others for more than one RPC timeout.
+    private final ThreadPoolExecutor offerPool;
 
     // ---- sync metrics ----
     final AtomicLong syncRejected = new AtomicLong();
@@ -278,6 +286,12 @@ public class RepoEngine {
                 new ThreadPoolExecutor.AbortPolicy());
         // let idle sync threads retire (core==max would otherwise keep them alive forever)
         syncPool.allowCoreThreadTimeOut(true);
+        int offerThreads = (int) clamp(longParam("sync_offer_threads", 8L), 1, 256);
+        // the queue is bounded by the subscribers (at most sync_max_peers): a cycle waits for every offer it started
+        offerPool = new ThreadPoolExecutor(offerThreads, offerThreads, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                r -> { Thread t = new Thread(r, "filerepo-offer"); t.setDaemon(true); return t; });
+        offerPool.allowCoreThreadTimeOut(true);
 
         if (liveTier != null) {
             List<String> known = new ArrayList<>();
@@ -536,6 +550,7 @@ public class RepoEngine {
             }
         }
         try { syncPool.shutdownNow(); } catch (Exception ex) { logger.error("syncPool shutdown error", ex); }
+        try { offerPool.shutdownNow(); } catch (Exception ex) { logger.error("offerPool shutdown error", ex); }
 
     }
 
@@ -981,13 +996,37 @@ public class RepoEngine {
      * subscriber that is new, cleared or that failed a file), paced.
      */
     private void offerAll(ScanResult result) {
-        for (ActiveSub s : new ArrayList<>(subscribers.values())) {
-            if (!s.reachable) continue;
+        List<ActiveSub> subs = new ArrayList<>();
+        for (ActiveSub s : subscribers.values()) if (s.reachable) subs.add(s);
+        if (subs.isEmpty()) return;
+        // one task per subscriber, run concurrently; the cycle ends when every one has (each is bounded: a page that is
+        // not answered within sync_rpc_timeout_ms ends that subscriber's turn)
+        List<Future<?>> turns = new ArrayList<>(subs.size());
+        for (ActiveSub s : subs) {
             try {
-                if (offerFresh(s, result)) offerTo(s);
-            } catch (Exception ex) {
-                logger.error("offer to " + s.key + " failed", ex);
+                turns.add(offerPool.submit(() -> offerOne(s, result)));
+            } catch (RejectedExecutionException shutDown) {
+                return;
             }
+        }
+        for (Future<?> f : turns) {
+            try {
+                f.get();
+            } catch (InterruptedException stop) {
+                for (Future<?> g : turns) g.cancel(true);
+                Thread.currentThread().interrupt();
+                return;
+            } catch (ExecutionException | CancellationException ex) {
+                logger.error("offer failed", ex);
+            }
+        }
+    }
+
+    private void offerOne(ActiveSub s, ScanResult result) {
+        try {
+            if (offerFresh(s, result)) offerTo(s);
+        } catch (Exception ex) {
+            logger.error("offer to " + s.key + " failed", ex);
         }
     }
 

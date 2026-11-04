@@ -399,6 +399,7 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_stream_idle_ms` | `30000` | A transfer with no frame for this long is cancelled and retried. |
 | `sync_stream_rounds` | `3` | Attempts per file, and rounds of re-requesting lost ranges. |
 | `sync_rpc_timeout_ms` | `30000` | Bound on a sync request (`repolistin`, `streamfile`). |
+| `sync_offer_threads` | `8` | Subscribers a producer offers to at once. A cycle costs the slowest subscriber's answer, not the sum: a subscriber that went away costs one unanswered offer (`sync_rpc_timeout_ms`), concurrently with the others, and is then skipped until it subscribes again. |
 | `sync_tombstone_ttl_ms` | `604800000` (7 days) | How long a confirmed delete is kept. |
 | `sync_delete_guard_fraction` | `0.10` | The mass-delete guard: a loss of more than one file and more than this fraction of the catalog is held. |
 | `sync_delete_guard_subtree_min` | `2` | A whole subtree that lost all its cataloged files, at least this many, is held. |
