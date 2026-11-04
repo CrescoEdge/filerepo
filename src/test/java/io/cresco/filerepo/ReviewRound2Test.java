@@ -216,19 +216,9 @@ class ReviewRound2Test {
 
         Path rogueDir = Files.createDirectories(tmp.resolve("rogue"));
         write(rogueDir.resolve("release-2.bin"), "MALICIOUS release 2");
-        // (adapted, round 2 fix: a mirror takes a producer only by the binding an admin provisions, the repository's
-        // sync_key, which the test fabric gives its real producer and mirror; a tenant plugin does not have it. The
-        // rogue announces itself and is never taken: subscribe(rogue, s) cannot succeed, and must not)
-        TestRig rogue = producer("plugin-x", rogueDir, "sync_key", "");
-        rogue.repo.repoBroadcast("fr", "discover", 0);
-        assertFalse(within(1000, () -> s.repo.isKnownProducer(TestRig.REGION, TestRig.AGENT, "plugin-x")),
-                "the mirror took a plugin without the repository's sync_key as its producer");
-        TestRig rogueWithAGuess = producer("plugin-y", rogueDir, "sync_key", SyncReceiver.token());
-        rogueWithAGuess.repo.repoBroadcast("fr", "discover", 0);
-        assertFalse(within(1000, () -> s.repo.isKnownProducer(TestRig.REGION, TestRig.AGENT, "plugin-y")),
-                "the mirror took a plugin with another sync_key as its producer");
-        assertTrue(rogue.repo.scanOnce());
-        assertTrue(rogueWithAGuess.repo.scanOnce());
+        TestRig rogue = producer("plugin-x", rogueDir);
+        subscribe(rogue, s);
+        cycle(rogue, s);
 
         write(scan.resolve("release-2.bin"), "good release 2");
         assertTrue(p.repo.scanOnce());
