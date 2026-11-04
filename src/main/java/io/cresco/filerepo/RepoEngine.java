@@ -57,6 +57,18 @@ public class RepoEngine {
     /** The sync protocol this filerepo speaks: a producer and its subscribers must speak the same one. */
     static final String SYNC_PROTO = "2";
 
+    /** What a producer signs of one offer (repolistin): the payloads by their SHA-256. */
+    static String[] offerParts(String name, String producer, String mirror, String transferId, String gen, String filesJson,
+                               String deletesJson) {
+        return new String[]{"repolistin", name, producer, mirror, transferId, gen, ProducerKey.digest(filesJson),
+                ProducerKey.digest(deletesJson)};
+    }
+
+    /** What a producer signs of its answer to a subscribe (reposubscribed). */
+    static String[] answerParts(String name, String producer, String mirror, String nonce, String gen, String dir, String epoch) {
+        return new String[]{"reposubscribed", name, producer, mirror, nonce, gen, dir, epoch};
+    }
+
     // one scan at a time (the scan timer's own re-entry guard)
     private AtomicBoolean inScan = new AtomicBoolean(false);
 
@@ -221,18 +233,25 @@ public class RepoEngine {
 
     /**
      * A producer's identity, as a mirror verifies it: the node it runs on, from the broker's stamp of its caller
-     * ({@code <tenant>/<region>/<agent>}, unforgeable by any other node), the repository name, and the directory it
-     * produces from on that node (its real path, as it reports it). Not the plugin id: a producer redeployed over the
-     * same directory is the same producer. Not anything a holder of a shared secret could claim.
+     * ({@code <tenant>/<region>/<agent>}, unforgeable by any other node), the repository name, and the fingerprint of the
+     * producer's own signing key ({@link ProducerKey}), proven by its signature over the mirror's fresh nonce: no other
+     * plugin, on that node or any other, can claim it without the key. Not the plugin id (a producer redeployed over the
+     * same directory keeps its key, and is the same producer), and not anything a holder of a shared secret could claim.
+     * The directory it reports producing from is kept for display only.
      */
     static final class Identity {
-        final String tenant, region, agent, repo, dir;
+        final String tenant, region, agent, repo;
+        /** The producer key's fingerprint (64 hex), or null for a round-3 identity (by directory), which pins nothing. */
+        final String key;
+        /** The directory the producer reported (display only), or a round-3 identity's directory. */
+        final String dir;
 
-        Identity(String tenant, String region, String agent, String repo, String dir) {
+        Identity(String tenant, String region, String agent, String repo, String key, String dir) {
             this.tenant = tenant == null ? "-" : tenant;
             this.region = region;
             this.agent = agent;
             this.repo = repo;
+            this.key = key;
             this.dir = dir;
         }
 
@@ -240,14 +259,24 @@ public class RepoEngine {
             return tenant + "/" + region + "/" + agent;
         }
 
-        /** The whole identity, as a pin records it. */
+        /** The whole identity, as a pin and a mirror's claims record it. */
         String full() {
-            return node() + "|" + repo + "|" + dir;
+            return node() + "|" + repo + "|" + (key != null ? "fp:" + key : dir);
         }
 
-        /** The key its claims are recorded under in a mirror. */
+        /**
+         * The key its claims are recorded under in a mirror: by its node, name and key (a mirror hears only producers of
+         * its own tenant); a round-3 identity (by directory) keeps the key its claims were recorded under then, so an
+         * admin can hand them on (syncpin adopt=true).
+         */
         String holder() {
+            if (key != null) return "k:" + DBEngine.sha256(region + "/" + agent + "|" + repo + "|" + key).substring(0, 40);
             return "n:" + DBEngine.sha256(full()).substring(0, 40);
+        }
+
+        /** As an admin pins it: {@code region/agent#fingerprint}. */
+        String pin() {
+            return region + "/" + agent + "#" + key;
         }
 
         static Identity parse(String full) {
@@ -256,50 +285,65 @@ public class RepoEngine {
             if (a.length != 3) return null;
             String[] n = a[0].split("/", 3);
             if (n.length != 3) return null;
-            return new Identity(n[0], n[1], n[2], a[1], a[2]);
+            if (a[2].startsWith("fp:")) return new Identity(n[0], n[1], n[2], a[1], a[2].substring(3), null);
+            return new Identity(n[0], n[1], n[2], a[1], null, a[2]);
         }
 
         @Override
         public String toString() {
-            return node() + ":" + dir;
+            return key != null ? pin() + (dir == null ? "" : " (" + dir + ")") : node() + ":" + dir + " (by directory)";
         }
     }
 
-    /** A producer pin: a node ({@code region/agent}, of this tenant), and optionally the directory it produces from. */
+    /** A producer pin: a node ({@code region/agent}, of this tenant) and the fingerprint of its producer key. */
     static final class Pin {
-        final String region, agent, dir;
+        final String region, agent, key;
 
-        Pin(String region, String agent, String dir) {
+        Pin(String region, String agent, String key) {
             this.region = region;
             this.agent = agent;
-            this.dir = dir;
+            this.key = key;
         }
 
-        /** {@code region/agent} or {@code region/agent:/its/directory}; null when malformed. */
+        static final java.util.regex.Pattern FINGERPRINT = java.util.regex.Pattern.compile("[0-9a-f]{64}");
+
+        /** {@code region/agent#fingerprint}; null when malformed (see {@link #why}). */
         static Pin parse(String spec) {
-            if (spec == null) return null;
+            return why(spec) == null ? make(spec) : null;
+        }
+
+        /** Why {@code spec} pins nothing, or null when it is a pin. */
+        static String why(String spec) {
+            if (spec == null || spec.trim().isEmpty()) return "it is empty";
             spec = spec.trim();
-            String dir = null;
-            int colon = spec.indexOf(':');
-            if (colon >= 0) {
-                dir = spec.substring(colon + 1).trim();
-                spec = spec.substring(0, colon).trim();
-                if (dir.isEmpty() || !dir.startsWith("/")) return null;
+            int hash = spec.indexOf('#');
+            if (hash < 0) {
+                return "it names no producer key: a pin is region/agent#<the producer's key fingerprint> (the producer's"
+                        + " repostate shows producer_pin); a node or a directory is no identity: any plugin there could claim it";
             }
-            String[] parts = spec.split("/");
-            // region/agent/pluginid, the round-2 form: the node is what is pinned now (a plugin id changes on redeploy)
-            if (parts.length == 3 && dir == null) return new Pin(parts[0], parts[1], null);
-            if (parts.length != 2 || parts[0].isEmpty() || parts[1].isEmpty()) return null;
-            return new Pin(parts[0], parts[1], dir);
+            String node = spec.substring(0, hash), fp = spec.substring(hash + 1).trim().toLowerCase(java.util.Locale.ROOT);
+            if (!FINGERPRINT.matcher(fp).matches()) return "the fingerprint is not 64 hex digits (SHA-256 of the producer's public key)";
+            String[] parts = node.trim().split("/");
+            if (parts.length != 2 || parts[0].isEmpty() || parts[1].isEmpty() || node.indexOf(':') >= 0) {
+                return "the node is not region/agent";
+            }
+            return null;
+        }
+
+        private static Pin make(String spec) {
+            spec = spec.trim();
+            int hash = spec.indexOf('#');
+            String[] parts = spec.substring(0, hash).trim().split("/");
+            return new Pin(parts[0], parts[1], spec.substring(hash + 1).trim().toLowerCase(java.util.Locale.ROOT));
         }
 
         boolean matches(Identity id) {
-            return region.equals(id.region) && agent.equals(id.agent) && (dir == null || dir.equals(id.dir));
+            return id != null && id.key != null && region.equals(id.region) && agent.equals(id.agent) && key.equals(id.key);
         }
 
         @Override
         public String toString() {
-            return region + "/" + agent + (dir == null ? "" : ":" + dir);
+            return region + "/" + agent + "#" + key;
         }
     }
 
@@ -307,11 +351,14 @@ public class RepoEngine {
     static final class KnownProducer {
         final Identity id;
         final boolean pinned;
+        // the key its offers are signed with; null only for a producer a test remembers by its address
+        final java.security.PublicKey key;
         volatile long lastSeen;
 
-        KnownProducer(Identity id, boolean pinned, long lastSeen) {
+        KnownProducer(Identity id, boolean pinned, java.security.PublicKey key, long lastSeen) {
             this.id = id;
             this.pinned = pinned;
+            this.key = key;
             this.lastSeen = lastSeen;
         }
 
@@ -478,16 +525,16 @@ public class RepoEngine {
         if (pinned != null && !pinned.trim().isEmpty()) {
             List<Pin> pins = new ArrayList<>();
             for (String p : pinned.split(",")) {
-                Pin pin = Pin.parse(p);
-                if (pin == null) {
-                    logger.error("sync_producers: '" + p.trim() + "' is not region/agent or region/agent:/directory; ignored");
+                if (p.trim().isEmpty()) continue;
+                String why = Pin.why(p);
+                if (why != null) {
+                    logger.error("sync_producers: '" + p.trim() + "' pins nothing: " + why);
                 } else {
-                    if (p.trim().split("/").length == 3 && p.indexOf(':') < 0) {
-                        logger.warn("sync_producers: '" + p.trim() + "' names a plugin id; the node " + pin
-                                + " is pinned (a plugin id changes when the producer is redeployed)");
-                    }
-                    pins.add(pin);
+                    pins.add(Pin.parse(p));
                 }
+            }
+            if (pins.isEmpty()) {
+                logger.error("sync_producers names no producer key: this mirror syncs nothing until it does");
             }
             configuredProducers = Collections.unmodifiableList(pins);
         } else {
@@ -500,6 +547,7 @@ public class RepoEngine {
             role = "none";
         }
         syncRole = role;
+        loadSigningKey();
 
         int syncThreads = (int) clamp(longParam("sync_threads", 8L), 1, 256);
         int syncQueue = (int) clamp(longParam("sync_queue_max", 64L), 1, 100_000);
@@ -673,9 +721,62 @@ public class RepoEngine {
         }
     }
 
+    // this producer's signing key (its identity to mirrors, with its node), from its state directory; null when this is
+    // not a producer, its catalog is not open (another plugin serves the directory), or the key could not be read
+    private volatile ProducerKey signingKey;
+    private volatile String signingKeyError;
+
+    /**
+     * Load this producer's signing key from the state directory, or make it there once. Only while this plugin holds the
+     * directory's lock (its catalog is open): a second plugin over the same directory never reads or makes it. A key that
+     * cannot be read is never replaced (the producer's identity is that key): the producer serves no mirror until an
+     * admin restores or removes it.
+     */
+    private void loadSigningKey() {
+        if (!isProducer()) return;
+        if (dbEngine.openError() != null || dbEngine.stateDir() == null) {
+            signingKeyError = "the catalog is not open";
+            return;
+        }
+        try {
+            ProducerKey.Loaded l = ProducerKey.loadOrCreate(dbEngine.stateDir());
+            signingKey = l.key;
+            Path file = dbEngine.stateDir().resolve(ProducerKey.FILE);
+            if (l.created) {
+                logger.warn("filerepo " + fileRepoName + ": made this producer's signing key " + file + " (owner-only). Pin it"
+                        + " on each mirror: sync_producers=" + plugin.getRegion() + "/" + plugin.getAgent() + "#" + l.key.fingerprint
+                        + " (or syncpin producer=...). Back it up with the state directory: a producer that loses it is a new"
+                        + " producer to its mirrors");
+            } else {
+                logger.info("filerepo " + fileRepoName + ": producer key " + l.key.fingerprint + " (" + file + ")");
+            }
+            if (l.tightened) {
+                logger.error("filerepo " + fileRepoName + ": the producer key " + file + " was readable by others: made"
+                        + " owner-only. If it may have been copied, replace it (remove the file, restart, re-pin every mirror)");
+            }
+        } catch (Exception ex) {
+            signingKeyError = ex.getMessage();
+            logger.error("filerepo " + fileRepoName + ": the producer key in " + dbEngine.stateDir() + " cannot be used ("
+                    + ex.getMessage() + "): this producer serves no mirror until an admin restores it (or removes it, and"
+                    + " re-pins every mirror to the new key)");
+        }
+    }
+
+    /** This producer's key fingerprint, or null. */
+    String signingFingerprint() {
+        ProducerKey k = signingKey;
+        return k == null ? null : k.fingerprint;
+    }
+
+    /** How a mirror pins this producer ({@code region/agent#fingerprint}), or null. */
+    String producerPin() {
+        ProducerKey k = signingKey;
+        return k == null ? null : plugin.getRegion() + "/" + plugin.getAgent() + "#" + k.fingerprint;
+    }
+
     /**
      * A key kept in the catalog (round 2's producer identity). It is no longer anyone's identity: mirrors know a
-     * producer by its stamped node and its directory. Kept for diagnostics.
+     * producer by its stamped node and its signing key. Kept for diagnostics.
      */
     String producerKey() {
         String k = producerKey;
@@ -1569,8 +1670,10 @@ public class RepoEngine {
     // ---- a mirror's held deletes: of content whose producer's claim was orphaned (silent for sync_holder_ttl_ms) ----
     private final Map<String, String[]> mirrorHeld = new ConcurrentHashMap<>();
     private volatile String mirrorHoldId;
+    // the held set's size as of its id: published after the id, so a reader that sees a hold sees its id
+    private volatile int mirrorHeldCount;
 
-    private void refreshMirrorHold() {
+    private synchronized void refreshMirrorHold() {
         List<DBEngine.Tombstone> set = new ArrayList<>();
         for (Map.Entry<String, String[]> e : new TreeMap<>(mirrorHeld).entrySet()) {
             set.add(new DBEngine.Tombstone(e.getKey(), e.getKey(), e.getValue()[0], 0));
@@ -1581,6 +1684,7 @@ public class RepoEngine {
                     + " was silent for sync_holder_ttl_ms); hold " + id + ". An admin releases them with releasedeletes");
         }
         mirrorHoldId = id;
+        mirrorHeldCount = set.size();
     }
 
     /**
@@ -1633,7 +1737,7 @@ public class RepoEngine {
 
     /** How many deletes are held: by the mass-delete guard (a producer), or of orphaned content (a mirror). */
     int getDeletesHeld() {
-        return isMirror() ? mirrorHeld.size() : guard.heldCount();
+        return isMirror() ? mirrorHeldCount : guard.heldCount();
     }
 
     /** The id of the held set (what releasedeletes names), or null. */
@@ -1756,14 +1860,24 @@ public class RepoEngine {
         String tid = epoch + "." + transferSeq.incrementAndGet();
         String gen = s.gen;
         pendingTransferMap.put(tid, new Offer(s.key, gen, pageFiles, pageDeletes));
+        ProducerKey key = signingKey;
+        if (key == null) {
+            pendingTransferMap.remove(tid);
+            return false;
+        }
         MsgEvent req = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, s.region, s.agent, s.plugin);
         req.setParam("action", "repolistin");
-        req.setCompressedParam("repolistin", gson.toJson(pageFiles));
-        if (!pageDeletes.isEmpty()) req.setCompressedParam("repodeletes", gson.toJson(pageDeletes));
+        String filesJson = gson.toJson(pageFiles);
+        String deletesJson = pageDeletes.isEmpty() ? null : gson.toJson(pageDeletes);
+        req.setCompressedParam("repolistin", filesJson);
+        if (deletesJson != null) req.setCompressedParam("repodeletes", deletesJson);
         req.setParam("transfer_id", tid);
         req.setParam("sync_proto", SYNC_PROTO);
         // the subscriber's generation this offer is for: a mirror cleared since refuses it
         req.setParam("sync_gen", gen);
+        // signed with this producer's key: what it offers and deletes, to whom, for which generation, in which transfer
+        req.setParam("sync_sig", key.sign(offerParts(fileRepoName, SyncAuth.addr(plugin.getRegion(), plugin.getAgent(),
+                plugin.getPluginID()), SyncAuth.addr(s.region, s.agent, s.plugin), tid, gen, filesJson, deletesJson)));
         MsgEvent reply = plugin.sendRPC(req, syncRpcTimeoutMs);
         if (reply == null) {
             logger.warn("subscriber " + s.key + " did not answer transfer " + tid + "; skipped until it subscribes again");
@@ -1919,6 +2033,7 @@ public class RepoEngine {
         String refusal = null;
         if (!isProducer()) refusal = "not a producer";
         else if (!fileRepoName.equals(name)) refusal = "a producer of another filerepo_name";
+        else if (signingKey == null) refusal = "this producer has no signing key (" + signingKeyError + "): see its log";
         else if (!SYNC_PROTO.equals(proto)) refusal = "sync protocol " + proto + " is not " + SYNC_PROTO + ": upgrade the subscriber";
         else if (gen == null || !gen.matches("[0-9a-f]{1,64}")) refusal = "no valid sync_gen";
         else if (nonce == null || !nonce.matches("[0-9a-f]{32}")) refusal = "no valid sync_nonce";
@@ -1974,10 +2089,15 @@ public class RepoEngine {
             logger.info("reposubscribe from " + key + " refused: " + refusal);
         } else {
             String dir = producerDir();
+            ProducerKey sk = signingKey;
             reply.setParam("producer_epoch", epoch);
-            // the directory this producer produces from: with the node of its stamped caller, its identity to mirrors
+            // the directory this producer produces from (shown to admins); its identity is its node and its key
             reply.setParam("producer_dir", dir);
             reply.setParam("sync_nonce", nonce);
+            reply.setParam("producer_pubkey", sk.publicB64);
+            reply.setParam("producer_key", sk.fingerprint);
+            // the proof: this producer's key signs the mirror's fresh nonce, both ends' stamped addresses and its generation
+            reply.setParam("producer_sig", sk.sign(answerParts(name, me, them, nonce, gen, dir, epoch)));
             if (syncKey != null) reply.setParam("sync_auth", SyncAuth.mac(syncKey, "reposubscribed", name, me, them, nonce, dir, gen));
             if (wasDropped) reply.setParam("notice", "dropped-for-lag");
         }
@@ -2093,23 +2213,27 @@ public class RepoEngine {
         }
     }
 
-    /** Remember a producer as verified and pinned, under an identity made from its address (tests). */
+    /**
+     * Tests only: remember a producer as verified and pinned, under an identity made from its address, with no key (its
+     * diffs are taken unsigned). Production knows a producer only from its signed answer ({@link #onSubscribed}), which
+     * always carries its key; nothing a message carries reaches this.
+     */
     void rememberProducer(String region, String agent, String pluginId) {
-        rememberProducer(region, agent, pluginId, new Identity("-", region, agent, fileRepoName, "/" + pluginId), true);
+        rememberProducer(region, agent, pluginId, new Identity("-", region, agent, fileRepoName, null, "/" + pluginId), true, null);
     }
 
-    /** Remember a verified producer: its identity, and whether it is this mirror's pinned producer. Bounded. */
-    void rememberProducer(String region, String agent, String pluginId, Identity id, boolean pinned) {
-        String key = peerKey(region, agent, pluginId);
+    /** Remember a verified producer: its identity, its key, and whether it is this mirror's pinned producer. Bounded. */
+    void rememberProducer(String region, String agent, String pluginId, Identity id, boolean pinned, java.security.PublicKey key) {
+        String addr = peerKey(region, agent, pluginId);
         long now = System.currentTimeMillis();
-        if (!knownProducers.containsKey(key) && knownProducers.size() >= syncMaxPeers) {
+        if (!knownProducers.containsKey(addr) && knownProducers.size() >= syncMaxPeers) {
             knownProducers.entrySet().removeIf(e -> now - e.getValue().lastSeen > peerTtlMs);
             if (knownProducers.size() >= syncMaxPeers) {
-                logger.warn("not taking producer " + key + ": already " + knownProducers.size() + " producers (sync_max_peers)");
+                logger.warn("not taking producer " + addr + ": already " + knownProducers.size() + " producers (sync_max_peers)");
                 return;
             }
         }
-        knownProducers.put(key, new KnownProducer(id, pinned, now));
+        knownProducers.put(addr, new KnownProducer(id, pinned, key, now));
         // a pinned producer heard from now: its claims are live (an orphaned claim is not taken back by this; see decide)
         if (pinned) dbEngine.touchHolder(id.holder(), now);
     }
@@ -2145,7 +2269,8 @@ public class RepoEngine {
                 logger.warn("filerepo " + fileRepoName + ": pinned its producer " + id + " (trust on first use). Only it"
                         + " may add, change or delete files here; an admin changes the pin with syncpin, or sets sync_producers");
             }
-            return tofuPin.full().equals(id.full());
+            return tofuPin.key != null && tofuPin.region.equals(id.region) && tofuPin.agent.equals(id.agent)
+                    && tofuPin.key.equals(id.key);
         }
     }
 
@@ -2157,7 +2282,7 @@ public class RepoEngine {
     }
 
     /**
-     * syncpin (an admin's): pin {@code spec} ({@code region/agent:/directory}) as this mirror's producer, replacing the
+     * syncpin (an admin's): pin {@code spec} ({@code region/agent#fingerprint}) as this mirror's producer, replacing the
      * pin taken on first use, or (spec null) forget that pin, so the next verified producer is pinned. With
      * {@code adopt}, what the previous producer delivered here becomes the new one's; otherwise its claims are orphaned:
      * kept, protected from deletes, changed by nobody but it. A new generation follows: the producer offers everything.
@@ -2167,13 +2292,14 @@ public class RepoEngine {
         if (configuredProducers != null) return "this mirror's producers come from sync_producers (configuration)";
         Identity next = null;
         if (spec != null) {
+            String why = Pin.why(spec);
+            if (why != null) return "producer must be region/agent#<its key fingerprint>: " + why;
             Pin pin = Pin.parse(spec);
-            if (pin == null || pin.dir == null) return "producer must be region/agent:/its/directory";
             String tenant = null;
             try {
                 tenant = plugin.getAgentService().getTenant();
             } catch (Exception ignore) { }
-            next = new Identity(tenant, pin.region, pin.agent, fileRepoName, pin.dir);
+            next = new Identity(tenant, pin.region, pin.agent, fileRepoName, pin.key, null);
         }
         Identity before = tofuPin;
         try {
@@ -2346,13 +2472,27 @@ public class RepoEngine {
             return;
         }
         a.nonce = null;   // one answer per ask
-        Identity id = new Identity(Callers.tenant(m, insecure), from[0], from[1], fileRepoName, dir);
-        boolean pinned = isPinnedProducer(id);
+        // the producer's key, proven by its signature over this ask's nonce, both stamped addresses and this
+        // generation. An answer without it (another plugin on the producer's agent claiming its directory, a key holder
+        // replaying an answer, a filerepo of an earlier build) names no key: it is known, never pinned, and nothing it
+        // offers or deletes is taken
+        java.security.PublicKey pk = ProducerKey.publicKey(m.getParam("producer_pubkey"));
+        boolean signed = pk != null && ProducerKey.verify(pk, m.getParam("producer_sig"), answerParts(fileRepoName,
+                SyncAuth.addr(from[0], from[1], from[2]), SyncAuth.addr(plugin.getRegion(), plugin.getAgent(), plugin.getPluginID()),
+                nonce, syncGen, dir, m.getParam("producer_epoch")));
+        Identity id = new Identity(Callers.tenant(m, insecure), from[0], from[1], fileRepoName,
+                signed ? ProducerKey.fingerprint(pk.getEncoded()) : null, dir);
+        if (!signed) {
+            syncUnverified.incrementAndGet();
+            logger.warn("reposubscribed from " + key + " names no producer key (no valid P-384 signature over this ask):"
+                    + " it is never this mirror's producer");
+        }
+        boolean pinned = signed && isPinnedProducer(id);
         if (!pinned) {
             unpinnedSeen.put(id.full(), System.currentTimeMillis());
             warnUnpinned(id);
         }
-        rememberProducer(from[0], from[1], from[2], id, pinned);
+        rememberProducer(from[0], from[1], from[2], id, pinned, signed ? pk : null);
         if ("dropped-for-lag".equals(m.getParam("notice"))) {
             logger.error("producer " + key + " had dropped this mirror for lagging: it may hold files deleted at the"
                     + " producer since; clear it (clearrepo) to make it exact");
@@ -2370,7 +2510,7 @@ public class RepoEngine {
     }
 
     public void getFileRepoDiff(String repoDiffString, String transferId, String region, String agent, String pluginId) {
-        acceptDiff(repoDiffString, null, transferId, syncGen, region, agent, pluginId);
+        acceptDiff(repoDiffString, null, transferId, syncGen, null, region, agent, pluginId);
     }
 
     /**
@@ -2378,14 +2518,24 @@ public class RepoEngine {
      * sync_pending_per_peer waiting per producer and sync_max_peers producers at once, on a bounded pool. Anything over
      * a bound is refused as busy, and the producer offers it again next cycle.
      */
-    Accepted acceptDiff(String filesJson, String deletesJson, String transferId, String gen, String region, String agent,
-                        String pluginId) {
+    Accepted acceptDiff(String filesJson, String deletesJson, String transferId, String gen, String sig, String region,
+                        String agent, String pluginId) {
         String repoId = peerKey(region, agent, pluginId);
         KnownProducer kp = knownProducer(region, agent, pluginId);
         if (kp == null) {
             syncRefused.incrementAndGet();
             logger.warn("diff " + transferId + " from " + repoId + " refused: not a verified producer this repository subscribed to");
             return new Accepted("9", "refused: not a verified producer this repository subscribed to");
+        }
+        // signed by the key that producer proved when it answered: what it offers and deletes, to this mirror, for this
+        // generation, in this transfer. (A producer that proved no key is never pinned: its offers are refused whole
+        // below. Only a test remembers a pinned producer without a key.)
+        if (kp.key != null && !ProducerKey.verify(kp.key, sig, offerParts(fileRepoName, SyncAuth.addr(region, agent, pluginId),
+                SyncAuth.addr(plugin.getRegion(), plugin.getAgent(), plugin.getPluginID()), transferId, gen, filesJson, deletesJson))) {
+            syncRefused.incrementAndGet();
+            syncUnverified.incrementAndGet();
+            logger.warn("diff " + transferId + " from " + repoId + " refused: not signed by the producer key " + kp.id.key);
+            return new Accepted("9", "refused: not signed by the producer's key");
         }
         String current = syncGen;
         if (gen == null || !gen.equals(current)) {
@@ -2937,6 +3087,16 @@ public class RepoEngine {
         facts.put("backing", "local");
         if (!subscriber) {
             facts.put("role", fileScanTimer != null ? "producer" : "on-demand");
+            if (isProducer()) {
+                // what an admin pins on each mirror (sync_producers, or syncpin producer=...)
+                String pin = producerPin();
+                if (pin != null) {
+                    facts.put("producer_key", signingFingerprint());
+                    facts.put("producer_pin", pin);
+                } else {
+                    facts.put("producer_key_error", String.valueOf(signingKeyError));
+                }
+            }
             if (getDeletesHeld() > 0) {
                 facts.put("deletes_held", String.valueOf(getDeletesHeld()));
                 facts.put("deletes_hold_id", String.valueOf(getHoldId()));
@@ -2954,9 +3114,11 @@ public class RepoEngine {
         String pin = pinnedProducers();
         facts.put("pinned_producer", pin == null ? "none yet (the first verified producer will be pinned)" : pin);
         if (!unpinnedSeen.isEmpty()) facts.put("unpinned_producers", String.valueOf(unpinnedSeen.size()));
-        if (!mirrorHeld.isEmpty()) {
-            facts.put("deletes_held", String.valueOf(mirrorHeld.size()));
-            facts.put("deletes_hold_id", String.valueOf(mirrorHoldId));
+        String mirrorHold = mirrorHoldId;
+        int mirrorHolding = mirrorHeldCount;
+        if (mirrorHolding > 0 && mirrorHold != null) {
+            facts.put("deletes_held", String.valueOf(mirrorHolding));
+            facts.put("deletes_hold_id", mirrorHold);
         }
         boolean hasLanded = isLanded() || dbEngine.hasFiles();
         facts.put("landed", String.valueOf(hasLanded));

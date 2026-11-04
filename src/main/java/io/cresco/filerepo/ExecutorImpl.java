@@ -139,11 +139,11 @@ import io.cresco.library.capability.*;
                   @CrescoParam(name = "hold_id", required = true, description = "the held set to release (repostate deletes_hold_id); refused if it changed")},
         returns = @CrescoReturn(name = "released", description = "how many held deletes the next scan records, if it finds exactly that set")),
     @CrescoAction(name = "syncpin", type = "EXEC", roles = {"infra", "admin"},
-        summary = "Pin a mirror's producer (region/agent:/its/directory), replacing the one trusted on first use, or forget " +
-                  "that pin (reset=true). With adopt=true what the previous producer delivered becomes the new one's.",
+        summary = "Pin a mirror's producer (region/agent#<its key fingerprint>), replacing the one trusted on first use, or " +
+                  "forget that pin (reset=true). With adopt=true what the previous producer delivered becomes the new one's.",
         why = "Move a mirror to another producer, or re-pin after the producer moved.",
         params = {@CrescoParam(name = "confirm", required = true, description = "this repository's directory, exactly"),
-                  @CrescoParam(name = "producer", description = "region/agent:/the/producer's/directory"),
+                  @CrescoParam(name = "producer", description = "region/agent#<fingerprint> (the producer's repostate producer_pin)"),
                   @CrescoParam(name = "reset", type = "boolean", description = "forget the pin: the next verified producer is pinned"),
                   @CrescoParam(name = "adopt", type = "boolean", description = "hand the previous producer's claims to the new one")},
         returns = @CrescoReturn(name = "pinned_producer", description = "the pin now")),
@@ -1524,7 +1524,7 @@ public class ExecutorImpl implements Executor {
     }
 
     /**
-     * syncpin (a mirror's admin): pin this mirror's producer ({@code producer=region/agent:/its/directory}), or with
+     * syncpin (a mirror's admin): pin this mirror's producer ({@code producer=region/agent#fingerprint}), or with
      * {@code reset=true} forget the pin taken on first use so the next verified producer is pinned; {@code adopt=true}
      * hands what the previous producer delivered to the new one. Confirmed like clearrepo.
      */
@@ -1545,7 +1545,7 @@ public class ExecutorImpl implements Executor {
         String producer = incoming.getParam("producer");
         if (reset == (producer != null)) {
             incoming.setParam("status","8");
-            incoming.setParam("status_desc","give producer=region/agent:/its/directory, or reset=true");
+            incoming.setParam("status_desc","give producer=region/agent#<its key fingerprint>, or reset=true");
             return incoming;
         }
         String why = repoEngine.syncPin(reset ? null : producer, "true".equalsIgnoreCase(incoming.getParam("adopt")));
@@ -1922,7 +1922,7 @@ public class ExecutorImpl implements Executor {
             } else if((repoListStringIn != null) && (transferId != null)) {
 
                 RepoEngine.Accepted accepted = repoEngine.acceptDiff(repoListStringIn, deletesIn, transferId,
-                        incoming.getParam("sync_gen"), from[0], from[1], from[2]);
+                        incoming.getParam("sync_gen"), incoming.getParam("sync_sig"), from[0], from[1], from[2]);
                 incoming.setParam("status_code", accepted.code);
                 incoming.setParam("status_desc", accepted.desc);
 

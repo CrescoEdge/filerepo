@@ -129,7 +129,7 @@ class SyncRound2Test {
         cycle(p, s);
         assertEquals("from p", read(mirror.resolve("a.txt")));
         String pin = s.call("repostate").getParam("pinned_producer");
-        assertTrue(pin.contains(TestRig.REGION + "/" + TestRig.AGENT) && pin.endsWith(scan.toString()), pin);
+        assertTrue(pin.startsWith(p.repo.producerPin()), pin);
         // another producer of the name: verified, known, but not pinned: nothing it offers lands
         Path other = Files.createDirectories(tmp.resolve("other"));
         write(other.resolve("b.txt"), "from q");
@@ -139,10 +139,13 @@ class SyncRound2Test {
         assertFalse(Files.exists(mirror.resolve("b.txt")), "an unpinned producer added a file");
         assertEquals("1", s.call("repostate").getParam("unpinned_producers"));
         // an admin re-pins the mirror to q, handing it what p delivered: a new generation, q offers everything
-        assertEquals("unconfirmed", s.call(TestRig.as(s.requestTo("syncpin", "producer",
+        assertEquals("unconfirmed", s.call(TestRig.as(s.requestTo("syncpin", "producer", q.repo.producerPin()), "admin"))
+                .getParam("refusal"));
+        // a directory is no identity: a pin names the producer's key
+        assertEquals("pin", s.call(TestRig.as(s.requestTo("syncpin", "confirm", mirror.toString(), "producer",
                 TestRig.REGION + "/" + TestRig.AGENT + ":" + other), "admin")).getParam("refusal"));
         MsgEvent pinned = s.call(TestRig.as(s.requestTo("syncpin", "confirm", mirror.toString(), "producer",
-                TestRig.REGION + "/" + TestRig.AGENT + ":" + other, "adopt", "true"), "admin"));
+                q.repo.producerPin(), "adopt", "true"), "admin"));
         assertEquals("10", pinned.getParam("status"), pinned.getParams().toString());
         subscribe(q, s);
         cycle(q, s);
@@ -181,8 +184,7 @@ class SyncRound2Test {
     void aKeyedProducerServesOnlyMirrorsThatHoldTheKey() throws Exception {
         TestRig p = producer("plugin-p", scan);
         // pinned to the producer, so it asks; but it has another key
-        TestRig s = subscriber("plugin-s", mirror, "sync_key", SyncReceiver.token(),
-                "sync_producers", TestRig.REGION + "/" + TestRig.AGENT + "/plugin-p");
+        TestRig s = subscriber("plugin-s", mirror, "sync_key", SyncReceiver.token(), "sync_producers", p.repo.producerPin());
         MsgEvent sub = s.requestTo("reposubscribe", "filerepo_name", "fr", "sync_gen", "abc", "sync_proto", RepoEngine.SYNC_PROTO,
                 "sync_nonce", SyncReceiver.token(), "sync_auth", "00");
         Fabric.stamp(sub, "plugin-s");
@@ -196,8 +198,7 @@ class SyncRound2Test {
     @Test
     void producersPinnedByAnAdminSyncWithoutAKey() throws Exception {
         TestRig p = producer("plugin-p", scan, "sync_key", "");
-        TestRig s = subscriber("plugin-s", mirror, "sync_key", "",
-                "sync_producers", TestRig.REGION + "/" + TestRig.AGENT + ":" + scan);
+        TestRig s = subscriber("plugin-s", mirror, "sync_key", "", "sync_producers", p.repo.producerPin());
         write(scan.resolve("a.txt"), "pinned");
         subscribe(p, s);
         cycle(p, s);
@@ -314,19 +315,20 @@ class SyncRound2Test {
 
     @Test
     void anotherPinnedProducerNeverReplacesOrphanedContent() throws Exception {
-        // two producers pinned by node (no directory): co-producers of the name
+        // two producers pinned by their keys: co-producers of the name
         TestRig p = producer("plugin-p", scan);
-        TestRig s = subscriber("plugin-s", mirror, "sync_producers", TestRig.REGION + "/" + TestRig.AGENT);
-        write(scan.resolve("model.bin"), "v1");
-        subscribe(p, s);
-        cycle(p, s);
         Path other = Files.createDirectories(tmp.resolve("other"));
         write(other.resolve("model.bin"), "q's");
         TestRig q = producer("plugin-q", other);
+        TestRig s = subscriber("plugin-s", mirror, "sync_producers", p.repo.producerPin() + "," + q.repo.producerPin());
+        write(scan.resolve("model.bin"), "v1");
+        subscribe(p, s);
+        cycle(p, s);
         subscribe(q, s);
         // p goes silent beyond the holder TTL (q is heard from): its content is orphaned, and q may still not replace it
         String pHolder = s.db.holdings("model.bin").keySet().iterator().next();
-        String qHolder = new RepoEngine.Identity(Fabric.TENANT, TestRig.REGION, TestRig.AGENT, "fr", other.toString()).holder();
+        String qHolder = new RepoEngine.Identity(Fabric.TENANT, TestRig.REGION, TestRig.AGENT, "fr", q.repo.signingFingerprint(),
+                null).holder();
         s.db.touchHolder(qHolder, System.currentTimeMillis() + 60_000L);
         assertEquals(List.of(pHolder), s.repo.orphanSilentProducers(System.currentTimeMillis() + 1));
         assertTrue(s.repo.isKnownProducer(TestRig.REGION, TestRig.AGENT, "plugin-q"), "precondition: q is still a live producer");
