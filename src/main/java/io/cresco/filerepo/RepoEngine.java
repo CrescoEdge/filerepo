@@ -233,18 +233,24 @@ public class RepoEngine {
         }
     });
     private final Map<String, Long> lagAlarmed = new ConcurrentHashMap<>();
-    // producers of this name that answered and are not this mirror's pinned producer (bounded): for repostate (the
-    // candidates an admin may pin) and warnings; identity -> when last heard from
-    private final Map<String, Long> unpinnedSeen = Collections.synchronizedMap(new LinkedHashMap<String, Long>() {
-        protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
-            return size() > 256;
+    /** A producer of this name that answered and is not this mirror's pinned producer: what repostate lists. */
+    static final class Candidate {
+        final Identity id;
+        final long firstSeen;
+        final AtomicLong answers = new AtomicLong();
+
+        Candidate(Identity id, long firstSeen) {
+            this.id = id;
+            this.firstSeen = firstSeen;
         }
-    });
-    private final Map<String, Identity> unpinnedIds = Collections.synchronizedMap(new LinkedHashMap<String, Identity>() {
-        protected boolean removeEldestEntry(Map.Entry<String, Identity> eldest) {
-            return size() > 256;
-        }
-    });
+    }
+
+    static final int MAX_CANDIDATES = 64;
+    // since this plugin started: identity -> when first heard, and how often it answered. Bounded: once full, a new
+    // identity is not recorded (counted in candidatesOmitted), so a stream of new answers never pushes out the ones
+    // first seen
+    private final Map<String, Candidate> candidates = new ConcurrentHashMap<>();
+    final AtomicLong candidatesOmitted = new AtomicLong();
     private final Map<String, Long> unpinnedWarned = Collections.synchronizedMap(new LinkedHashMap<String, Long>() {
         protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
             return size() > 256;
@@ -2673,8 +2679,6 @@ public class RepoEngine {
         refillCursor.clear();
         knownProducers.clear();
         attempts.clear();
-        unpinnedSeen.clear();
-        unpinnedIds.clear();
         syncGen = newGen();
         writeGenerationMarker();
     }
@@ -2841,8 +2845,12 @@ public class RepoEngine {
         }
         boolean pinned = signed && isPinnedProducer(id);
         if (!pinned) {
-            unpinnedSeen.put(id.full(), System.currentTimeMillis());
-            unpinnedIds.put(id.full(), id);
+            Candidate cand = candidates.get(id.full());
+            if (cand == null && candidates.size() < MAX_CANDIDATES) {
+                cand = candidates.computeIfAbsent(id.full(), k -> new Candidate(id, System.currentTimeMillis()));
+            }
+            if (cand != null) cand.answers.incrementAndGet();
+            else candidatesOmitted.incrementAndGet();
             warnUnpinned(id);
         }
         rememberProducer(from[0], from[1], from[2], id, pinned, signed ? pk : null);
@@ -3508,17 +3516,20 @@ public class RepoEngine {
         String pin = pinnedProducers();
         facts.put("pinned_producer", pin == null ? "none: this mirror syncs nothing until an admin pins its producer"
                 + " (sync_producers=region/agent#<fingerprint>, or syncpin producer=...)" : pin);
-        if (!unpinnedSeen.isEmpty()) facts.put("unpinned_producers", String.valueOf(unpinnedSeen.size()));
-        // the producers that answered and proved a key, most recent first: what an admin may pin
-        List<String> candidates = new ArrayList<>();
-        synchronized (unpinnedIds) {
-            List<Identity> ids = new ArrayList<>(unpinnedIds.values());
-            Collections.reverse(ids);
-            for (Identity id : ids) {
-                if (id.key != null && candidates.size() < 8 && !candidates.contains(id.toString())) candidates.add(id.toString());
-            }
+        if (!candidates.isEmpty()) facts.put("unpinned_producers", String.valueOf(candidates.size()));
+        if (candidatesOmitted.get() > 0) facts.put("candidates_omitted", String.valueOf(candidatesOmitted.get()));
+        // the producers that answered and proved a key, in the order this mirror first heard them (an answer repeated
+        // moves nothing up), with when and how often: what an admin may pin, once it has checked the fingerprint
+        // against the producer's own log or repostate
+        List<Candidate> seen = new ArrayList<>(candidates.values());
+        seen.sort(Comparator.comparingLong((Candidate cd) -> cd.firstSeen).thenComparing(cd -> cd.id.full()));
+        List<String> listed = new ArrayList<>();
+        for (Candidate cd : seen) {
+            if (cd.id.key == null || isPinnedProducer(cd.id) || listed.size() >= 8) continue;
+            listed.add(cd.id.pin() + " (" + (cd.id.dir == null ? "" : cd.id.dir + "; ") + "first seen "
+                    + java.time.Instant.ofEpochMilli(cd.firstSeen) + ", " + cd.answers.get() + " answer(s))");
         }
-        if (!candidates.isEmpty()) facts.put("candidate_producers", String.join(", ", candidates));
+        if (!listed.isEmpty()) facts.put("candidate_producers", String.join(", ", listed));
         orphanedFacts(facts);
         String mirrorHold = mirrorHoldId;
         int mirrorHolding = mirrorHeldCount;

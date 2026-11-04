@@ -19,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * The round-5 design beyond the review's own tests: every delete counts against the day and the total (additions never
- * enlarge their base, and join it once a day old), rolling retention, a bounded ledger.
+ * enlarge their base, and join it once a day old), rolling retention, a bounded ledger, candidates by first seen.
  */
 class SyncRound5Test {
 
@@ -235,5 +235,30 @@ class SyncRound5Test {
         for (int i = 60; i < 70; i++) Files.delete(scan.resolve("f" + i));
         scanned(p);
         assertEquals(0, p.repo.getDeletesHeld());
+    }
+
+    // =================================================================== candidates
+
+    @Test
+    void candidatesAreListedByFirstSeenWithHowOftenTheyAnswered() throws Exception {
+        TestRig p = producer("plugin-p", scan, "sync_key", "");
+        TestRig s = subscriber("plugin-s", mirror, "sync_key", "", "sync_producers", "",
+                "sync_subscribe_retry_ms", "100");
+        p.repo.repoBroadcast("fr", "discover", 0);
+        await(() -> s.repo.isKnownProducer(TestRig.REGION, TestRig.AGENT, "plugin-p"), "p answered");
+        Path rogueDir = Files.createDirectories(tmp.resolve("rogue"));
+        write(rogueDir.resolve("x"), "x");
+        TestRig x = producer("plugin-x", rogueDir, "sync_key", "");
+        // the rogue keeps answering
+        for (int i = 0; i < 5; i++) {
+            x.repo.repoBroadcast("fr", "discover", 0);
+            Thread.sleep(150);
+        }
+        await(() -> s.repo.isKnownProducer(TestRig.REGION, TestRig.AGENT, "plugin-x"), "x answered");
+        String listed = s.call("repostate").getParam("candidate_producers");
+        int pAt = listed.indexOf(p.repo.producerPin()), xAt = listed.indexOf(x.repo.producerPin());
+        assertTrue(pAt >= 0 && xAt > pAt, "first seen first, whoever answers since: " + listed);
+        assertTrue(listed.contains("first seen ") && listed.contains("answer(s)"), listed);
+        assertTrue(listed.substring(xAt).matches("(?s).*\\b[2-9] answer\\(s\\).*"), "x answered more than once: " + listed);
     }
 }

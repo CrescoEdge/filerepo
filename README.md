@@ -116,8 +116,11 @@ mirror with no pin **syncs nothing**:
   `producer=region/agent#<fingerprint>`); the pin is kept in the catalog. Nothing is ever pinned because it answered,
   first or at all. Without `sync_producers` and before a `syncpin`, the mirror syncs nothing: it still asks the producers
   of its name, and `repostate` lists those that answered and proved a key as `candidate_producers`
-  (`region/agent#<fingerprint> (directory)`), for the admin to choose from (a WARN an hour per producer names the
-  `syncpin` command too). `syncpin reset=true` forgets the pin: the mirror syncs nothing again until an admin pins one.
+  (`region/agent#<fingerprint> (directory; first seen <time>, <n> answer(s))`), in the order this mirror first heard
+  them since it started (answering again moves nothing up; at most 64 are kept, later ones are counted in
+  `candidates_omitted`, never pushing out the first). A candidate is whoever answered, not a recommendation: **take the
+  fingerprint from the producer's own log or its `repostate` (`producer_pin`) on the producer's agent**, and pin that.
+  A WARN an hour per producer names the `syncpin` command too. `syncpin reset=true` forgets the pin: the mirror syncs nothing again until an admin pins one.
   Changing the pin, or resetting it, orphans what the old producer delivered (kept, never deleted, changed by nobody
   else) unless `adopt=true` hands it to the new producer (`from=` names the old producer, a pin or the holder
   `repostate` shows, when it is not the previous pin). A new generation follows, so the new producer offers everything.
