@@ -52,6 +52,7 @@ class AuthorizationTest {
         assertEquals(privileged, roles.get("putfilesremote"));
         assertEquals(privileged, roles.get("releasedeletes"));
         assertEquals(privileged, roles.get("releaserewrites"));
+        assertEquals(privileged, roles.get("syncpin"));
         // a lease extension as the node itself
         assertEquals(privileged, roles.get("liverealise"));
         // sync messages come from another filerepo
@@ -63,7 +64,7 @@ class AuthorizationTest {
                 "streamfilecancel", "getscandir", "repostate", "liverelay", "getmetrics", "getcapabilities"}) {
             assertEquals(Set.of(), roles.get(open), open);
         }
-        assertEquals(23, roles.size(), "every action is declared: " + roles.keySet());
+        assertEquals(24, roles.size(), "every action is declared: " + roles.keySet());
     }
 
     @Test

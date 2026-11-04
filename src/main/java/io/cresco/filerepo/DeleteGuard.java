@@ -28,7 +28,12 @@ import java.util.Set;
  *   <li>everything, when the loss (beyond the above) is at least {@code min} files AND more than {@code fraction} of
  *   the catalog, counting the deletes recorded within the last {@code windowMs} too: a loss spread over several cycles
  *   (a deletion still running when a scan reads the tree, a slow drip) is held once it adds up, so what gets through
- *   unheld is bounded by the threshold.</li>
+ *   unheld is bounded by the threshold;</li>
+ *   <li>everything, when the deletes recorded within the last 24 hours, with this cycle's, are at least {@code min}
+ *   AND more than {@code dayFraction} of the catalog: a slower drip, under the short window's threshold, is held
+ *   within a day;</li>
+ *   <li>everything, when the catalog would shrink by more than {@code totalFraction} of the most it held since the last
+ *   admin acknowledgement (a release): however slowly it is drained, never past that without an admin.</li>
  * </ul>
  * What is held is identified by a digest of exactly those deletes. An admin's release must name that digest, is
  * spent by the next evaluation whatever it finds, and expires: it never applies to a later or another loss.
@@ -60,6 +65,13 @@ final class DeleteGuard {
     private final long windowMs;
     // deletes recorded (not held) recently: {when, how many}, oldest first
     private final java.util.ArrayDeque<long[]> recent = new java.util.ArrayDeque<>();
+    static final long DAY_MS = 24L * 3600 * 1000;
+    private double dayFraction;
+    private double totalFraction;
+    // deletes recorded within the last 24 hours: {when, how many}
+    private final java.util.ArrayDeque<long[]> day = new java.util.ArrayDeque<>();
+    // the most files the catalog held since the last admin acknowledgement (kept in the catalog by the caller)
+    private volatile long baseline;
 
     // the hold now in force (from the last evaluation), and an admin's armed release
     private volatile String holdId;
@@ -78,6 +90,35 @@ final class DeleteGuard {
         this.subtreeFraction = subtreeFraction;
         this.releaseTtlMs = releaseTtlMs;
         this.windowMs = Math.max(0L, windowMs);
+    }
+
+    /** The longer-horizon budgets: deletes within a rolling day, and the total shrink since an admin's acknowledgement. */
+    synchronized void setBudgets(double dayFraction, double totalFraction) {
+        // a day allows at least what one window does, and the total at least what a day does (0 turns one off)
+        this.dayFraction = dayFraction <= 0 ? 0 : Math.max(dayFraction, fraction);
+        this.totalFraction = totalFraction <= 0 ? 0 : Math.max(totalFraction, Math.max(this.dayFraction, fraction));
+    }
+
+    /** The catalog's high-water mark since the last acknowledgement (to keep, and to restore after a restart). */
+    long baseline() {
+        return baseline;
+    }
+
+    synchronized void setBaseline(long b) {
+        baseline = Math.max(0, b);
+    }
+
+    private int recordedToday(long now) {
+        while (!day.isEmpty() && now - day.peekFirst()[0] > DAY_MS) day.pollFirst();
+        int n = 0;
+        for (long[] r : day) n += (int) r[1];
+        return n;
+    }
+
+    private void noteRecorded(long now, int n) {
+        if (n <= 0) return;
+        if (windowMs > 0) recent.addLast(new long[]{now, n});
+        day.addLast(new long[]{now, n});
     }
 
     /** Deletes recorded within the window before {@code now}. */
@@ -178,11 +219,23 @@ final class DeleteGuard {
         int loss = rest + earlier;
         // at least min files and more than the fraction of the catalog (as it was before the window's deletes)
         boolean large = loss >= min && loss > fraction * (catalogUnderRoot.size() + earlier);
-        if (empty || (rest > 0 && large)) {
+        // the longer horizons: a rolling day, and the shrink since the last acknowledgement
+        int today = dayFraction > 0 ? recordedToday(now) : 0;
+        int dayLoss = rest + today;
+        boolean dayLarge = dayFraction > 0 && dayLoss >= min && dayLoss > dayFraction * (catalogUnderRoot.size() + today);
+        baseline = Math.max(baseline, catalogUnderRoot.size());
+        long shrink = baseline - (catalogUnderRoot.size() - rest);
+        boolean totalLarge = totalFraction > 0 && rest > 0 && shrink >= min && shrink > totalFraction * baseline;
+        if (empty || (rest > 0 && (large || dayLarge || totalLarge))) {
             held.addAll(byPath.keySet());
-            why.add(empty ? "the scan dir is empty" : rest + " of " + catalogUnderRoot.size() + " cataloged files"
-                    + (earlier > 0 ? ", after " + earlier + " recorded in the last " + (windowMs / 60000) + " min" : "")
-                    + " (more than " + Math.round(fraction * 100) + "%)");
+            why.add(empty ? "the scan dir is empty"
+                    : large ? rest + " of " + catalogUnderRoot.size() + " cataloged files"
+                            + (earlier > 0 ? ", after " + earlier + " recorded in the last " + (windowMs / 60000) + " min" : "")
+                            + " (more than " + Math.round(fraction * 100) + "%)"
+                    : dayLarge ? rest + " now, after " + today + " recorded in the last 24 h (more than "
+                            + Math.round(dayFraction * 100) + "% of the catalog in a day)"
+                    : "the catalog would shrink by " + shrink + " of the " + baseline + " files it held since the last"
+                            + " acknowledgement (more than " + Math.round(totalFraction * 100) + "%)");
         }
 
         List<DBEngine.Tombstone> record = new ArrayList<>();
@@ -193,17 +246,20 @@ final class DeleteGuard {
         if (holding.isEmpty()) {
             holdId = null;
             heldCount = 0;
-            if (windowMs > 0 && !record.isEmpty()) recent.addLast(new long[]{now, record.size()});
+            noteRecorded(now, record.size());
             return new Decision(record, holding, null, null, false);
         }
         String id = digest(holding);
-        if (windowMs > 0 && !record.isEmpty() && !id.equals(armed)) recent.addLast(new long[]{now, record.size()});
+        if (!id.equals(armed)) noteRecorded(now, record.size());
         if (id.equals(armed)) {
-            // exactly the set an admin released: recorded, once; the admin has seen the loss, so the window starts over
+            // exactly the set an admin released: recorded, once. The admin has seen the loss: the windows start over,
+            // and the catalog as it is after it is the new acknowledged size
             holdId = null;
             heldCount = 0;
             record.addAll(holding);
             recent.clear();
+            day.clear();
+            baseline = catalogUnderRoot.size() - record.size();
             return new Decision(record, List.of(), id, String.join("; ", why), true);
         }
         holdId = id;

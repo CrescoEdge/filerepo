@@ -138,6 +138,15 @@ import io.cresco.library.capability.*;
         params = {@CrescoParam(name = "confirm", required = true, description = "this repository's directory, exactly"),
                   @CrescoParam(name = "hold_id", required = true, description = "the held set to release (repostate deletes_hold_id); refused if it changed")},
         returns = @CrescoReturn(name = "released", description = "how many held deletes the next scan records, if it finds exactly that set")),
+    @CrescoAction(name = "syncpin", type = "EXEC", roles = {"infra", "admin"},
+        summary = "Pin a mirror's producer (region/agent:/its/directory), replacing the one trusted on first use, or forget " +
+                  "that pin (reset=true). With adopt=true what the previous producer delivered becomes the new one's.",
+        why = "Move a mirror to another producer, or re-pin after the producer moved.",
+        params = {@CrescoParam(name = "confirm", required = true, description = "this repository's directory, exactly"),
+                  @CrescoParam(name = "producer", description = "region/agent:/the/producer's/directory"),
+                  @CrescoParam(name = "reset", type = "boolean", description = "forget the pin: the next verified producer is pinned"),
+                  @CrescoParam(name = "adopt", type = "boolean", description = "hand the previous producer's claims to the new one")},
+        returns = @CrescoReturn(name = "pinned_producer", description = "the pin now")),
     @CrescoAction(name = "releaserewrites", type = "EXEC", roles = {"infra", "admin"},
         summary = "Release the rewrites the rewrite guard is holding, so they are offered to subscribers. " +
                   "Must name the held set (repostate rewrites_hold_id): a release that names none, or another, is refused.",
@@ -316,6 +325,7 @@ public class ExecutorImpl implements Executor {
             transfers.shutdown();
             // a transfer that never started still holds its open file
             for (StreamObject s : transferStreams.values()) s.closeChannel();
+            proven.evict(true);
         } catch (Exception ex) {
             logger.error("transfer shutdown error", ex);
         }
@@ -419,6 +429,15 @@ public class ExecutorImpl implements Executor {
                     return refuseLiveRoot(incoming, "this repository's directory " + conflict);
                 }
             }
+            // no catalog (another plugin serves this directory, or it could not be opened): nothing is served or changed
+            String closed = repoEngine.catalogOpenError();
+            if (closed != null && action != null && !Set.of("getmetrics", "getcapabilities").contains(action)) {
+                incoming.setParam("status", "9");
+                incoming.setParam("status_code", "9");
+                incoming.setParam("status_desc", "refused: " + closed);
+                incoming.setParam("refusal", "catalog-closed");
+                return incoming;
+            }
             switch (action) {
 
                 case "repolist":
@@ -437,6 +456,8 @@ public class ExecutorImpl implements Executor {
                     return releaseDeletes(incoming);
                 case "releaserewrites":
                     return releaseRewrites(incoming);
+                case "syncpin":
+                    return syncPin(incoming);
                 case "getjar":
                     return getPluginJar(incoming);
                 case "getfile":
@@ -733,16 +754,93 @@ public class ExecutorImpl implements Executor {
         return incoming;
     }
 
-    /** A file opened to be served, and checked on the descriptor it will be read through. */
+    /**
+     * A file opened to be served, and checked on the descriptor it will be read through. Where the open was not
+     * descriptor-relative ({@code needsProof}), what it holds must be proven (its content hash, through this descriptor,
+     * equals the catalog's {@code md5}) before a byte of it is sent.
+     */
     private static final class Served {
         final FileChannel channel;
         final long size;
+        final boolean needsProof;
+        final String md5;
 
         Served(FileChannel channel, long size) {
+            this(channel, size, false, null);
+        }
+
+        Served(FileChannel channel, long size, boolean needsProof, String md5) {
             this.channel = channel;
             this.size = size;
+            this.needsProof = needsProof;
+            this.md5 = md5;
         }
     }
+
+    /** True when {@code ch} holds exactly the content hashed {@code md5} (read through the descriptor). */
+    private boolean holds(FileChannel ch, String md5) throws IOException {
+        proofs.incrementAndGet();
+        return md5 != null && md5.equals(Hashes.content(ch));
+    }
+
+    /** Whole-file proofs made on the fallback path (tests: a proven descriptor is reused, not re-read). */
+    final AtomicLong proofs = new AtomicLong();
+
+    /**
+     * Proven descriptors of the fallback path, shared by one caller's transfers of one cataloged version of one file,
+     * so the ranges a sync asks again for (and the next fetches of the same file) are not each a whole re-read. A
+     * descriptor proven once keeps reading that same file: nothing swapped in at the path later can reach it. Bounded
+     * (64), closed when idle for a minute and at stop.
+     */
+    private final class ProvenChannels {
+        private final Map<String, Object[]> map = new LinkedHashMap<>(16, 0.75f, true);   // key -> {channel, users, lastUsed}
+        private static final int MAX = 64;
+        private static final long IDLE_MS = 60_000L;
+
+        synchronized FileChannel acquire(String key) {
+            evict(false);
+            Object[] e = map.get(key);
+            if (e == null || !((FileChannel) e[0]).isOpen()) return null;
+            e[1] = (Integer) e[1] + 1;
+            e[2] = System.currentTimeMillis();
+            return (FileChannel) e[0];
+        }
+
+        /** Keep {@code ch} (proven) for {@code key}; the channel to read through, or null when it is not kept. */
+        synchronized FileChannel offer(String key, FileChannel ch) {
+            evict(false);
+            Object[] e = map.get(key);
+            if (e != null && ((FileChannel) e[0]).isOpen()) {
+                e[1] = (Integer) e[1] + 1;
+                e[2] = System.currentTimeMillis();
+                return (FileChannel) e[0];
+            }
+            if (map.size() >= MAX) return null;
+            map.put(key, new Object[]{ch, 1, System.currentTimeMillis()});
+            return ch;
+        }
+
+        synchronized void release(String key, FileChannel ch) {
+            Object[] e = map.get(key);
+            if (e != null && e[0] == ch) {
+                e[1] = Math.max(0, (Integer) e[1] - 1);
+                e[2] = System.currentTimeMillis();
+            }
+        }
+
+        synchronized void evict(boolean all) {
+            long now = System.currentTimeMillis();
+            for (Iterator<Map.Entry<String, Object[]>> it = map.entrySet().iterator(); it.hasNext(); ) {
+                Object[] e = it.next().getValue();
+                if (all || ((Integer) e[1] == 0 && now - (Long) e[2] > IDLE_MS)) {
+                    try { ((FileChannel) e[0]).close(); } catch (IOException ignore) { }
+                    it.remove();
+                }
+            }
+        }
+    }
+
+    private final ProvenChannels proven = new ProvenChannels();
 
     /** Why a file cannot be served, as a status and description (the open itself refused it). */
     private static final class NotServed extends Exception {
@@ -791,26 +889,10 @@ public class ExecutorImpl implements Executor {
         }
         Served byPath = openByPath(p, base, missingStatus);
         // No descriptor-relative open here: a directory on the path swapped for a link in the instant between the path
-        // checks and the open is not seen by them. So what was opened is proven by what it holds: every byte is read
-        // through the open descriptor and must hash to the content the catalog holds for this file; anything else (a
-        // file outside the repository, or one changed since it was cataloged) is never served. The bytes then served
-        // come through that same descriptor. This costs one extra read of the file, on these platforms only.
-        boolean ok = false;
-        try {
-            String held = Hashes.content(byPath.channel);
-            if (!held.equals(cataloged.get("md5"))) {
-                throw new NotServed("9", "the file opened does not hold its cataloged content (changed since it was"
-                        + " cataloged, or not this repository's file)", null);
-            }
-            ok = true;
-            return byPath;
-        } catch (IOException ex) {
-            throw new NotServed(missingStatus, "file could not be read: " + ex.getClass().getSimpleName(), null);
-        } finally {
-            if (!ok) {
-                try { byPath.channel.close(); } catch (IOException ignore) { }
-            }
-        }
+        // checks and the open is not seen by them. So what was opened must be proven by what it holds (every byte read
+        // through the open descriptor hashes to the catalog's content for this file) before any of it is served: the
+        // caller proves it, after its size checks and admission (getfile inline, a transfer on its own thread).
+        return new Served(byPath.channel, byPath.size, true, cataloged.get("md5"));
     }
 
     /** The descriptor-relative open (see openServable). */
@@ -937,6 +1019,15 @@ public class ExecutorImpl implements Executor {
                     incoming.setParam("status_desc","fileInfo == null");
                     return incoming;
                 }
+                // too large to inline, by the catalog: answered without opening (let alone reading) the file
+                long cataloguedSize = -1;
+                try { cataloguedSize = Long.parseLong(fileInfo.get("filesize")); } catch (Exception ignore) { }
+                if (cataloguedSize > maxInlineBytes) {
+                    incoming.setParam("status","5");
+                    incoming.setParam("status_desc","file " + cataloguedSize + " bytes exceeds max_inline_bytes "
+                            + maxInlineBytes + "; use streamfile");
+                    return incoming;
+                }
                 Served served;
                 try {
                     served = openServable(filePath, "6");
@@ -947,6 +1038,12 @@ public class ExecutorImpl implements Executor {
                     return incoming;
                 }
                 try (FileChannel ch = served.channel) {
+                    if (served.size <= maxInlineBytes && served.needsProof && !holds(ch, served.md5)) {
+                        incoming.setParam("status","9");
+                        incoming.setParam("status_desc","the file opened does not hold its cataloged content (changed since"
+                                + " it was cataloged, or not this repository's file)");
+                        return incoming;
+                    }
                     if (served.size > maxInlineBytes) {
                         // Memory safeguard: never slurp a huge file onto the heap for an inline reply.
                         incoming.setParam("status","5");
@@ -1099,7 +1196,10 @@ public class ExecutorImpl implements Executor {
                 so.setChannel(channel);
                 // a subscriber of this producer fetching what it was offered may use the threads kept for sync
                 boolean sync = repoEngine.isSubscriberCaller(incoming);
-                TransferScheduler.Admit admit = transfers.submit(owner, sync, () -> stream(channel, so, key, tid, identKey, identId, buffer));
+                final String proofKey = served.needsProof ? owner + "|" + filePath + "|" + served.md5 : null;
+                final String md5 = served.md5;
+                TransferScheduler.Admit admit = transfers.submit(owner, sync,
+                        () -> stream(channel, proofKey, md5, so, key, tid, identKey, identId, buffer));
                 if (admit == TransferScheduler.Admit.CALLER_FULL || admit == TransferScheduler.Admit.FULL) {
                     so.setChannel(null);
                     transferStreams.remove(key, so);
@@ -1130,17 +1230,45 @@ public class ExecutorImpl implements Executor {
     }
 
     /** The streamer: chunks with their offsets, then the terminal frame, whatever happened. */
-    private void stream(FileChannel channel, StreamObject so, String key, String transferId, String identKey,
-                        String identId, int bufferSize) {
+    private void stream(FileChannel channel, String proofKey, String md5, StreamObject so, String key, String transferId,
+                        String identKey, String identId, int bufferSize) {
         DataPlaneService dp = plugin.getAgentService().getDataPlaneService();
         MessageDigest sha = Hashes.sha384();
         long sent = 0;
         int seqNum = 0;
         String status = "10", desc = "complete";
-        try (FileChannel ch = channel) {
+        FileChannel ch = channel;
+        boolean shared = false;
+        try {
             Runnable hook = beforeStream;
             if (hook != null) hook.run();
-            if (!so.isActive()) {
+            if (proofKey != null && so.isActive()) {
+                // the fallback path: a descriptor proven before for this caller and this file version, or proven now
+                FileChannel known = proven.acquire(proofKey);
+                if (known != null) {
+                    so.setChannel(null);
+                    try { channel.close(); } catch (IOException ignore) { }
+                    ch = known;
+                    shared = true;
+                } else if (!holds(channel, md5)) {
+                    status = "9";
+                    desc = "the file opened does not hold its cataloged content (changed since it was cataloged, or not"
+                            + " this repository's file)";
+                } else {
+                    FileChannel kept = proven.offer(proofKey, channel);
+                    if (kept != null) {
+                        so.setChannel(null);
+                        if (kept != channel) {
+                            try { channel.close(); } catch (IOException ignore) { }
+                        }
+                        ch = kept;
+                        shared = true;
+                    }
+                }
+            }
+            if (!"10".equals(status)) {
+                // refused above: nothing is sent
+            } else if (!so.isActive()) {
                 status = "9";
                 desc = "cancelled";
             } else {
@@ -1186,6 +1314,11 @@ public class ExecutorImpl implements Executor {
             desc = "read or send failed: " + ex.getClass().getSimpleName();
             logger.error("streamFile " + transferId + " error: " + ex.getMessage());
         } finally {
+            if (shared) {
+                proven.release(proofKey, ch);
+            } else {
+                try { ch.close(); } catch (IOException ignore) { }
+            }
             try {
                 BytesMessage end = dp.createBytesMessage();
                 end.setStringProperty(identKey, identId);
@@ -1248,6 +1381,12 @@ public class ExecutorImpl implements Executor {
         if (gen == null) {
             logger.warn("repoconfirm ignored: no sync_gen (a subscriber of an earlier protocol build)");
             return;
+        }
+        String refused = incoming.getCompressedParam("refusedfiles");
+        if (refused != null) {
+            // settled there (nothing more to offer): this producer is not that mirror's pinned producer
+            logger.info("mirror " + from[0] + "/" + from[1] + "/" + from[2] + " refused what this producer offered:"
+                    + " it is not that mirror's pinned producer (see its repostate)");
         }
         repoEngine.confirmTransfer(incoming.getParam("transfer_id"), incoming.getCompressedParam("failedfiles"),
                 incoming.getCompressedParam("faileddeletes"), gen, from[0], from[1], from[2]);
@@ -1381,6 +1520,45 @@ public class ExecutorImpl implements Executor {
                 + " if it finds exactly that set held; the release is spent by that scan whatever it finds"
                 : "no deletes are held");
         if (released > 0) incoming.setParam("hold_id", String.valueOf(repoEngine.getHoldId()));
+        return incoming;
+    }
+
+    /**
+     * syncpin (a mirror's admin): pin this mirror's producer ({@code producer=region/agent:/its/directory}), or with
+     * {@code reset=true} forget the pin taken on first use so the next verified producer is pinned; {@code adopt=true}
+     * hands what the previous producer delivered to the new one. Confirmed like clearrepo.
+     */
+    private MsgEvent syncPin(MsgEvent incoming) {
+        if (!repoEngine.confirms(incoming.getParam("confirm"))) {
+            incoming.setParam("status","9");
+            incoming.setParam("status_desc","refused: confirm must name this repository's directory exactly");
+            incoming.setParam("refusal","unconfirmed");
+            return incoming;
+        }
+        if (!repoEngine.isMirror()) {
+            incoming.setParam("status","9");
+            incoming.setParam("status_desc","refused: only a mirror pins a producer");
+            incoming.setParam("refusal","not-a-mirror");
+            return incoming;
+        }
+        boolean reset = "true".equalsIgnoreCase(incoming.getParam("reset"));
+        String producer = incoming.getParam("producer");
+        if (reset == (producer != null)) {
+            incoming.setParam("status","8");
+            incoming.setParam("status_desc","give producer=region/agent:/its/directory, or reset=true");
+            return incoming;
+        }
+        String why = repoEngine.syncPin(reset ? null : producer, "true".equalsIgnoreCase(incoming.getParam("adopt")));
+        if (why != null) {
+            incoming.setParam("status","9");
+            incoming.setParam("status_desc","refused: " + why);
+            incoming.setParam("refusal","pin");
+            return incoming;
+        }
+        String pin = repoEngine.pinnedProducers();
+        incoming.setParam("pinned_producer", pin == null ? "" : pin);
+        incoming.setParam("status","10");
+        incoming.setParam("status_desc", reset ? "pin cleared: the next verified producer is pinned" : "pinned " + pin);
         return incoming;
     }
 

@@ -121,14 +121,37 @@ class SyncRound2Test {
     // ------------------------------------------------------------------ the binding (sync_key, sync_producers)
 
     @Test
-    void aMirrorWithNeitherKeyNorPinnedProducersTakesNoProducerAndSaysWhy() throws Exception {
+    void aMirrorWithoutPinsTrustsItsFirstVerifiedProducerAndOnlyItUntilAnAdminRepins() throws Exception {
         TestRig p = producer("plugin-p", scan, "sync_key", "");
         TestRig s = subscriber("plugin-s", mirror, "sync_key", "");
-        write(scan.resolve("a.txt"), "a");
-        p.repo.repoBroadcast("fr", "discover", 0);
-        assertFalse(within(800, () -> s.repo.isKnownProducer(TestRig.REGION, TestRig.AGENT, "plugin-p")));
-        assertTrue(s.sent.stream().noneMatch(m -> "reposubscribe".equals(m.getParam("action"))), "nothing sent");
-        assertTrue(s.log.stream().anyMatch(l -> l.contains("sync is off")), s.log.toString());
+        write(scan.resolve("a.txt"), "from p");
+        subscribe(p, s);
+        cycle(p, s);
+        assertEquals("from p", read(mirror.resolve("a.txt")));
+        String pin = s.call("repostate").getParam("pinned_producer");
+        assertTrue(pin.contains(TestRig.REGION + "/" + TestRig.AGENT) && pin.endsWith(scan.toString()), pin);
+        // another producer of the name: verified, known, but not pinned: nothing it offers lands
+        Path other = Files.createDirectories(tmp.resolve("other"));
+        write(other.resolve("b.txt"), "from q");
+        TestRig q = producer("plugin-q", other, "sync_key", "");
+        subscribe(q, s);
+        cycle(q, s);
+        assertFalse(Files.exists(mirror.resolve("b.txt")), "an unpinned producer added a file");
+        assertEquals("1", s.call("repostate").getParam("unpinned_producers"));
+        // an admin re-pins the mirror to q, handing it what p delivered: a new generation, q offers everything
+        assertEquals("unconfirmed", s.call(TestRig.as(s.requestTo("syncpin", "producer",
+                TestRig.REGION + "/" + TestRig.AGENT + ":" + other), "admin")).getParam("refusal"));
+        MsgEvent pinned = s.call(TestRig.as(s.requestTo("syncpin", "confirm", mirror.toString(), "producer",
+                TestRig.REGION + "/" + TestRig.AGENT + ":" + other, "adopt", "true"), "admin"));
+        assertEquals("10", pinned.getParam("status"), pinned.getParams().toString());
+        subscribe(q, s);
+        cycle(q, s);
+        assertEquals("from q", read(mirror.resolve("b.txt")));
+        // and p is now the unpinned one: its new file never lands
+        write(scan.resolve("c.txt"), "p again");
+        subscribe(p, s);
+        cycle(p, s);
+        assertFalse(Files.exists(mirror.resolve("c.txt")));
     }
 
     @Test
@@ -174,16 +197,21 @@ class SyncRound2Test {
     void producersPinnedByAnAdminSyncWithoutAKey() throws Exception {
         TestRig p = producer("plugin-p", scan, "sync_key", "");
         TestRig s = subscriber("plugin-s", mirror, "sync_key", "",
-                "sync_producers", TestRig.REGION + "/" + TestRig.AGENT + "/plugin-p");
+                "sync_producers", TestRig.REGION + "/" + TestRig.AGENT + ":" + scan);
         write(scan.resolve("a.txt"), "pinned");
         subscribe(p, s);
         cycle(p, s);
         assertEquals("pinned", read(mirror.resolve("a.txt")));
-        // another producer of the name, not pinned, is never asked
+        // another producer of the name on the same node, from another directory: not the pin; nothing it offers lands
         Path other = Files.createDirectories(tmp.resolve("other"));
+        write(other.resolve("b.txt"), "not pinned");
         TestRig q = producer("plugin-q", other, "sync_key", "");
-        q.repo.repoBroadcast("fr", "discover", 0);
-        assertFalse(within(800, () -> s.repo.isKnownProducer(TestRig.REGION, TestRig.AGENT, "plugin-q")));
+        subscribe(q, s);
+        cycle(q, s);
+        assertFalse(Files.exists(mirror.resolve("b.txt")));
+        // and syncpin does not override configured pins
+        assertEquals("pin", s.call(TestRig.as(s.requestTo("syncpin", "confirm", mirror.toString(), "reset", "true"), "admin"))
+                .getParam("refusal"));
     }
 
     // ------------------------------------------------------------------ state outside the plugin's data directory
@@ -250,52 +278,64 @@ class SyncRound2Test {
     // ------------------------------------------------------------------ claims of a producer that went silent
 
     @Test
-    void aSilentProducersClaimsAreOrphanedThenTakenBackWhenItReturns() throws Exception {
+    void aSilentProducerMayUpdateItsOrphanedFilesButItsDeletesWaitForAnAdmin() throws Exception {
         TestRig p = producer("plugin-p", scan);
         TestRig s = subscriber("plugin-s", mirror, "sync_holder_ttl_ms", "60000");
         Path f = write(scan.resolve("model.bin"), "v1");
+        write(scan.resolve("notes.txt"), "notes");
+        for (int i = 0; i < 10; i++) write(scan.resolve("keep" + i + ".txt"), "keep " + i);
         subscribe(p, s);
         cycle(p, s);
-        String holder = "p:" + p.repo.producerKey();
-        assertEquals(1, s.db.holdings("model.bin").size());
-        // it is silent for longer than the holder TTL: its claim is orphaned (still protecting the file)
+        String holder = s.db.holdings("model.bin").keySet().iterator().next();
+        // silent for longer than the holder TTL: its claims are orphaned (still protecting the files)
         assertEquals(List.of(holder), s.repo.orphanSilentProducers(System.currentTimeMillis() + 1));
         assertTrue(s.db.holdings("model.bin").containsKey(DBEngine.ORPHAN + holder));
-        // the producer is back: it takes its claim back, and updates
+        // it is back: it (and only it) may update what it delivered
         subscribe(p, s);
-        assertTrue(s.db.holdings("model.bin").containsKey(holder), "taken back");
         write(f, "v2");
         Files.setLastModifiedTime(f, FileTime.fromMillis(System.currentTimeMillis() + 10_000));
         cycle(p, s);
         assertEquals("v2", read(mirror.resolve("model.bin")));
+        assertTrue(s.db.holdings("model.bin").containsKey(holder), "updated: its claim is live again");
+        // but deleting orphaned content waits for an admin's release, with this mirror's hold id
+        Files.delete(scan.resolve("notes.txt"));
+        assertTrue(p.repo.scanOnce());
+        await(() -> s.repo.getDeletesHeld() == 1, "the delete held at the mirror");
+        assertTrue(Files.exists(mirror.resolve("notes.txt")));
+        MsgEvent st = s.call("repostate");
+        assertEquals("1", st.getParam("deletes_held"));
+        assertEquals("hold-id-required", s.call(TestRig.as(s.requestTo("releasedeletes", "confirm", mirror.toString()), "admin"))
+                .getParam("refusal"));
+        MsgEvent rel = s.call(TestRig.as(s.requestTo("releasedeletes", "confirm", mirror.toString(), "hold_id",
+                st.getParam("deletes_hold_id")), "admin"));
+        assertEquals("1", rel.getParam("released"), rel.getParams().toString());
+        assertFalse(Files.exists(mirror.resolve("notes.txt")));
     }
 
     @Test
-    void anotherVerifiedProducerMayUpdateOrphanedContentButNeverLiveContent() throws Exception {
+    void anotherPinnedProducerNeverReplacesOrphanedContent() throws Exception {
+        // two producers pinned by node (no directory): co-producers of the name
         TestRig p = producer("plugin-p", scan);
-        TestRig s = subscriber("plugin-s", mirror);
+        TestRig s = subscriber("plugin-s", mirror, "sync_producers", TestRig.REGION + "/" + TestRig.AGENT);
         write(scan.resolve("model.bin"), "v1");
         subscribe(p, s);
         cycle(p, s);
-        // a second producer (another directory, another key) with other content: refused while p is live
         Path other = Files.createDirectories(tmp.resolve("other"));
         write(other.resolve("model.bin"), "q's");
         TestRig q = producer("plugin-q", other);
         subscribe(q, s);
-        assertTrue(q.repo.scanOnce());
-        await(() -> s.repo.syncConflicts.get() >= 1, "q refused");
-        assertEquals("v1", read(mirror.resolve("model.bin")));
-        await(() -> s.sent.stream().anyMatch(m -> "repoconfirm".equals(m.getParam("action"))
-                && m.getCompressedParam("failedfiles") != null), "q told its offer failed");
-        // p goes silent beyond the holder TTL (q is heard from): q's next offer replaces the orphaned content
-        s.db.touchHolder("p:" + q.repo.producerKey(), System.currentTimeMillis() + 60_000L);
-        assertEquals(List.of("p:" + p.repo.producerKey()), s.repo.orphanSilentProducers(System.currentTimeMillis() + 1));
-        boolean taken = false;
-        for (int i = 0; i < 5 && !taken; i++) {
+        // p goes silent beyond the holder TTL (q is heard from): its content is orphaned, and q may still not replace it
+        String pHolder = s.db.holdings("model.bin").keySet().iterator().next();
+        String qHolder = new RepoEngine.Identity(Fabric.TENANT, TestRig.REGION, TestRig.AGENT, "fr", other.toString()).holder();
+        s.db.touchHolder(qHolder, System.currentTimeMillis() + 60_000L);
+        assertEquals(List.of(pHolder), s.repo.orphanSilentProducers(System.currentTimeMillis() + 1));
+        assertTrue(s.repo.isKnownProducer(TestRig.REGION, TestRig.AGENT, "plugin-q"), "precondition: q is still a live producer");
+        assertTrue(s.db.holdings("model.bin").containsKey(DBEngine.ORPHAN + pHolder));
+        for (int i = 0; i < 3; i++) {
             assertTrue(q.repo.scanOnce());
-            taken = within(1000, () -> "q's".equals(read(mirror.resolve("model.bin"))));
+            Thread.sleep(300);
         }
-        assertTrue(taken, "q took over the orphaned name: " + s.log);
+        assertEquals("v1", read(mirror.resolve("model.bin")), "another producer replaced orphaned content");
     }
 
     // ------------------------------------------------------------------ the rewrite guard

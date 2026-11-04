@@ -61,27 +61,46 @@ public class DBEngine {
             tablesNames.add("filelist");
 
             String jdbc = plugin.getConfig().getStringParam("db_jdbc");
-            stateDir = RepoPaths.stateDir(plugin);
+            // the directory by its real path (a mirror's or landing repository's is created first; a scan dir never is)
+            boolean create = plugin.getConfig().getStringParam("scan_dir") == null;
+            Path real = RepoPaths.realRepoDir(plugin, create);
+            if (real == null) {
+                logger.warn("the repository directory " + RepoPaths.repoDir(plugin) + " cannot be resolved: its catalog is"
+                        + " kept by its configured path until it can");
+            }
+            stateDir = RepoPaths.stateDir(plugin, real);
+            // a catalog kept by the spelled path (round 2) moves to the real path's, once
+            Path spelled = RepoPaths.spelledStateDir(plugin);
+            if (!spelled.equals(stateDir) && Files.isDirectory(spelled, LinkOption.NOFOLLOW_LINKS)
+                    && !Files.exists(stateDir, LinkOption.NOFOLLOW_LINKS)) {
+                Files.createDirectories(stateDir.getParent());
+                Files.move(spelled, stateDir, StandardCopyOption.ATOMIC_MOVE);
+                logger.warn("the catalog of " + RepoPaths.repoDir(plugin) + " moved to " + stateDir + " (keyed by its real path)");
+            }
             ownerOnlyDirectories(stateDir);
             // one plugin per repository directory: a second one (a duplicate pluginadd, two unnamed default
-            // repositories) would share a catalog under a second database engine and corrupt it
-            lockChannel = FileChannel.open(stateDir.resolve("lock"), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-            try {
-                lock = lockChannel.tryLock();
-            } catch (OverlappingFileLockException inThisJvm) {
-                lock = null;
+            // repositories, another spelling or mount of the same directory) would share a catalog under a second
+            // database engine and corrupt it, or clear what the other landed. Locked by real path and by file key.
+            String busy = acquireLock(stateDir.resolve("lock"), false);
+            if (busy == null) {
+                Path byKey = RepoPaths.fileKeyLock(plugin, real);
+                if (byKey != null) busy = acquireLock(byKey, true);
             }
-            if (lock == null) {
-                lockChannel.close();
-                lockChannel = null;
-                openError = "the repository directory " + RepoPaths.repoDir(plugin) + " is already served by another"
-                        + " filerepo plugin on this agent";
+            if (busy != null) {
+                releaseLocks();
+                openError = "the repository directory " + RepoPaths.repoDir(plugin) + " (" + real + ") is already served"
+                        + " by another filerepo plugin on this agent";
                 logger.error(openError + ": this plugin serves nothing");
                 return;
             }
 
             dbsource = stateDir.resolve("catalog").toFile();
-            if (jdbc == null) migrateLegacyCatalog(RepoPaths.legacyCatalog(plugin), dbsource.toPath());
+            if (jdbc == null && !migrateLegacyCatalog(RepoPaths.legacyCatalog(plugin), dbsource.toPath())) {
+                releaseLocks();
+                openError = "the catalog at " + RepoPaths.legacyCatalog(plugin) + " could not be moved to " + dbsource
+                        + " intact; nothing was adopted (see the ERROR above)";
+                return;
+            }
 
             String dbDriver = plugin.getConfig().getStringParam("db_driver", "org.apache.derby.jdbc.EmbeddedDriver");
             String dbConnectionString = jdbc != null ? jdbc : "jdbc:derby:" + dbsource.getAbsolutePath() + ";create=true";
@@ -103,7 +122,55 @@ public class DBEngine {
         } catch (Exception ex) {
             openError = "the catalog could not be opened: " + ex.getMessage();
             logger.error("DBEngine init failed", ex);
+            // a failed start never keeps the directory locked
+            try {
+                if (dataSource != null) dataSource.close();
+            } catch (Exception ignore) { }
+            releaseLocks();
         }
+    }
+
+    private FileChannel keyLockChannel;
+    private FileLock keyLock;
+
+    /** Lock {@code file} for this plugin; null when held now, otherwise why not. */
+    private String acquireLock(Path file, boolean byKey) throws IOException {
+        Files.createDirectories(file.getParent());
+        FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        FileLock l;
+        try {
+            l = ch.tryLock();
+        } catch (OverlappingFileLockException inThisJvm) {
+            l = null;
+        }
+        if (l == null) {
+            ch.close();
+            return "held";
+        }
+        if (byKey) {
+            keyLockChannel = ch;
+            keyLock = l;
+        } else {
+            lockChannel = ch;
+            lock = l;
+        }
+        return null;
+    }
+
+    /** Release every lock this plugin holds on its directory. */
+    private void releaseLocks() {
+        try {
+            if (lock != null) lock.release();
+            if (lockChannel != null) lockChannel.close();
+        } catch (Exception ignore) { }
+        try {
+            if (keyLock != null) keyLock.release();
+            if (keyLockChannel != null) keyLockChannel.close();
+        } catch (Exception ignore) { }
+        lock = null;
+        lockChannel = null;
+        keyLock = null;
+        keyLockChannel = null;
     }
 
     /** Why the catalog is not open (another plugin serves the directory, or it failed), or null. */
@@ -129,22 +196,94 @@ public class DBEngine {
 
     /**
      * The catalog used to live in the plugin's data directory, which the controller deletes with the plugin: move it
-     * here once (a rename; a copy where a rename cannot be done, leaving the old one in place). Never deletes.
+     * here once. A rename where it can be; otherwise a copy into {@code catalog.partial}, verified file by file (size and
+     * SHA-256) before it is renamed into place, the old one left where it was. A partial copy from an interrupted start
+     * is discarded and made again. Never deletes the old catalog. False when the copy could not be made intact (nothing
+     * is adopted then, and no new catalog is started over it).
      */
-    private void migrateLegacyCatalog(Path legacy, Path target) {
-        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS) || !Files.isDirectory(legacy, LinkOption.NOFOLLOW_LINKS)) return;
+    private boolean migrateLegacyCatalog(Path legacy, Path target) {
+        Path partial = target.resolveSibling(target.getFileName() + ".partial");
+        try {
+            if (Files.exists(partial, LinkOption.NOFOLLOW_LINKS)) deleteTree(partial);
+        } catch (IOException ex) {
+            logger.error("a partial catalog copy " + partial + " could not be removed: " + ex.getMessage());
+            return false;
+        }
+        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS) || !Files.isDirectory(legacy, LinkOption.NOFOLLOW_LINKS)) return true;
         try {
             try {
                 Files.move(legacy, target, StandardCopyOption.ATOMIC_MOVE);
+                logger.warn("the catalog moved from " + legacy + " (the plugin's data directory, deleted with the plugin) to "
+                        + target);
+                return true;
             } catch (java.nio.file.FileSystemException otherDevice) {
-                copyTree(legacy, target);
+                // another filesystem: copy, verify, then adopt
             }
-            logger.warn("the catalog moved from " + legacy + " (the plugin's data directory, deleted with the plugin) to "
-                    + target);
+            copyTree(legacy, partial);
+            String bad = sameTree(legacy, partial);
+            if (bad != null) {
+                deleteTree(partial);
+                logger.error("the catalog copy from " + legacy + " differs (" + bad + "): not adopted; the old catalog"
+                        + " is left in place and this plugin serves nothing until an admin moves it");
+                return false;
+            }
+            Files.move(partial, target, StandardCopyOption.ATOMIC_MOVE);
+            logger.warn("the catalog was copied (verified) from " + legacy + " to " + target + "; the old one is left in place");
+            return true;
         } catch (Exception ex) {
             logger.error("the catalog at " + legacy + " could not be moved to " + target + ": " + ex.getMessage()
-                    + "; a new catalog is started (the old one is left in place)");
+                    + "; nothing was adopted, the old one is left in place");
+            return false;
         }
+    }
+
+    /** Null when every regular file of {@code a} is in {@code b} with the same size and SHA-256, and no more; else why. */
+    private static String sameTree(Path a, Path b) throws IOException {
+        Map<String, String> ha = treeHashes(a), hb = treeHashes(b);
+        if (!ha.keySet().equals(hb.keySet())) return "the file lists differ";
+        for (Map.Entry<String, String> e : ha.entrySet()) {
+            if (!e.getValue().equals(hb.get(e.getKey()))) return e.getKey() + " differs";
+        }
+        return null;
+    }
+
+    private static Map<String, String> treeHashes(Path root) throws IOException {
+        Map<String, String> out = new HashMap<>();
+        Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                if (attrs.isRegularFile()) {
+                    try (java.io.InputStream in = Files.newInputStream(file)) {
+                        java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+                        byte[] buf = new byte[1 << 16];
+                        int n;
+                        while ((n = in.read(buf)) != -1) md.update(buf, 0, n);
+                        out.put(root.relativize(file).toString(), attrs.size() + ":" + Hashes.hex(md.digest()));
+                    } catch (java.security.NoSuchAlgorithmException e) {
+                        throw new IOException(e);
+                    }
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return out;
+    }
+
+    private static void deleteTree(Path root) throws IOException {
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return;
+        Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Files.delete(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                Files.delete(dir);
+                return FileVisitResult.CONTINUE;
+            }
+        });
     }
 
     private static void copyTree(Path from, Path to) throws IOException {
@@ -210,14 +349,7 @@ public class DBEngine {
         } catch (Exception ex) {
             logger.error("DBEngine shutdown error", ex);
         }
-        try {
-            if (lock != null) lock.release();
-            if (lockChannel != null) lockChannel.close();
-        } catch (Exception ex) {
-            logger.error("DBEngine lock release error", ex);
-        }
-        lock = null;
-        lockChannel = null;
+        releaseLocks();
         return isShutdown;
     }
 
@@ -327,6 +459,7 @@ public class DBEngine {
             {"HOLDERS", "CREATE TABLE holders (holder varchar(256) primary key NOT NULL, last_seen bigint NOT NULL)"},
             {"HELDCHANGE", "CREATE TABLE heldchange (pathhash varchar(200) primary key NOT NULL, filepath varchar(1000) NOT NULL,"
                     + " prevmd5 varchar(255), md5 varchar(255))"},
+            {"REWRITTEN", "CREATE TABLE rewritten (pathhash varchar(200) primary key NOT NULL)"},
     };
 
     /**
@@ -799,6 +932,34 @@ public class DBEngine {
         return rename(ORPHAN + holder, holder);
     }
 
+    /** An admin hands one producer's claims (live and orphaned) to another (syncpin adopt). */
+    public int adoptClaims(String from, String to) {
+        return rename(from, to) + rename(ORPHAN + from, to);
+    }
+
+    /** Orphan one producer's claims now (syncpin without adopt: it is no longer this mirror's producer). */
+    public int orphanHolder(String holder) {
+        int n = rename(holder, ORPHAN + holder);
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM holders WHERE holder = ?")) {
+            ps.setString(1, holder);
+            ps.executeUpdate();
+        } catch (Exception ex) {
+            logger.error("orphanHolder error", ex);
+        }
+        return n;
+    }
+
+    /** How many claims the mirror records (any producer). */
+    public long mirroredCount() {
+        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM mirrored")) {
+            return rs.next() ? rs.getLong(1) : 0;
+        } catch (Exception ex) {
+            return 0;
+        }
+    }
+
     /**
      * Claims of producers not heard from since {@code before} become orphans ({@code ~producer}): they still protect
      * their files from any delete, but no longer block another verified producer of the name. The producers orphaned.
@@ -891,6 +1052,62 @@ public class DBEngine {
             }
         } catch (Exception ex) {
             logger.error("holdChanges error", ex);
+        }
+    }
+
+    /** Files rewritten (and offered) since the last acknowledgement: recorded, once each. */
+    public void noteRewritten(List<String> paths, int batchSize) {
+        if (paths.isEmpty()) return;
+        try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement("INSERT INTO rewritten (pathhash) SELECT ? FROM SYSIBM.SYSDUMMY1"
+                    + " WHERE NOT EXISTS (SELECT 1 FROM rewritten WHERE pathhash = ?)")) {
+                int n = 0;
+                for (String p : paths) {
+                    String k = pathKey(p);
+                    ps.setString(1, k);
+                    ps.setString(2, k);
+                    ps.executeUpdate();
+                    if (++n % Math.max(1, batchSize) == 0) conn.commit();
+                }
+                conn.commit();
+            } catch (SQLException ex) {
+                try { conn.rollback(); } catch (SQLException ignore) { }
+                logger.error("noteRewritten failed: " + ex.getMessage());
+            } finally {
+                try { conn.setAutoCommit(true); } catch (SQLException ignore) { }
+            }
+        } catch (Exception ex) {
+            logger.error("noteRewritten error", ex);
+        }
+    }
+
+    public boolean wasRewritten(String path) {
+        try (Connection conn = ds.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT 1 FROM rewritten WHERE pathhash = ?")) {
+            ps.setString(1, pathKey(path));
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    public long rewrittenCount() {
+        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM rewritten")) {
+            return rs.next() ? rs.getLong(1) : 0;
+        } catch (Exception ex) {
+            return 0;
+        }
+    }
+
+    public void clearRewritten() {
+        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement()) {
+            st.executeUpdate("DELETE FROM rewritten");
+        } catch (Exception ex) {
+            logger.error("clearRewritten error", ex);
         }
     }
 

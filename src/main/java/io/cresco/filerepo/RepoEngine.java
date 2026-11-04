@@ -162,7 +162,12 @@ public class RepoEngine {
     // offers it everything again (paced), and it skips what it holds
     private volatile String syncGen;
     // producers an admin pinned (sync_producers: region/agent/plugin, comma-separated); null: none pinned
-    private final Set<String> configuredProducers;
+    private final List<Pin> configuredProducers;
+    // sync_role: producer | mirror | none, or "" (from the directories configured: scan_dir a producer, repo_dir a mirror)
+    private final String syncRole;
+    // the producer a mirror trusted on first use (catalog meta), when no sync_producers is configured
+    private volatile Identity tofuPin;
+    static final String META_PRODUCER_PIN = "producer_pin";
     // the admin-provisioned secret of this repository name (sync_key), shared by its producer(s) and mirrors; null: none.
     // A mirror takes a producer only when it proves this key (or an admin pinned it): with neither, it syncs nothing.
     private final byte[] syncKey;
@@ -196,24 +201,122 @@ public class RepoEngine {
         }
     });
     private final Map<String, Long> lagAlarmed = new ConcurrentHashMap<>();
+    // verified producers of this name that are not this mirror's pinned producer (bounded): for repostate and warnings
+    private final Map<String, Long> unpinnedSeen = Collections.synchronizedMap(new LinkedHashMap<String, Long>() {
+        protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            return size() > 256;
+        }
+    });
+    private final Map<String, Long> unpinnedWarned = Collections.synchronizedMap(new LinkedHashMap<String, Long>() {
+        protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            return size() > 256;
+        }
+    });
+    final AtomicLong syncUnpinned = new AtomicLong();
     // this producer's stable key (catalog meta): mirrors record what it delivered under it, so a redeployed plugin
     // (a new plugin id over the same scan dir and catalog) is the same producer to them
     private volatile String producerKey;
     static final String META_PRODUCER_KEY = "producer_key";
     static final String META_SYNC_GEN = "sync_gen";
 
-    /** A producer as a mirror knows it: its stable key and when it was last heard from. */
+    /**
+     * A producer's identity, as a mirror verifies it: the node it runs on, from the broker's stamp of its caller
+     * ({@code <tenant>/<region>/<agent>}, unforgeable by any other node), the repository name, and the directory it
+     * produces from on that node (its real path, as it reports it). Not the plugin id: a producer redeployed over the
+     * same directory is the same producer. Not anything a holder of a shared secret could claim.
+     */
+    static final class Identity {
+        final String tenant, region, agent, repo, dir;
+
+        Identity(String tenant, String region, String agent, String repo, String dir) {
+            this.tenant = tenant == null ? "-" : tenant;
+            this.region = region;
+            this.agent = agent;
+            this.repo = repo;
+            this.dir = dir;
+        }
+
+        String node() {
+            return tenant + "/" + region + "/" + agent;
+        }
+
+        /** The whole identity, as a pin records it. */
+        String full() {
+            return node() + "|" + repo + "|" + dir;
+        }
+
+        /** The key its claims are recorded under in a mirror. */
+        String holder() {
+            return "n:" + DBEngine.sha256(full()).substring(0, 40);
+        }
+
+        static Identity parse(String full) {
+            if (full == null) return null;
+            String[] a = full.split("\\|", 3);
+            if (a.length != 3) return null;
+            String[] n = a[0].split("/", 3);
+            if (n.length != 3) return null;
+            return new Identity(n[0], n[1], n[2], a[1], a[2]);
+        }
+
+        @Override
+        public String toString() {
+            return node() + ":" + dir;
+        }
+    }
+
+    /** A producer pin: a node ({@code region/agent}, of this tenant), and optionally the directory it produces from. */
+    static final class Pin {
+        final String region, agent, dir;
+
+        Pin(String region, String agent, String dir) {
+            this.region = region;
+            this.agent = agent;
+            this.dir = dir;
+        }
+
+        /** {@code region/agent} or {@code region/agent:/its/directory}; null when malformed. */
+        static Pin parse(String spec) {
+            if (spec == null) return null;
+            spec = spec.trim();
+            String dir = null;
+            int colon = spec.indexOf(':');
+            if (colon >= 0) {
+                dir = spec.substring(colon + 1).trim();
+                spec = spec.substring(0, colon).trim();
+                if (dir.isEmpty() || !dir.startsWith("/")) return null;
+            }
+            String[] parts = spec.split("/");
+            // region/agent/pluginid, the round-2 form: the node is what is pinned now (a plugin id changes on redeploy)
+            if (parts.length == 3 && dir == null) return new Pin(parts[0], parts[1], null);
+            if (parts.length != 2 || parts[0].isEmpty() || parts[1].isEmpty()) return null;
+            return new Pin(parts[0], parts[1], dir);
+        }
+
+        boolean matches(Identity id) {
+            return region.equals(id.region) && agent.equals(id.agent) && (dir == null || dir.equals(id.dir));
+        }
+
+        @Override
+        public String toString() {
+            return region + "/" + agent + (dir == null ? "" : ":" + dir);
+        }
+    }
+
+    /** A producer as a mirror knows it: who it is, whether it is this mirror's pinned producer, when last heard from. */
     static final class KnownProducer {
-        final String producerKey;
+        final Identity id;
+        final boolean pinned;
         volatile long lastSeen;
 
-        KnownProducer(String producerKey, long lastSeen) {
-            this.producerKey = producerKey;
+        KnownProducer(Identity id, boolean pinned, long lastSeen) {
+            this.id = id;
+            this.pinned = pinned;
             this.lastSeen = lastSeen;
         }
 
         String holder() {
-            return "p:" + producerKey;
+            return id.holder();
         }
     }
 
@@ -274,6 +377,11 @@ public class RepoEngine {
     private final long resetIntervalMs;
     private final double rewriteFraction;
     private final int rewriteMin;
+    private final double rewriteDayFraction;
+    private final double rewriteTotalFraction;
+    // files rewritten (and offered) within the last 24 hours: path -> when (bounded: past the budget everything is held)
+    private final LinkedHashMap<String, Long> rewrittenToday = new LinkedHashMap<>();
+    static final String META_DELETE_BASELINE = "delete_baseline";
 
     // Bounded, named, daemon pool for peer-sync updaters: one per producer at a time, at most sync_threads at once,
     // and at most sync_queue_max waiting (FR-D5). A diff that finds both full is refused as busy (status 11) and the
@@ -335,7 +443,14 @@ public class RepoEngine {
                 fractionParam("sync_delete_guard_subtree_fraction", 0.01),
                 clamp(longParam("sync_release_ttl_ms", 600_000L), 1_000L, Long.MAX_VALUE),
                 clamp(longParam("sync_delete_guard_window_ms", 900_000L), 0L, Long.MAX_VALUE));
+        guard.setBudgets(fractionOrZero("sync_delete_guard_day_fraction", 0.25),
+                fractionOrZero("sync_delete_guard_total_fraction", 0.5));
         rewriteFraction = fractionParam("sync_rewrite_guard_fraction", 0.25);
+        // a day allows at least what one cycle does, and the total at least what a day does (0 turns one off)
+        double rd = fractionOrZero("sync_rewrite_guard_day_fraction", 0.25);
+        rewriteDayFraction = rd <= 0 ? 0 : Math.max(rd, rewriteFraction);
+        double rt = fractionOrZero("sync_rewrite_guard_total_fraction", 0.5);
+        rewriteTotalFraction = rt <= 0 ? 0 : Math.max(rt, Math.max(rewriteDayFraction, rewriteFraction));
         rewriteMin = (int) clamp(longParam("sync_rewrite_guard_min", 10L), 1, Integer.MAX_VALUE);
         followLinks = plugin.getConfig().getBooleanParam("scan_follow_links", false);
         requirePutHashes = plugin.getConfig().getBooleanParam("putfiles_require_hashes", true);
@@ -361,16 +476,30 @@ public class RepoEngine {
 
         String pinned = plugin.getConfig().getStringParam("sync_producers");
         if (pinned != null && !pinned.trim().isEmpty()) {
-            Set<String> s = new HashSet<>();
+            List<Pin> pins = new ArrayList<>();
             for (String p : pinned.split(",")) {
-                String[] parts = p.trim().split("/");
-                if (parts.length == 3) s.add(peerKey(parts[0], parts[1], parts[2]));
-                else logger.error("sync_producers: '" + p.trim() + "' is not region/agent/pluginid; ignored");
+                Pin pin = Pin.parse(p);
+                if (pin == null) {
+                    logger.error("sync_producers: '" + p.trim() + "' is not region/agent or region/agent:/directory; ignored");
+                } else {
+                    if (p.trim().split("/").length == 3 && p.indexOf(':') < 0) {
+                        logger.warn("sync_producers: '" + p.trim() + "' names a plugin id; the node " + pin
+                                + " is pinned (a plugin id changes when the producer is redeployed)");
+                    }
+                    pins.add(pin);
+                }
             }
-            configuredProducers = Collections.unmodifiableSet(s);
+            configuredProducers = Collections.unmodifiableList(pins);
         } else {
             configuredProducers = null;
         }
+        String role = plugin.getConfig().getStringParam("sync_role");
+        role = role == null ? "" : role.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!role.isEmpty() && !Set.of("producer", "mirror", "none").contains(role)) {
+            logger.error("sync_role '" + role + "' is not producer, mirror or none: this repository syncs nothing");
+            role = "none";
+        }
+        syncRole = role;
 
         int syncThreads = (int) clamp(longParam("sync_threads", 8L), 1, 256);
         int syncQueue = (int) clamp(longParam("sync_queue_max", 64L), 1, 100_000);
@@ -410,6 +539,15 @@ public class RepoEngine {
         }
         // this repository's sync generation survives a restart: a plain restart resumes where it left off
         syncGen = loadGen();
+        try {
+            String b = dbEngine.getMeta(META_DELETE_BASELINE);
+            if (b != null) guard.setBaseline(Long.parseLong(b));
+        } catch (Exception ignore) { }
+        try {
+            tofuPin = Identity.parse(dbEngine.getMeta(META_PRODUCER_PIN));
+        } catch (Exception ex) {
+            tofuPin = null;
+        }
 
         if (liveRow == null && scanDirString == null && repoDir == null) {
             migrateDefaultRepository();
@@ -427,6 +565,15 @@ public class RepoEngine {
                         + " working directory; configure an absolute path");
             }
         }
+    }
+
+    /** A fraction in [0, 1]: 0 turns that budget off. */
+    private double fractionOrZero(String name, double dflt) {
+        try {
+            Double d = plugin.getConfig().getDoubleParam(name);
+            if (d != null && d >= 0 && d <= 1) return d;
+        } catch (Exception ignore) { }
+        return dflt;
     }
 
     private double fractionParam(String name, double dflt) {
@@ -459,7 +606,77 @@ public class RepoEngine {
         return g;
     }
 
-    /** This producer's stable key: created once and kept in the catalog. */
+    // ---- a mirror's generation, kept with its files too ----
+    static final String GEN_MARKER = "generation";
+    private volatile long lastMarkerCheck;
+
+    /** Record this mirror's generation inside its directory (the owner-only staging directory, never scanned). */
+    void writeGenerationMarker() {
+        if (!isMirror()) return;
+        try {
+            Path m = privateStaging().resolve(GEN_MARKER);
+            Path tmp = m.resolveSibling(GEN_MARKER + ".tmp");
+            Files.write(tmp, syncGen.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            Files.move(tmp, m, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (Exception ex) {
+            logger.error("the generation marker could not be written in " + getRepoDir() + ": " + ex.getMessage());
+        }
+    }
+
+    /**
+     * A mirror whose directory no longer matches its catalog starts a new generation, so its producer offers it
+     * everything again: the marker of its generation inside the directory is missing (a new, replaced or reformatted
+     * volume) or names another generation, or the directory is empty though the catalog records what producers
+     * delivered (an rm -rf instead of clearrepo). Nothing is deleted. At start, and at most once a minute after.
+     */
+    void checkGenerationMarker(boolean force) {
+        if (!isMirror()) return;
+        long now = System.currentTimeMillis();
+        if (!force && now - lastMarkerCheck < 60_000L) return;
+        lastMarkerCheck = now;
+        String why = null;
+        try {
+            Path m = privateStaging().resolve(GEN_MARKER);
+            String onDisk = Files.isRegularFile(m, LinkOption.NOFOLLOW_LINKS)
+                    ? new String(Files.readAllBytes(m), java.nio.charset.StandardCharsets.US_ASCII).trim() : null;
+            if (onDisk == null) why = "it has no generation marker (a new, replaced or reformatted directory)";
+            else if (!onDisk.equals(syncGen)) why = "its generation marker names another generation";
+            else if (dbEngine.mirroredCount() > 0 && !hasAnyFile(getRepoDir().toPath())) {
+                why = "it is empty, though the catalog records files its producer delivered";
+            }
+        } catch (IOException ex) {
+            logger.error("the generation marker of " + getRepoDir() + " could not be read: " + ex.getMessage());
+            return;
+        }
+        if (why == null) return;
+        String before = syncGen;
+        syncGen = newGen();
+        attempts.clear();
+        writeGenerationMarker();
+        logger.warn("mirror " + getRepoDir() + ": " + why + ": a new generation " + syncGen + " (was " + before
+                + "), so its producer offers it everything again; nothing is deleted");
+    }
+
+    private static boolean hasAnyFile(Path dir) throws IOException {
+        if (!Files.isDirectory(dir)) return false;
+        try (java.util.stream.Stream<Path> st = Files.list(dir)) {
+            return st.anyMatch(p -> !isStaging(p.getFileName().toString()));
+        }
+    }
+
+    /** The real path of this producer's scan dir (its identity, with its node, to mirrors). */
+    String producerDir() {
+        try {
+            return Paths.get(scanDirString).toRealPath().toString();
+        } catch (Exception ex) {
+            return Paths.get(scanDirString).toAbsolutePath().normalize().toString();
+        }
+    }
+
+    /**
+     * A key kept in the catalog (round 2's producer identity). It is no longer anyone's identity: mirrors know a
+     * producer by its stamped node and its directory. Kept for diagnostics.
+     */
     String producerKey() {
         String k = producerKey;
         if (k != null) return k;
@@ -482,21 +699,40 @@ public class RepoEngine {
 
     /**
      * The default repository used to be {@code <plugin data dir>/repo}, which the controller deletes with the plugin:
-     * move it to the stable default once (a rename; never a delete) and rewrite the catalog's paths. If both hold files,
-     * neither is touched and an admin moves the old files by hand.
+     * move it to the stable default once (a rename on the same filesystem; never a copy, never a delete) and rewrite
+     * the catalog's paths. Journaled in the state directory before the rename, so a crash between the rename and the
+     * rewrite is completed at the next start. If both directories hold files, or they are on different filesystems,
+     * nothing is moved and an ERROR names both.
      */
     private void migrateDefaultRepository() {
+        Path journal = dbEngine.stateDir() == null ? null : dbEngine.stateDir().resolve("migration.journal");
         Path legacy = RepoPaths.legacyDefaultRepo(plugin);
         Path target = repoDirFile().toPath();
-        if (legacy.equals(target) || !Files.isDirectory(legacy, LinkOption.NOFOLLOW_LINKS)) return;
         try {
-            boolean targetEmpty = !Files.exists(target, LinkOption.NOFOLLOW_LINKS);
-            if (!targetEmpty && Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
-                try (java.util.stream.Stream<Path> st = Files.list(target)) {
-                    targetEmpty = st.noneMatch(p -> !PRIVATE_STAGING.equals(p.getFileName().toString()));
+            if (journal != null && Files.isRegularFile(journal, LinkOption.NOFOLLOW_LINKS)) {
+                // an interrupted migration: finish it, or start it again
+                java.util.Properties j = new java.util.Properties();
+                try (java.io.InputStream in = Files.newInputStream(journal)) {
+                    j.load(in);
                 }
+                Path from = Paths.get(j.getProperty("from")), to = Paths.get(j.getProperty("to"));
+                if (!Files.exists(from, LinkOption.NOFOLLOW_LINKS) && Files.isDirectory(to, LinkOption.NOFOLLOW_LINKS)) {
+                    int rows = dbEngine.rebasePaths(from.toString(), to.toString());
+                    Files.delete(journal);
+                    logger.warn("the interrupted move of the default repository from " + from + " to " + to
+                            + " was completed: " + rows + " catalog row(s) updated");
+                    return;
+                }
+                if (Files.isDirectory(from, LinkOption.NOFOLLOW_LINKS) && Files.exists(to, LinkOption.NOFOLLOW_LINKS)
+                        && hasAnyFile(to)) {
+                    logger.error("an interrupted move of the default repository left files in both " + from + " and " + to
+                            + ": nothing is moved; an admin merges them by hand and removes " + journal);
+                    return;
+                }
+                Files.delete(journal);   // the rename never happened: start over below
             }
-            if (!targetEmpty) {
+            if (legacy.equals(target) || !Files.isDirectory(legacy, LinkOption.NOFOLLOW_LINKS)) return;
+            if (Files.exists(target, LinkOption.NOFOLLOW_LINKS) && hasAnyFile(target)) {
                 logger.error("the old default repository " + legacy + " and the new " + target + " both hold files: the"
                         + " old one is not served; move its files into the new one by hand");
                 return;
@@ -506,13 +742,32 @@ public class RepoEngine {
                 Path staging = target.resolve(PRIVATE_STAGING);
                 if (Files.isDirectory(staging, LinkOption.NOFOLLOW_LINKS)) {
                     try (java.util.stream.Stream<Path> st = Files.list(staging)) {
-                        if (st.findAny().isEmpty()) Files.delete(staging);
+                        for (Path f : (Iterable<Path>) st::iterator) Files.delete(f);   // our own empty-repo staging
                     }
+                    Files.delete(staging);
                 }
                 Files.delete(target);   // empty
             }
-            Files.move(legacy, target, StandardCopyOption.ATOMIC_MOVE);
+            if (journal != null) {
+                java.util.Properties j = new java.util.Properties();
+                j.setProperty("from", legacy.toString());
+                j.setProperty("to", target.toString());
+                Path tmp = journal.resolveSibling("migration.journal.tmp");
+                try (java.io.OutputStream out = Files.newOutputStream(tmp)) {
+                    j.store(out, "filerepo: moving the default repository");
+                }
+                Files.move(tmp, journal, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            }
+            try {
+                Files.move(legacy, target, StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException otherDevice) {
+                if (journal != null) Files.deleteIfExists(journal);
+                logger.error("the old default repository " + legacy + " is on another filesystem than " + target
+                        + ": it is not copied (a partial copy is never adopted); move its files by hand");
+                return;
+            }
             int rows = dbEngine.rebasePaths(legacy.toString(), target.toString());
+            if (journal != null) Files.deleteIfExists(journal);
             logger.warn("the default repository moved from " + legacy + " (the plugin's data directory, deleted with the"
                     + " plugin) to " + target + "; " + rows + " catalog row(s) updated");
         } catch (Exception ex) {
@@ -590,9 +845,19 @@ public class RepoEngine {
         return fileRepoName;
     }
 
-    /** True when this repository is a producer (scan_dir and filerepo_name, not live-backed). */
+    /**
+     * True when this repository is a producer: scan_dir and filerepo_name, not live-backed, and sync_role producer or
+     * unset. A repository configured as a mirror never acts as a producer to other mirrors.
+     */
     boolean isProducer() {
-        return liveRow == null && scanDirString != null && fileRepoName != null;
+        return liveRow == null && scanDirString != null && fileRepoName != null
+                && (syncRole.isEmpty() || "producer".equals(syncRole));
+    }
+
+    /** True when this repository is a mirror: filerepo_name and repo_dir, no scan_dir, sync_role mirror or unset. */
+    boolean isMirror() {
+        return liveRow == null && scanDirString == null && fileRepoName != null && repoDir != null
+                && (syncRole.isEmpty() || "mirror".equals(syncRole));
     }
 
     public void start() {
@@ -606,12 +871,19 @@ public class RepoEngine {
         long delay =  plugin.getConfig().getLongParam("scan_delay", 5000L);
         long period =  plugin.getConfig().getLongParam("scan_period", 15000L);
 
-        if((scanDirString != null) && (fileRepoName != null)) {
+        if ("mirror".equals(syncRole) && scanDirString != null) {
+            logger.error("sync_role=mirror with a scan_dir: this repository is not a producer, and serves no mirror");
+        } else if ("producer".equals(syncRole) && scanDirString == null) {
+            logger.error("sync_role=producer needs a scan_dir: this repository syncs nothing");
+        }
+        if (isProducer()) {
             logger.info("Starting file scan : " + scanDirString + " filerepo: " + fileRepoName);
             startScan(delay, period);
-        } else if((scanDirString == null) && (fileRepoName != null) && (repoDir != null)) {
-            logger.info("Start listening for filerepo: " + fileRepoName
-                    + (configuredProducers == null ? "" : " (producers pinned: " + configuredProducers + ")"));
+        } else if (isMirror()) {
+            logger.info("Start listening for filerepo: " + fileRepoName + (configuredProducers != null
+                    ? " (producers pinned: " + configuredProducers + ")"
+                    : tofuPin != null ? " (producer pinned: " + tofuPin + ")" : " (the first verified producer will be pinned)"));
+            checkGenerationMarker(true);
             createSubListener(fileRepoName);
         }
 
@@ -1087,7 +1359,15 @@ public class RepoEngine {
         String rootDevNow = walk.rootDev == null ? null : String.valueOf(walk.rootDev);
         if (rootDevBefore != null && rootDevNow != null && !rootDevBefore.equals(rootDevNow)) vanished.add(root.toString());
 
+        long baselineBefore = guard.baseline();
         DeleteGuard.Decision d = guard.evaluate(root, underRoot, gone, seen.size(), vanished, now);
+        if (guard.baseline() != baselineBefore) {
+            try {
+                dbEngine.setMeta(META_DELETE_BASELINE, String.valueOf(guard.baseline()));
+            } catch (Exception ex) {
+                logger.error("the delete guard's acknowledged size could not be recorded: " + ex.getMessage());
+            }
+        }
         if (d.released) logger.warn("releasing " + d.held.size() + " held delete(s) recorded now, as an admin asked");
         if (!d.held.isEmpty()) {
             if (!d.holdId.equals(lastHoldLogged)) {
@@ -1184,7 +1464,27 @@ public class RepoEngine {
     private Set<String> guardRewritesLocked(List<String[]> rewrites, int catalogSize) {
         Set<String> heldNow = new HashSet<>();
         if (rewrites.isEmpty()) return heldNow;
-        boolean mass = rewrites.size() >= rewriteMin && rewrites.size() > rewriteFraction * catalogSize;
+        long now = System.currentTimeMillis();
+        // the longer horizons: distinct files rewritten within a rolling day, and since the last acknowledgement
+        rewrittenToday.values().removeIf(t -> now - t > DeleteGuard.DAY_MS);
+        Set<String> today = new HashSet<>(rewrittenToday.keySet());
+        int cycleNew = 0;
+        for (String[] r : rewrites) if (today.add(r[0])) cycleNew++;
+        boolean cycleLarge = rewrites.size() >= rewriteMin && rewrites.size() > rewriteFraction * catalogSize;
+        boolean dayLarge = rewriteDayFraction > 0 && today.size() >= rewriteMin && today.size() > rewriteDayFraction * catalogSize;
+        long sinceAck = 0;
+        boolean totalLarge = false;
+        if (!cycleLarge && !dayLarge && rewriteTotalFraction > 0) {
+            // counted only up to the budget: one lookup per rewrite at most, and none once it is over
+            double budget = rewriteTotalFraction * catalogSize;
+            sinceAck = dbEngine.rewrittenCount();
+            for (String[] r : rewrites) {
+                if (sinceAck > budget && sinceAck >= rewriteMin) break;
+                if (!dbEngine.wasRewritten(r[0])) sinceAck++;
+            }
+            totalLarge = sinceAck >= rewriteMin && sinceAck > budget;
+        }
+        boolean mass = cycleLarge || dayLarge || totalLarge;
         List<String[]> hold = new ArrayList<>();
         List<String> restored = new ArrayList<>();
         for (String[] r : rewrites) {
@@ -1198,13 +1498,22 @@ public class RepoEngine {
                 hold.add(r);
             }
         }
+        // what goes through counts toward the day and the acknowledged total
+        List<String> passed = new ArrayList<>();
+        for (String[] r : rewrites) {
+            if (heldNow.contains(r[0])) continue;
+            passed.add(r[0]);
+            rewrittenToday.put(r[0], now);
+        }
+        if (rewriteTotalFraction > 0) dbEngine.noteRewritten(passed, scanBatchSize);
         if (hold.isEmpty() && restored.isEmpty()) return heldNow;
         dbEngine.holdChanges(hold, scanBatchSize);
         dbEngine.unholdChanges(restored);
         refreshRewriteHold();
         if (rewritesHeld > 0 && !String.valueOf(rewriteHoldId).equals(lastRewriteHoldLogged)) {
             logger.error("rewrite guard: " + rewritesHeld + " rewritten file(s) held, not offered to subscribers ("
-                    + rewrites.size() + " of " + catalogSize + " cataloged files rewritten in one cycle); hold "
+                    + rewrites.size() + " of " + catalogSize + " cataloged files rewritten this cycle, " + today.size()
+                    + " in the last 24 h, " + sinceAck + " since the last acknowledgement); hold "
                     + rewriteHoldId + ". If intended, an admin releases them with releaserewrites");
             lastRewriteHoldLogged = rewriteHoldId;
         }
@@ -1249,19 +1558,87 @@ public class RepoEngine {
             dbEngine.markChanged(paths, scanBatchSize);
             dbEngine.unholdChanges(paths);
             refreshRewriteHold();
+            // the admin has seen them: the day and the acknowledged total start over
+            rewrittenToday.clear();
+            dbEngine.clearRewritten();
             logger.warn("releasing " + paths.size() + " held rewrite(s): offered to every subscriber, as an admin asked");
             return paths.size();
         }
     }
 
-    /** How many deletes the mass-delete guard is holding. */
+    // ---- a mirror's held deletes: of content whose producer's claim was orphaned (silent for sync_holder_ttl_ms) ----
+    private final Map<String, String[]> mirrorHeld = new ConcurrentHashMap<>();
+    private volatile String mirrorHoldId;
+
+    private void refreshMirrorHold() {
+        List<DBEngine.Tombstone> set = new ArrayList<>();
+        for (Map.Entry<String, String[]> e : new TreeMap<>(mirrorHeld).entrySet()) {
+            set.add(new DBEngine.Tombstone(e.getKey(), e.getKey(), e.getValue()[0], 0));
+        }
+        String id = set.isEmpty() ? null : DeleteGuard.digest(set);
+        if (id != null && !id.equals(mirrorHoldId)) {
+            logger.error("filerepo " + fileRepoName + ": " + set.size() + " delete(s) of orphaned content held (its producer"
+                    + " was silent for sync_holder_ttl_ms); hold " + id + ". An admin releases them with releasedeletes");
+        }
+        mirrorHoldId = id;
+    }
+
+    /**
+     * Release this mirror's held deletes (an admin's releasedeletes naming {@code holdId}): each file is deleted if it
+     * still holds the content the producer deleted and was not landed here. The count, 0 when nothing is held, -1 when
+     * the id names another set, {@link DeleteGuard#RELEASE_NEEDS_ID} when it names none.
+     */
+    int releaseMirrorHeld(String holdId) {
+        if (holdId == null || holdId.isEmpty()) return DeleteGuard.RELEASE_NEEDS_ID;
+        if (mirrorHeld.isEmpty()) return 0;
+        if (!holdId.equals(mirrorHoldId)) return -1;
+        Path repoBase = getRepoDir().toPath().toAbsolutePath().normalize();
+        Path realBase;
+        try {
+            realBase = repoBase.toRealPath();
+        } catch (IOException ex) {
+            realBase = repoBase;
+        }
+        int n = 0;
+        if (!enterGate()) return 0;
+        try {
+            synchronized (nameLock) {
+                for (Map.Entry<String, String[]> e : new ArrayList<>(mirrorHeld.entrySet())) {
+                    String rel = e.getKey(), md5 = e.getValue()[0], producer = e.getValue()[1];
+                    Target t = target(repoBase, realBase, rel);
+                    try {
+                        if (t.why == null && Files.isRegularFile(t.path, LinkOption.NOFOLLOW_LINKS)
+                                && dbEngine.getFileInfo(t.path.toFile().getAbsolutePath()) == null
+                                && md5.equals(Hashes.content(t.path))) {
+                            Files.delete(t.path);
+                            syncDeleted.incrementAndGet();
+                        }
+                    } catch (IOException ex) {
+                        logger.warn("released delete of " + rel + " not done: " + ex.getMessage());
+                        continue;
+                    }
+                    dbEngine.forgetMirrored(DBEngine.ORPHAN + producer, rel);
+                    dbEngine.forgetMirrored(producer, rel);
+                    mirrorHeld.remove(rel);
+                    n++;
+                }
+            }
+        } finally {
+            exitGate();
+        }
+        refreshMirrorHold();
+        logger.warn("released " + n + " held delete(s) of orphaned content, as an admin asked");
+        return n;
+    }
+
+    /** How many deletes are held: by the mass-delete guard (a producer), or of orphaned content (a mirror). */
     int getDeletesHeld() {
-        return guard.heldCount();
+        return isMirror() ? mirrorHeld.size() : guard.heldCount();
     }
 
     /** The id of the held set (what releasedeletes names), or null. */
     String getHoldId() {
-        return guard.holdId();
+        return isMirror() ? mirrorHoldId : guard.holdId();
     }
 
     /**
@@ -1270,6 +1647,7 @@ public class RepoEngine {
      * another set.
      */
     int releaseHeldDeletes(String holdId) {
+        if (isMirror()) return releaseMirrorHeld(holdId);
         return guard.release(holdId, System.currentTimeMillis());
     }
 
@@ -1595,11 +1973,12 @@ public class RepoEngine {
             reply.setParam("refusal", refusal);
             logger.info("reposubscribe from " + key + " refused: " + refusal);
         } else {
-            String pk = producerKey();
+            String dir = producerDir();
             reply.setParam("producer_epoch", epoch);
-            reply.setParam("producer_key", String.valueOf(pk));
+            // the directory this producer produces from: with the node of its stamped caller, its identity to mirrors
+            reply.setParam("producer_dir", dir);
             reply.setParam("sync_nonce", nonce);
-            if (syncKey != null) reply.setParam("sync_auth", SyncAuth.mac(syncKey, "reposubscribed", name, me, them, nonce, pk, gen));
+            if (syncKey != null) reply.setParam("sync_auth", SyncAuth.mac(syncKey, "reposubscribed", name, me, them, nonce, dir, gen));
             if (wasDropped) reply.setParam("notice", "dropped-for-lag");
         }
         plugin.msgOut(reply);
@@ -1683,7 +2062,10 @@ public class RepoEngine {
 
     // =========================================================================== subscriber
 
-    /** One diff from a producer, waiting for its updater: for this repository's generation, from one holder. */
+    /**
+     * One diff from a producer, waiting for its updater: for this repository's generation, from one holder (null: from a
+     * verified producer that is not this mirror's pinned producer, refused whole).
+     */
     private static final class PendingDiff {
         final String transferId;
         final String filesJson;
@@ -1711,13 +2093,13 @@ public class RepoEngine {
         }
     }
 
-    /** Remember a producer as verified, under a key made from its address (tests). Bounded by sync_max_peers. */
+    /** Remember a producer as verified and pinned, under an identity made from its address (tests). */
     void rememberProducer(String region, String agent, String pluginId) {
-        rememberProducer(region, agent, pluginId, DBEngine.sha256(peerKey(region, agent, pluginId)).substring(0, 32));
+        rememberProducer(region, agent, pluginId, new Identity("-", region, agent, fileRepoName, "/" + pluginId), true);
     }
 
-    /** Remember a producer as verified, with its stable key. Bounded by sync_max_peers. */
-    void rememberProducer(String region, String agent, String pluginId, String producerKey) {
+    /** Remember a verified producer: its identity, and whether it is this mirror's pinned producer. Bounded. */
+    void rememberProducer(String region, String agent, String pluginId, Identity id, boolean pinned) {
         String key = peerKey(region, agent, pluginId);
         long now = System.currentTimeMillis();
         if (!knownProducers.containsKey(key) && knownProducers.size() >= syncMaxPeers) {
@@ -1727,14 +2109,9 @@ public class RepoEngine {
                 return;
             }
         }
-        KnownProducer kp = new KnownProducer(producerKey, now);
-        KnownProducer before = knownProducers.put(key, kp);
-        dbEngine.touchHolder(kp.holder(), now);
-        if (before == null || !before.producerKey.equals(producerKey)) {
-            // a producer that is back takes back what it delivered here before its claims were orphaned
-            int back = dbEngine.unorphan(kp.holder());
-            if (back > 0) logger.info("producer " + key + " (key " + producerKey + ") is back: " + back + " claim(s) taken back");
-        }
+        knownProducers.put(key, new KnownProducer(id, pinned, now));
+        // a pinned producer heard from now: its claims are live (an orphaned claim is not taken back by this; see decide)
+        if (pinned) dbEngine.touchHolder(id.holder(), now);
     }
 
     boolean isKnownProducer(String region, String agent, String pluginId) {
@@ -1746,31 +2123,95 @@ public class RepoEngine {
         return kp != null && System.currentTimeMillis() - kp.lastSeen <= peerTtlMs ? kp : null;
     }
 
+    /**
+     * Is {@code id} this mirror's producer? With sync_producers, it must match one of the pins. Without, the first
+     * verified producer of this name is pinned (trust on first use, kept in the catalog; an admin changes it with
+     * syncpin), and only it.
+     */
+    private boolean isPinnedProducer(Identity id) {
+        if (configuredProducers != null) {
+            for (Pin p : configuredProducers) if (p.matches(id)) return true;
+            return false;
+        }
+        synchronized (this) {
+            if (tofuPin == null) {
+                try {
+                    dbEngine.setMeta(META_PRODUCER_PIN, id.full());
+                } catch (Exception ex) {
+                    logger.error("the producer pin could not be recorded: " + ex.getMessage() + "; not pinning " + id);
+                    return false;
+                }
+                tofuPin = id;
+                logger.warn("filerepo " + fileRepoName + ": pinned its producer " + id + " (trust on first use). Only it"
+                        + " may add, change or delete files here; an admin changes the pin with syncpin, or sets sync_producers");
+            }
+            return tofuPin.full().equals(id.full());
+        }
+    }
+
+    /** The producer pin(s), for repostate. */
+    String pinnedProducers() {
+        if (configuredProducers != null) return configuredProducers.toString();
+        Identity t = tofuPin;
+        return t == null ? null : t.toString();
+    }
+
+    /**
+     * syncpin (an admin's): pin {@code spec} ({@code region/agent:/directory}) as this mirror's producer, replacing the
+     * pin taken on first use, or (spec null) forget that pin, so the next verified producer is pinned. With
+     * {@code adopt}, what the previous producer delivered here becomes the new one's; otherwise its claims are orphaned:
+     * kept, protected from deletes, changed by nobody but it. A new generation follows: the producer offers everything.
+     * Null when it was done, otherwise why not.
+     */
+    synchronized String syncPin(String spec, boolean adopt) {
+        if (configuredProducers != null) return "this mirror's producers come from sync_producers (configuration)";
+        Identity next = null;
+        if (spec != null) {
+            Pin pin = Pin.parse(spec);
+            if (pin == null || pin.dir == null) return "producer must be region/agent:/its/directory";
+            String tenant = null;
+            try {
+                tenant = plugin.getAgentService().getTenant();
+            } catch (Exception ignore) { }
+            next = new Identity(tenant, pin.region, pin.agent, fileRepoName, pin.dir);
+        }
+        Identity before = tofuPin;
+        try {
+            if (next == null) dbEngine.deleteMeta(META_PRODUCER_PIN);
+            else dbEngine.setMeta(META_PRODUCER_PIN, next.full());
+        } catch (Exception ex) {
+            return "the pin could not be recorded: " + ex.getMessage();
+        }
+        tofuPin = next;
+        if (before != null && (next == null || !before.full().equals(next.full()))) {
+            if (adopt && next != null) {
+                int n = dbEngine.adoptClaims(before.holder(), next.holder());
+                logger.warn("syncpin: " + n + " claim(s) of " + before + " handed to " + next);
+            } else {
+                int n = dbEngine.orphanHolder(before.holder());
+                logger.warn("syncpin: " + n + " claim(s) of " + before + " orphaned (kept, protected, frozen)");
+            }
+        }
+        knownProducers.clear();
+        attempts.clear();
+        syncGen = newGen();
+        writeGenerationMarker();
+        logger.warn("syncpin: producer pin " + (next == null ? "cleared (the next verified producer is pinned)" : "is " + next)
+                + "; a new generation " + syncGen);
+        return null;
+    }
+
     /** This repository's sync generation, as its subscribe advertises it (tests). */
     String getSyncGen() {
         return syncGen;
     }
 
-    /** True when this repository may take any producer: it holds a sync_key, or an admin pinned its producers. */
-    private boolean syncConfigured() {
-        if (syncKey != null || configuredProducers != null) return true;
-        long now = System.currentTimeMillis();
-        if (now - syncOffWarned > 3_600_000L) {
-            syncOffWarned = now;
-            logger.error("filerepo " + fileRepoName + ": sync is off. A mirror takes a producer only when both hold the"
-                    + " same sync_key (an admin-provisioned secret for this repository name) or the producer is pinned in"
-                    + " sync_producers; this one has neither");
-        }
-        return false;
-    }
-
     /**
-     * A producer's discover (dataplane, unverified): only an address to ask. Taken only when this repository may take
-     * producers at all (sync_key or sync_producers), from a pinned producer if it has pins, and with a sync_key only
-     * when the discover carries a fresh proof of it (a forged discover costs nothing and sends nothing). A subscribe
-     * (reposubscribe, a MsgEvent, with a nonce and, with a sync_key, its proof) goes to it at most once per
-     * sync_subscribe_retry_ms per producer; the producer is taken only when it answers, verified by its stamped caller
-     * and its proof.
+     * A producer's discover (dataplane, unverified): only an address to ask. Taken by a mirror only; with sync_producers
+     * only from a pinned node, and with a sync_key only when the discover carries a fresh proof of it (a forged discover
+     * costs nothing and sends nothing). A subscribe (reposubscribe, a MsgEvent, with a nonce and, with a sync_key, its
+     * proof) goes to it at most once per sync_subscribe_retry_ms per producer; the producer is known only when it
+     * answers, verified by its stamped caller (and its proof), and only the pinned producer may change anything here.
      */
     private void onDiscover(Map<String, String> m) {
         String region = m.get("repo_region_id"), agent = m.get("repo_agent_id"), pluginId = m.get("repo_plugin_id");
@@ -1786,8 +2227,12 @@ public class RepoEngine {
                     + SYNC_PROTO + ": not syncing from it until it is upgraded");
             return;
         }
-        if (!syncConfigured()) return;
-        if (configuredProducers != null && !configuredProducers.contains(key)) return;
+        if (!isMirror()) return;
+        if (configuredProducers != null) {
+            boolean node = false;
+            for (Pin p : configuredProducers) if (p.region.equals(region) && p.agent.equals(agent)) node = true;
+            if (!node) return;
+        }
         if (syncKey != null) {
             long ts;
             try {
@@ -1803,6 +2248,7 @@ public class RepoEngine {
             }
         }
         sweepHolders(now);
+        checkGenerationMarker(false);
         String nonce = SyncReceiver.token();
         synchronized (attempts) {
             Attempt last = attempts.get(key);
@@ -1862,8 +2308,9 @@ public class RepoEngine {
 
     /**
      * reposubscribed: a producer's answer, from its stamped caller; taken only from a producer this repository asked,
-     * echoing the nonce of that ask, and with a sync_key only with its proof. The producer is then known by its stable
-     * key (what it delivers here is recorded under that key, whatever plugin id serves it).
+     * echoing the nonce of that ask, and with a sync_key only with its proof. The producer is then known by its
+     * identity: the node its caller stamp names, this repository's name, and the directory it reports producing from.
+     * Whether it is this mirror's producer is the pin's decision (sync_producers, or the first verified producer).
      */
     void onSubscribed(MsgEvent m) {
         String[] from = Callers.plugin(m, insecure);
@@ -1877,34 +2324,49 @@ public class RepoEngine {
             logger.warn("reposubscribed from " + key + " ignored: this repository did not ask it");
             return;
         }
-        if (configuredProducers != null && !configuredProducers.contains(key)) return;
-        if (syncKey == null && configuredProducers == null) return;
+        if (!isMirror()) return;
         if (!("true".equals(m.getParam("accepted")) && fileRepoName != null && fileRepoName.equals(m.getParam("filerepo_name"))
                 && SYNC_PROTO.equals(m.getParam("sync_proto")))) {
             knownProducers.remove(key);
             logger.info("producer " + key + " did not take this subscriber: " + m.getParam("refusal"));
             return;
         }
-        String pk = m.getParam("producer_key");
+        String dir = m.getParam("producer_dir");
         String nonce = a.nonce;
-        if (pk == null || !pk.matches("[0-9a-f]{32}") || nonce == null || !nonce.equals(m.getParam("sync_nonce"))) {
+        if (dir == null || !dir.startsWith("/") || dir.length() > 1000 || nonce == null || !nonce.equals(m.getParam("sync_nonce"))) {
             syncUnverified.incrementAndGet();
-            logger.warn("reposubscribed from " + key + " ignored: no valid producer key, or not the answer to this ask");
+            logger.warn("reposubscribed from " + key + " ignored: no producer directory, or not the answer to this ask");
             return;
         }
         if (syncKey != null && !SyncAuth.verify(syncKey, m.getParam("sync_auth"), "reposubscribed", fileRepoName,
                 SyncAuth.addr(from[0], from[1], from[2]),
-                SyncAuth.addr(plugin.getRegion(), plugin.getAgent(), plugin.getPluginID()), nonce, pk, syncGen)) {
+                SyncAuth.addr(plugin.getRegion(), plugin.getAgent(), plugin.getPluginID()), nonce, dir, syncGen)) {
             syncUnverified.incrementAndGet();
             logger.warn("reposubscribed from " + key + " ignored: it does not hold this repository's sync_key");
             return;
         }
         a.nonce = null;   // one answer per ask
-        rememberProducer(from[0], from[1], from[2], pk);
+        Identity id = new Identity(Callers.tenant(m, insecure), from[0], from[1], fileRepoName, dir);
+        boolean pinned = isPinnedProducer(id);
+        if (!pinned) {
+            unpinnedSeen.put(id.full(), System.currentTimeMillis());
+            warnUnpinned(id);
+        }
+        rememberProducer(from[0], from[1], from[2], id, pinned);
         if ("dropped-for-lag".equals(m.getParam("notice"))) {
             logger.error("producer " + key + " had dropped this mirror for lagging: it may hold files deleted at the"
                     + " producer since; clear it (clearrepo) to make it exact");
         }
+    }
+
+    /** At most once an hour per producer: a verified producer of this name that is not this mirror's pinned producer. */
+    private void warnUnpinned(Identity id) {
+        long now = System.currentTimeMillis();
+        Long last = unpinnedWarned.get(id.full());
+        if (last != null && now - last < 3_600_000L) return;
+        unpinnedWarned.put(id.full(), now);
+        logger.warn("producer " + id + " of " + fileRepoName + " is not this mirror's pinned producer (" + pinnedProducers()
+                + "): what it offers is refused, what it deletes is ignored");
     }
 
     public void getFileRepoDiff(String repoDiffString, String transferId, String region, String agent, String pluginId) {
@@ -1932,7 +2394,9 @@ public class RepoEngine {
             return new Accepted("9", "refused: offered for generation " + gen + ", this repository is at " + current);
         }
         kp.lastSeen = System.currentTimeMillis();
-        PendingDiff diff = new PendingDiff(transferId, filesJson, deletesJson, current, kp.holder());
+        // a verified producer that is not this mirror's pinned producer: taken, and answered with every file refused
+        // and every delete ignored (its offers settle at it; nothing here changes)
+        PendingDiff diff = new PendingDiff(transferId, filesJson, deletesJson, current, kp.pinned ? kp.holder() : null);
         synchronized (lockPeerUpdateQueueMap) {
             Deque<PendingDiff> q = peerUpdateQueueMap.get(repoId);
             if (q == null) {
@@ -2084,11 +2548,16 @@ public class RepoEngine {
         }
         Map<String, DBEngine.Holding> claims = dbEngine.holdings(rel);
         DBEngine.Holding mine = claims.remove(holder);
-        boolean otherLive = false, otherLiveFetched = false, otherFetchedDifferent = false;
-        Set<String> orphaned = new HashSet<>();
+        // this producer's own claim, orphaned while it was silent: it (and only it) may act on that content again
+        DBEngine.Holding myOrphan = claims.remove(DBEngine.ORPHAN + holder);
+        if (mine == null) mine = myOrphan;
+        boolean otherLive = false, otherLiveFetched = false, otherFetchedDifferent = false, otherOrphanDifferent = false;
+        Set<String> otherOrphanMd5s = new HashSet<>();
         for (Map.Entry<String, DBEngine.Holding> e : claims.entrySet()) {
             if (e.getKey().startsWith(DBEngine.ORPHAN)) {
-                orphaned.add(e.getValue().md5);
+                // another producer's orphaned content: nobody but that producer may replace it
+                otherOrphanMd5s.add(e.getValue().md5);
+                if (!md5.equals(e.getValue().md5)) otherOrphanDifferent = true;
                 continue;
             }
             otherLive = true;
@@ -2104,16 +2573,18 @@ public class RepoEngine {
             String held = Hashes.content(localPath);
             if (held == null) return new Verdict(Take.REFUSE, ' ', "the file here could not be read");
             if (held.equals(md5)) {
-                boolean fetched = (mine != null && mine.kind == DBEngine.HOLD_FETCHED) || !otherLiveFetched;
+                boolean fetched = (mine != null && mine.kind == DBEngine.HOLD_FETCHED)
+                        || (!otherLiveFetched && otherOrphanMd5s.isEmpty());
                 return new Verdict(Take.HOLD, fetched ? DBEngine.HOLD_FETCHED : DBEngine.HOLD_MATCHED, null);
             }
-            boolean ownEarlier = mine != null && held.equals(mine.md5) && !otherLiveFetched;
-            boolean orphan = mine == null && !otherLive && orphaned.contains(held);
-            if (ownEarlier || orphan) return new Verdict(Take.FETCH, DBEngine.HOLD_FETCHED, null);
-            return new Verdict(Take.REFUSE, ' ', otherLive ? "the file here is another producer's content ("
-                    + claims.keySet() + ")" : "the file here holds other content, not this producer's");
+            boolean ownEarlier = mine != null && held.equals(mine.md5) && !otherLiveFetched && !otherOrphanMd5s.contains(held);
+            if (ownEarlier) return new Verdict(Take.FETCH, DBEngine.HOLD_FETCHED, null);
+            return new Verdict(Take.REFUSE, ' ', otherOrphanMd5s.contains(held) ? "the file here is the orphaned content of a"
+                    + " producer silent for sync_holder_ttl_ms: only it may replace it"
+                    : otherLive ? "the file here is another producer's content (" + claims.keySet() + ")"
+                    : "the file here holds other content, not this producer's");
         }
-        if (otherFetchedDifferent) {
+        if (otherFetchedDifferent || otherOrphanDifferent) {
             return new Verdict(Take.REFUSE, ' ', "another producer delivered other content under that name");
         }
         return new Verdict(Take.FETCH, DBEngine.HOLD_FETCHED, null);
@@ -2144,6 +2615,20 @@ public class RepoEngine {
         logger.debug("UPDATING " + repoId + " transferid: " + pending.transferId);
         List<String> failedFiles = new ArrayList<>();
         List<String> failedDeletes = new ArrayList<>();
+        if (holder == null) {
+            // not this mirror's producer: no name here is its to add, change or delete
+            List<String> refused = new ArrayList<>();
+            for (FileObject f : remoteRepoFiles.values()) if (f != null && f.filePath != null) refused.add(f.filePath);
+            syncUnpinned.addAndGet(refused.size() + remoteDeletes.size());
+            MsgEvent c = plugin.getGlobalPluginMsgEvent(MsgEvent.Type.EXEC, region, agent, pluginId);
+            c.setParam("action", "repoconfirm");
+            c.setParam("transfer_id", pending.transferId);
+            c.setParam("sync_proto", SYNC_PROTO);
+            c.setParam("sync_gen", pending.gen);
+            if (!refused.isEmpty()) c.setCompressedParam("refusedfiles", gson.toJson(refused));
+            plugin.msgOut(c);
+            return;
+        }
         Path repoBase = getRepoDir().toPath().toAbsolutePath().normalize();
         Path realBase;
         try {
@@ -2184,7 +2669,10 @@ public class RepoEngine {
                 String md5 = fileObject.MD5;
                 Verdict v = underGate(pending.gen, () -> {
                     Verdict now = decide(localPath, rel, md5, holder);
-                    if (now.take == Take.HOLD) dbEngine.recordMirrored(holder, rel, md5, now.kind);
+                    if (now.take == Take.HOLD) {
+                        dbEngine.recordMirrored(holder, rel, md5, now.kind);
+                        dbEngine.forgetMirrored(DBEngine.ORPHAN + holder, rel);
+                    }
                     return now;
                 });
                 if (v == null) {
@@ -2219,11 +2707,13 @@ public class RepoEngine {
                         Verdict again = decide(dest, rel, md5, holder);
                         if (again.take == Take.HOLD) {
                             dbEngine.recordMirrored(holder, rel, md5, again.kind);
+                            dbEngine.forgetMirrored(DBEngine.ORPHAN + holder, rel);
                             return again;
                         }
                         if (again.take != Take.FETCH) return again;
                         Files.move(part, dest, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
                         dbEngine.recordMirrored(holder, rel, md5, DBEngine.HOLD_FETCHED);
+                        dbEngine.forgetMirrored(DBEngine.ORPHAN + holder, rel);
                         // claims on content that is no longer here go
                         dbEngine.forgetOtherClaims(rel, holder, md5);
                         return again;
@@ -2321,6 +2811,13 @@ public class RepoEngine {
     private boolean deleteLocked(DeleteObject d, String producer, Path localPath) throws IOException {
         Map<String, DBEngine.Holding> claims = dbEngine.holdings(d.fileName);
         DBEngine.Holding mine = claims.remove(producer);
+        DBEngine.Holding myOrphan = claims.remove(DBEngine.ORPHAN + producer);
+        if (mine == null && myOrphan != null && d.MD5.equals(myOrphan.md5)) {
+            // content its producer delivered and then went silent for sync_holder_ttl_ms: deleting it needs an admin
+            // release with this mirror's hold id; until then the delete is held (the producer offers it again)
+            if (mirrorHeld.putIfAbsent(d.fileName, new String[]{d.MD5, producer}) == null) refreshMirrorHold();
+            return false;
+        }
         if (mine == null) {
             // this producer never delivered that name here: not its to delete
             return true;
@@ -2454,6 +2951,13 @@ public class RepoEngine {
                     "the origin of what it holds: no producer refills it");
         }
         facts.put("role", "subscriber");
+        String pin = pinnedProducers();
+        facts.put("pinned_producer", pin == null ? "none yet (the first verified producer will be pinned)" : pin);
+        if (!unpinnedSeen.isEmpty()) facts.put("unpinned_producers", String.valueOf(unpinnedSeen.size()));
+        if (!mirrorHeld.isEmpty()) {
+            facts.put("deletes_held", String.valueOf(mirrorHeld.size()));
+            facts.put("deletes_hold_id", String.valueOf(mirrorHoldId));
+        }
         boolean hasLanded = isLanded() || dbEngine.hasFiles();
         facts.put("landed", String.valueOf(hasLanded));
         if (hasLanded) {
@@ -2588,6 +3092,7 @@ public class RepoEngine {
             // clear that fails partway), and the next discover subscribes again at once
             syncGen = newGen();
             attempts.clear();
+            writeGenerationMarker();
 
             Runnable hook = afterClearCheck;
             if (hook != null) hook.run();

@@ -159,6 +159,14 @@ public class Plugin implements PluginService {
             return true;
         } catch(Exception ex) {
             ex.printStackTrace();
+            // a failed start keeps nothing: the engines stop and the catalog (and its directory lock) is released
+            try { if (repoEngine != null) repoEngine.shutdown(); } catch (Exception ignore) { }
+            try { if (dbEngine != null) dbEngine.shutdown(); } catch (Exception ignore) { }
+            try { if (liveTier != null) liveTier.close(); } catch (Exception ignore) { }
+            repoEngine = null;
+            dbEngine = null;
+            liveTier = null;
+            pluginBuilder = null;
             return false;
         }
     }

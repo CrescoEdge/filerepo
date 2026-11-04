@@ -82,27 +82,43 @@ filerepo logs a WARNING at start if such a directory exists.)
 **Where a repository's state lives.** Nothing is kept in the plugin's own data directory, which the controller
 deletes when it stops a plugin added at runtime: the default repository directory is under the agent's data
 directory, by repository name, and the **catalog** (the Derby database: what was cataloged and landed, the sync state,
-the producer's identity, the mirror's generation) is in `<agent data dir>/filerepo/state/<SHA-256 of the repository
-directory>`, so the same directory finds the same catalog whatever plugin id serves it: a redeployed plugin keeps its
-identity, its catalog and its subscribers. One plugin serves one repository directory at a time (a lock file there): a
-second plugin over the same directory (or a second unnamed default repository on one agent) opens no catalog, serves
-nothing, and says so in its health check. A catalog or default repository from before is moved (renamed) there once, at
-start, with its catalog rows; nothing is deleted, and if both the old and the new default directory hold files, the old
-one is left alone and an ERROR names both.
+the producer pin, the mirror's generation) is in `<agent data dir>/filerepo/state/<SHA-256 of the repository
+directory's real path>`, so the same directory finds the same catalog whatever plugin id serves it and however its
+path is spelled: a redeployed plugin keeps its catalog and its subscribers. One plugin serves one repository directory
+at a time: it is locked by its real path, and by its file key (device and inode, `<agent data dir>/filerepo/locks`),
+so a second plugin over the same directory (another spelling, a symlinked parent, a bind mount, or a second unnamed
+default repository on one agent) opens no catalog, refuses every verb (`refusal=catalog-closed`) and says so in its
+health check. A start that fails releases the lock. A catalog or default repository from before is moved there once,
+at start: a rename, journaled (`migration.journal` in the state directory) so a crash between the rename and the
+rewrite of the catalog's paths is completed at the next start; a catalog on another filesystem is copied and verified
+file by file before it is adopted (an interrupted copy is discarded and made again); a default repository on another
+filesystem is not copied at all. Nothing is ever deleted; if both the old and the new default directory hold files,
+the old one is left alone and an ERROR names both.
 
-**Which producers a mirror takes: `sync_key`.** A mirror (consumer) takes as producer only a plugin an admin bound to
-it, and **with neither binding it syncs nothing** (an ERROR says so, once an hour):
+**Who a mirror's producer is: the pin.** A producer is known by what no other node can forge: the **node it runs on**,
+from the broker's stamp of its caller (`<tenant>/<region>/<agent>`), with the repository name and the **directory it
+produces from** on that node (the real path it reports). Not its plugin id (a redeployed producer over the same
+directory is the same producer), and not anything a holder of a shared secret could claim. Each mirror has a **pinned
+producer**, and only it may add, change or delete files there:
 
-- **`sync_key`** (recommended): one secret per repository name, provisioned by an admin on the producer(s) and on
-  every mirror of that `filerepo_name` (at least 16 characters; it never travels, only proofs of it do). A producer's
-  `discover` carries an HMAC-SHA256 proof bound to its address and the time (a mirror ignores a discover without a
-  fresh one, at no cost: it sends nothing); the mirror's `reposubscribe` carries a proof bound to both addresses, its
-  generation and a fresh nonce (a keyed producer refuses a mirror without it); the producer's `reposubscribed` carries
-  a proof bound to both addresses, that nonce, its generation and the producer's stable key. Any plugin of the tenant
-  can still announce itself as a producer of the name; without the key it is never taken.
-- **`sync_producers`**: an admin's comma list of `region/agent/pluginid`; the mirror subscribes to those only. A
-  pinned plugin id changes when the producer is redeployed (`pluginadd` gives a new id), so pins must be updated then;
-  prefer `sync_key`.
+- **`sync_producers`** (recommended): an admin's comma list of pins, `region/agent:/the/producer's/directory` (or
+  `region/agent` for any producer of the name on that node). The mirror asks only those nodes. The round-2 form
+  `region/agent/pluginid` is read as the node `region/agent`, with a WARN.
+- **Trust on first use** (no `sync_producers`): the first verified producer of the name the mirror subscribes to is
+  pinned, recorded in the catalog, and logged (a WARN naming it). Check `repostate`'s `pinned_producer` after the first
+  sync. To change it an admin sends **`syncpin`** to the mirror (`confirm=<the mirror's directory>`,
+  `producer=region/agent:/its/directory`, and `adopt=true` to hand the old producer's files to the new one; or
+  `reset=true` to pin the next verified producer); a new generation follows, so the new producer offers everything.
+- Other verified producers of the name are still known (`repostate` counts `unpinned_producers`, a WARN an hour names
+  them), but everything they offer is refused and everything they delete ignored: they settle at the producer (logged
+  there as refused) and nothing at the mirror changes. Any mirror, or any bundle on a mirror's agent, can run a
+  producer of the name; it is never the pinned one.
+- **`sync_role`** (`producer`, `mirror` or `none`; unset: a scan dir makes a producer, a repo_dir a mirror): a
+  repository configured as a mirror never answers as a producer, even with a scan dir.
+- **`sync_key`** (optional): one secret per repository name, on the producer(s) and every mirror. It is an additional
+  proof of membership, never an identity: a keyed mirror ignores a discover without a fresh HMAC proof of it (a forged
+  discover costs nothing, and sends nothing), takes a `reposubscribed` only with a proof bound to both addresses, its
+  nonce, its generation and the producer's directory; a keyed producer refuses a mirror that does not prove it.
 
 **Sync protocol 2.** A producer broadcasts `discover` on the dataplane (only an address, with its proof); a consumer
 answers with `reposubscribe`, a MsgEvent to that address; the producer takes it only as a producer of the same
@@ -110,11 +126,6 @@ answers with `reposubscribe`, a MsgEvent to that address; the producer takes it 
 and **both sides know each other by their stamped caller (`cresco_caller`), never by a message's source fields**.
 Then the producer sends `repolistin` pages (files, plus `repodeletes`) → the consumer pulls each changed file with the
 producer's own `streamfile` **over the dataplane**, verifies it and moves it into place → `repoconfirm`.
-
-- **A producer's identity is stable.** A producer has a random key kept in its catalog; a mirror records what it
-  fetched under that key, not under the plugin id. A producer redeployed over the same scan dir (a new plugin id, the
-  same catalog) is the same producer to its mirrors: it updates and deletes what it delivered, and its subscribers are
-  not offered everything again.
 
 - **Over the dataplane, verified.** Only one small `streamfile` request per file crosses the control plane; the bytes
   ride the dataplane. Chunks are written at their `offset`; a range lost in transit is asked for again
@@ -129,18 +140,25 @@ producer's own `streamfile` **over the dataplane**, verifies it and moves it int
   while the catalog changes. A confirm settles only its own transfer: transfer ids carry the producer instance's
   random epoch, and a transfer is bound to the subscriber it was offered to, to the file versions it offered, and to
   the subscriber's generation it was offered for.
-- **Generations.** A mirror's sync generation is kept in its catalog, so a plain restart resumes where it left off
-  (nothing is offered again). A clear renews it before the first file goes. An offer for an earlier generation is
+- **Generations.** A mirror's sync generation is kept in its catalog, and a marker of it inside the mirror's directory
+  (`.filerepo-staging/generation`), so a plain restart resumes where it left off (nothing is offered again), while a
+  directory that came back without its marker (a new, replaced or reformatted volume), with another generation's, or
+  empty though the catalog records what its producer delivered (an `rm -rf` instead of `clearrepo`), starts a new
+  generation at once (checked at start and at most once a minute): its producer offers it everything again, and
+  nothing is deleted. A clear renews it before the first file goes. An offer for an earlier generation is
   refused by the mirror; a transfer the mirror was applying when it was cleared commits nothing more (each file and
   delete is committed under the repository gate, only while the generation is the one the transfer was taken for),
   and its confirm settles nothing at the producer. A producer resets a subscriber for a new generation (everything
   offered again) at most a few times at once, then once per `sync_reset_interval_ms`.
-- **Several producers of one name.** A mirror records, per name, which producer's content it holds: a *fetched*
-  claim (the bytes came from that producer) or a *matched* one (a producer offered exactly the content already there).
-  The producer with the fetched claim updates and deletes the file; a matched claim never blocks its updates, but a
-  file another producer still claims is never deleted (only the deleting producer's claim goes). A producer not heard
-  from for `sync_holder_ttl_ms` has its claims orphaned: they still protect their files from every delete, but
-  another verified producer of the name may then update them; the producer, when it is back, takes them back.
+- **Several pinned producers of one name** (`sync_producers` listing several). A mirror records, per name, which
+  producer's content it holds: a *fetched* claim (the bytes came from that producer) or a *matched* one (a producer
+  offered exactly the content already there). The producer with the fetched claim updates and deletes the file; a
+  matched claim never blocks its updates, but a file another producer still claims is never deleted (only the deleting
+  producer's claim goes).
+- **A silent producer's files.** A producer not heard from for `sync_holder_ttl_ms` (30 days) has its claims
+  orphaned: its files may then be replaced by **it alone** (no other producer, pinned or not), and **deleting them
+  always needs an admin**: such a delete is held at the mirror (`repostate` `deletes_held`, `deletes_hold_id`, a health
+  WARN, an ERROR) until an admin sends `releasedeletes` to the mirror with `confirm` and that `hold_id`.
 - **A mirror's own content is safe.** A consumer records which producer delivered which content under which name
   (the catalog's `mirrored` table). Sync never overwrites a file landed there (`putfiles`, `putjar`), nor content that
   is not that producer's, nor another producer's; it never deletes a file another producer still holds there; and a
@@ -166,7 +184,13 @@ producer's own `streamfile` **over the dataplane**, verifies it and moves it int
     `sync_delete_guard_window_ms` (15 min) too: a loss spread over cycles (a deletion still running while a scan reads
     the tree, a slow drip) is held once it adds up, so what gets through unheld is bounded by the threshold. (In a small
     repository, a few deletes are a large fraction: raise the fraction, or shorten the window, for a small churny one.)
-    A release starts the window over.
+    A release starts the window over;
+  - everything when the deletes recorded in the last 24 hours, with this cycle's, are at least the minimum **and** more
+    than `sync_delete_guard_day_fraction` (25%) of the catalog: a slower drip is held within a day;
+  - everything when the catalog would shrink by more than `sync_delete_guard_total_fraction` (50%) of the most it held
+    since the last admin acknowledgement (a release; kept in the catalog across restarts): however slowly a catalog is
+    drained, never past half of it without an admin. Each longer budget is at least as large as the shorter ones (it
+    follows a raised fraction), and `0` turns it off.
 
   The rows stay; `repostate` reports `deletes_held` and `deletes_hold_id`, the health check WARNs and
   `filerepo.sync.deletes.held` counts them, every cycle, until the files return or an admin sends `releasedeletes`
@@ -178,8 +202,11 @@ producer's own `streamfile` **over the dataplane**, verifies it and moves it int
   `sync_rewrite_guard_fraction` (25%) of the catalog (ransomware, the wrong volume or an old snapshot on the mount
   point) has those rewrites held: offered to no subscriber, new ones included, while every mirror keeps its copy.
   A held file changed again stays held; one changed back to the content the mirrors have is no longer held and offered
-  to nobody. `repostate` reports `rewrites_held` and `rewrites_hold_id`, the health check WARNs, until an admin sends
-  `releaserewrites` with `confirm` and that `hold_id`. A touch (a new time, the same content) is no change at all.
+  to nobody. The same longer horizons hold a slower rewrite: distinct files rewritten in the last 24 hours more than
+  `sync_rewrite_guard_day_fraction` (25%) of the catalog, or since the last acknowledgement (a `releaserewrites`) more
+  than `sync_rewrite_guard_total_fraction` (50%); each at least the minimum. `repostate` reports `rewrites_held` and
+  `rewrites_hold_id`, the health check WARNs, until an admin sends `releaserewrites` with `confirm` and that `hold_id`.
+  A touch (a new time, the same content) is no change at all.
 - **Bounded.** A consumer keeps at most `sync_pending_per_peer` diffs per producer and `sync_max_peers` producers,
   on `sync_threads` threads with `sync_queue_max` waiting; past any bound a diff is refused as busy
   (`status_code 11`) and the producer offers it again next cycle. A producer offers to `sync_offer_threads`
@@ -381,7 +408,7 @@ are base64 in the reply. A refusal of the live-tier and clear rules is `status 9
 
 Roles (`@CrescoAction(roles=...)`, enforced by the agent before filerepo runs; see the controller's
 `docs/caller-authorization.md`): **`clearrepo`, `putjar`, `removefile`, `putfiles`, `putfilesremote`,
-`releasedeletes`, `releaserewrites` and `liverealise` need `infra` or `admin`**; `repolistin`, `repoconfirm`, `reposubscribe` and
+`releasedeletes`, `releaserewrites`, `syncpin` and `liverealise` need `infra` or `admin`**; `repolistin`, `repoconfirm`, `reposubscribe` and
 `reposubscribed` need `plugin` (another filerepo); every other action is open to callers of this agent's tenant and to
 `infra`. Wherever filerepo itself needs to know who called (the owner of a transfer, an admin's `force`, a sync peer)
 it reads only the stamped caller; a message without one is anonymous only in explicit insecure development mode
@@ -401,8 +428,9 @@ it reads only the stamped caller; a message without one is anonymous only in exp
 | `getscandir` | — | `scan_dir` | Report the configured scan directory. Refused on a live-backed repository. |
 | `removefile` *(infra/admin)* | `file_name`; optional `repo_name` | `status` | Remove a file (disk + catalog row), contained to the repository directory; on a producer, a delete for its subscribers. |
 | `clearrepo` *(infra/admin)* | `confirm` *(req)*; optional `repo_name`, `force` | `status`, `state`, `refusal` | Delete every file in the repository directory. An only copy needs `force=true` (admin). |
-| `releasedeletes` *(infra/admin)* | `confirm` *(req)*, `hold_id` *(req)* | `released`, `hold_id` | Let the next scan record exactly the deletes the mass-delete guard holds (refused without `hold_id`, or if it names another set). |
+| `releasedeletes` *(infra/admin)* | `confirm` *(req)*, `hold_id` *(req)* | `released`, `hold_id` | On a producer: let the next scan record exactly the deletes the mass-delete guard holds. On a mirror: apply the held deletes of a silent producer's files. Refused without `hold_id`, or if it names another set. |
 | `releaserewrites` *(infra/admin)* | `confirm` *(req)*, `hold_id` *(req)* | `released` | Offer exactly the rewrites the rewrite guard holds (refused without `hold_id`, or if it names another set). |
+| `syncpin` *(infra/admin)* | `confirm` *(req)*, `producer` (`region/agent:/dir`) or `reset=true`, optional `adopt` | `pinned_producer` | A mirror's producer pin (trust on first use) replaced, or forgotten; a new generation follows. Refused where `sync_producers` is configured. |
 | `repostate` | — | `state`, `backing`, facts | What the repo is: `LIVE`, `WORKSPACE_CLEAN`, `WORKSPACE_DIRTY`, `MIRROR` or `ONLY_COPY`. |
 | `liverelay` | `request` (json, req) | `reply` (json), `reply_status` | Relay a request signed by its end user, unchanged, through the live-tier provider. |
 | `liverealise` *(infra/admin)* | optional `lease_ms` (at most `live_lease_max_ms`), `request_id` | `job_id`, `reply_status` | Realise a live-backed repo's copy again, as the node (keeps it live). |
@@ -462,13 +490,14 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_max_peers` | `256` | Producers syncing at once (and subscribers kept by a producer). |
 | `sync_diff_page` / `sync_delete_page` | `1000` / `1000` | Files / deletes per `repolistin` page. |
 | `sync_pages_per_cycle` | `8` | Pages a subscriber is offered per cycle beyond this cycle's changes (catch-up after a failure, a new or a cleared subscriber). `sync_full_pages_per_cycle` is the older name. |
-| `sync_key` | *(unset)* | **The binding between a repository's producer(s) and mirrors** (a secret of at least 16 characters, the same on all of them; an admin provisions it like any secret). A mirror takes only producers that prove it, a keyed producer serves only mirrors that prove it. A mirror with neither `sync_key` nor `sync_producers` syncs nothing. |
-| `sync_producers` | *(unset)* | A consumer's pinned producers (`region/agent/pluginid`, comma-separated): it subscribes to no other (with `sync_key` too, they must also prove it). |
+| `sync_producers` | *(unset)* | **A mirror's pinned producers**: `region/agent:/the/producer's/directory` (or `region/agent`), comma-separated. Only they may change the mirror; it asks no other node. Unset: the first verified producer is pinned (trust on first use; `syncpin` changes it). |
+| `sync_role` | *(from the directories)* | `producer`, `mirror` or `none`. A mirror never acts as a producer. |
+| `sync_key` | *(unset)* | An additional proof of membership (a secret of at least 16 characters, the same on a repository's producer(s) and mirrors): discovers, subscribes and answers without its proof are ignored. Never an identity. |
 | `sync_subscribe_retry_ms` | `10000` | A consumer asks one producer at most this often. |
 | `sync_peer_ttl_ms` | `3600000` | A producer (at a consumer) not heard from for this long is forgotten until it answers again. |
 | `sync_subscriber_ttl_ms` | `604800000` (7 days) | A subscriber (at a producer) silent this long is dropped, with an ERROR; until then it is kept with everything it owes (deletes included). |
 | `sync_lag_alarm_ms` | `86400000` | A subscriber owing confirms this long is an alarm (ERROR a day, gauge, health WARN). |
-| `sync_holder_ttl_ms` | `2592000000` (30 days) | At a consumer: claims of a producer not heard from this long are orphaned (they protect their files from deletes, but another verified producer may update them). |
+| `sync_holder_ttl_ms` | `2592000000` (30 days) | At a mirror: claims of a producer not heard from this long are orphaned: only it may replace those files, and deleting them needs an admin's `releasedeletes` at the mirror. |
 | `sync_reset_interval_ms` | `600000` | A subscriber's new generations (each re-offers the whole catalog) are taken a few at once, then one per this interval. |
 | `sync_offer_timeout_ms` | `600000` | An offered file is not offered again for this long unless confirmed or failed. |
 | `sync_stream_buffer` | `262144` | Chunk size a consumer asks for (4 KB - 768 KB). |
@@ -479,8 +508,10 @@ Passed as the plugin config map (e.g. via the client's `add_plugin_agent`, or th
 | `sync_tombstone_ttl_ms` | `604800000` (7 days) | How long a delete every kept subscriber applied is kept. |
 | `sync_delete_guard_min` / `sync_delete_guard_fraction` | `3` / `0.10` | The mass-delete guard: a loss of at least this many files and more than this fraction of the catalog is held. |
 | `sync_delete_guard_window_ms` | `900000` (15 min) | Deletes recorded this recently count with a cycle's loss for the fraction (`0`: each cycle alone). |
+| `sync_delete_guard_day_fraction` / `sync_delete_guard_total_fraction` | `0.25` / `0.5` | Deletes in a rolling 24 h, and the shrink since the last acknowledgement, beyond which everything is held (`0`: off). |
 | `sync_delete_guard_subtree_min` / `sync_delete_guard_subtree_fraction` | `10` / `0.01` | A whole subtree that lost all its cataloged files, at least this many and more than this fraction of the catalog, is held. (A vanished mount and an emptied scan dir are always held.) |
 | `sync_rewrite_guard_min` / `sync_rewrite_guard_fraction` | `10` / `0.25` | The rewrite guard: a cycle rewriting at least this many existing files and more than this fraction of the catalog is held. `1.0` turns it off. |
+| `sync_rewrite_guard_day_fraction` / `sync_rewrite_guard_total_fraction` | `0.25` / `0.5` | Distinct files rewritten in a rolling 24 h, and since the last `releaserewrites`, beyond which rewrites are held (`0`: off). |
 | `sync_release_ttl_ms` | `600000` | How long an admin's release waits for the scan that applies it. |
 | `live_lease_max_ms` | `86400000` | The longest lease `liverealise` may ask for. |
 | `putfiles_require_hashes` | `true` | `putfiles` refuses a file without an expected hash. |
@@ -601,10 +632,11 @@ def stream_get(path, size):
 
 What an operator sees change, and what to do:
 
-- **Bind each repository's producers and mirrors: set `sync_key`.** A mirror now takes a producer only when both
-  hold the same `sync_key` (or the producer is pinned in `sync_producers`); with neither, **a mirror syncs nothing**
-  and says so (an ERROR, once an hour). Before upgrading, generate one secret per `filerepo_name` (for example
-  `openssl rand -hex 32`) and add `sync_key` to the config of its producer(s) and every mirror.
+- **Pin each mirror's producer.** Set `sync_producers=region/agent:/the/producer's/scan/dir` on every mirror (the
+  producer's node and the real path of its scan dir). Without it, a mirror pins the first verified producer it hears
+  from (trust on first use): check its `repostate` (`pinned_producer`) after the first sync, and correct it with
+  `syncpin` if needed. Only the pinned producer changes a mirror; any other producer of the name is refused.
+  `sync_key` is optional now (an extra proof of membership). `sync_role=mirror` keeps a mirror from ever producing.
 - **State moved out of the plugin's data directory.** The catalog moves (renamed, once, at start) to
   `<agent data dir>/filerepo/state/...`, and the default repository directory to
   `<agent data dir>/filerepo/repos/<filerepo_name, or "default">`, with its catalog rows; nothing is deleted. Two
@@ -646,12 +678,21 @@ What an operator sees change, and what to do:
   an emptied scan dir, a large lost subtree and any loss of 3+ files over 10% of the catalog (within 15 minutes); release it with
   `releasedeletes` and the `hold_id` from `repostate` (**required**) once intended. Check `repostate`
   (`deletes_held`) after an upgrade if the scan dir changed while filerepo was down.
-- **Mass rewrites are held** like mass deletes (`rewrites_held`, `releaserewrites` with `hold_id`). A job that
-  legitimately regenerates most of a repository at once must be followed by a release, or set
-  `sync_rewrite_guard_fraction=1.0` for that repository.
-- **On macOS and Windows** (no descriptor-relative opens), `getfile` and `streamfile` read a file twice: once to prove
-  the opened file holds its cataloged content, once to send it; a file changed since the last scan is refused until
-  rescanned. Linux opens descriptor-relative and reads once.
+- **Mass rewrites are held** like mass deletes (`rewrites_held`, `releaserewrites` with `hold_id`), also when spread
+  over a day (25%) or since the last acknowledgement (50%). A job that legitimately regenerates most of a repository
+  must be followed by a release, or set the rewrite fractions to `1.0` for that repository. Deletes have the same
+  longer budgets (25% a day, 50% since the last release).
+- **A mirror's directory carries a generation marker** (`.filerepo-staging/generation`). A mirror upgraded from a build
+  without one starts a new generation once (its producer offers everything; it holds what it has and fetches nothing
+  twice).
+- **A producer silent for 30 days** (`sync_holder_ttl_ms`): its files at a mirror are changed by it alone, and deleted
+  only with an admin's `releasedeletes` at the mirror.
+- **On macOS and Windows** (no descriptor-relative opens), `getfile` and `streamfile` prove an opened file by reading
+  it once through its descriptor (it must hash to its cataloged content) before sending it: after the size check
+  (getfile answers "too large" from the catalog without opening the file) and after the transfer is admitted (on its
+  own thread). The proven descriptor is kept for a minute for the same caller and file version, so the next ranges of
+  that file are not read again. A file changed since the last scan is refused until rescanned. Linux opens
+  descriptor-relative and reads once.
 - **`streamfile`**: `transfer_id` is optional and validated; `ident_key` must be a property name; chunks carry
   `offset`; every transfer ends with an empty terminal frame (`transfer_end=true`, `sha384` on success). A client that
   counts frames should skip the terminal one (it carries no payload). Busy is `status 11`.

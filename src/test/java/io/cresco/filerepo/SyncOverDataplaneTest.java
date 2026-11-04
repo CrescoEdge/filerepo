@@ -520,7 +520,8 @@ class SyncOverDataplaneTest {
     @Test
     void aMirrorPinnedToItsProducersSubscribesToNoOther() throws Exception {
         producer();
-        subscriber("sync_producers", TestRig.REGION + "/" + TestRig.AGENT + "/plugin-elsewhere");
+        // pins are per node (and directory): a node elsewhere
+        subscriber("sync_producers", TestRig.REGION + "/agent-elsewhere");
         producer.repo.repoBroadcast("fr", "discover", 0);
         Thread.sleep(300);
         assertFalse(producer.repo.isSubscriber(TestRig.REGION, TestRig.AGENT, "plugin-s"), "plugin-p is not a pinned producer");

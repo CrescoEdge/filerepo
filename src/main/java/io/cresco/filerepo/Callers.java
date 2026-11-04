@@ -56,6 +56,14 @@ final class Callers {
         return c.getPrincipal();
     }
 
+    /** The verified caller's tenant ("-" for an anonymous caller in insecure mode), or null. */
+    static String tenant(MsgEvent m, boolean insecure) {
+        Caller c = of(m, insecure);
+        if (c == null) return null;
+        if (c.isAnonymous() || c.getTenant() == null) return "-";
+        return c.getTenant();
+    }
+
     /**
      * The plugin a sync message comes from, {region, agent, pluginid}, as the verified caller names it. Null when the
      * caller is not verified, or not a plugin. In insecure mode an anonymous caller is addressed by the message's

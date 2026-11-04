@@ -81,6 +81,31 @@ class StreamFileTest {
     }
 
     @Test
+    void aProvenDescriptorIsReusedForTheRangesOfOneFileNotReReadForEach() throws Exception {
+        rig();
+        byte[] data = new byte[300_000];
+        new java.util.Random(7).nextBytes(data);
+        Path f = cataloged("ranges.bin", data);
+        for (int i = 0; i < 3; i++) {
+            assertEquals("10", stream(f, i * 100_000L, 100_000, "transfer_id", "r" + i).getParam("status"));
+            assertEquals("10", terminal("r" + i).getStringProperty("transfer_status"));
+        }
+        boolean descriptorRelative;
+        try (var ds = Files.newDirectoryStream(repo)) {
+            descriptorRelative = ds instanceof java.nio.file.SecureDirectoryStream;
+        }
+        // proven once (the fallback), or never needed (descriptor-relative opens)
+        assertEquals(descriptorRelative ? 0 : 1, rig.exec.proofs.get(), "whole-file proofs for three ranges of one file");
+        // a version change is proven again
+        byte[] v2 = "the second version".getBytes();
+        Files.write(f, v2);
+        rig.db.upsertFile(f.toString(), Hashes.content(v2), Files.getLastModifiedTime(f).toMillis(), v2.length);
+        assertEquals("10", stream(f, 0, v2.length, "transfer_id", "v2").getParam("status"));
+        assertEquals("10", terminal("v2").getStringProperty("transfer_status"));
+        assertEquals(descriptorRelative ? 0 : 2, rig.exec.proofs.get());
+    }
+
+    @Test
     void aTransferWithNoVerifiedCallerIsRefused() throws Exception {
         rig();
         Path f = cataloged("anon.txt", "hello".getBytes());
@@ -325,8 +350,18 @@ class StreamFileTest {
         }
         hold.countDown();
         Message end = terminal("short");
-        assertEquals("8", end.getStringProperty("transfer_status"));
         assertNull(end.getStringProperty("sha384"), "no hash for an incomplete transfer");
-        assertEquals("1000", end.getStringProperty("total_bytes"));
+        boolean descriptorRelative;
+        try (var ds = Files.newDirectoryStream(repo)) {
+            descriptorRelative = ds instanceof java.nio.file.SecureDirectoryStream;
+        }
+        if (descriptorRelative) {
+            assertEquals("8", end.getStringProperty("transfer_status"));
+            assertEquals("1000", end.getStringProperty("total_bytes"));
+        } else {
+            // the fallback proves the file by its content before sending: a truncated file is refused whole
+            assertEquals("9", end.getStringProperty("transfer_status"));
+            assertEquals("0", end.getStringProperty("total_bytes"));
+        }
     }
 }
