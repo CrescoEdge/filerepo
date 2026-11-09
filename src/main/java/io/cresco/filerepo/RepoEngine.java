@@ -618,7 +618,7 @@ public class RepoEngine {
                 r -> { Thread t = new Thread(r, "filerepo-offer"); t.setDaemon(true); return t; });
         offerPool.allowCoreThreadTimeOut(true);
 
-        if (liveTier != null) {
+        if (liveTier != null && dbEngine.openError() == null) {
             List<String> known = new ArrayList<>();
             // roots the operator names (comma-separated): refused from the start, before any provider has registered
             String configured = plugin.getConfig().getStringParam("live_roots");
@@ -632,7 +632,10 @@ public class RepoEngine {
             liveTier.rememberRoots(known, this::rememberLiveRoot);
         }
 
-        if (liveRow == null && scanDirString != null && fileRepoName != null) {
+        // a catalog that did not open (another plugin serves this directory, or it failed): nothing below reads or writes
+        // it -- start() says why once, and the plugin serves nothing
+        boolean catalogOpen = dbEngine.openError() == null;
+        if (catalogOpen && liveRow == null && scanDirString != null && fileRepoName != null) {
             // a producer keeps serving the subscribers it knew before a restart, until they go quiet
             for (DBEngine.Subscriber s : dbEngine.getSubscribers()) {
                 subscribers.put(s.key, new ActiveSub(s.key, s.region, s.agent, s.plugin, s.gen, s.lastSeen));
@@ -640,18 +643,20 @@ public class RepoEngine {
             refreshRewriteHold();
         }
         // this repository's sync generation survives a restart: a plain restart resumes where it left off
-        syncGen = loadGen();
-        try {
-            Identity recorded = Identity.parse(dbEngine.getMeta(META_PRODUCER_PIN));
-            if (recorded != null && recorded.key == null) {
-                // round 3 pinned by directory, and pinned whoever answered first: not an identity, and not an admin's choice
-                legacyPin = recorded;
-                if (isMirror()) dbEngine.nameHolder(recorded.holder(), recorded.toString());
-            } else {
-                adminPin = recorded;
+        syncGen = catalogOpen ? loadGen() : SyncReceiver.token();
+        if (catalogOpen) {
+            try {
+                Identity recorded = Identity.parse(dbEngine.getMeta(META_PRODUCER_PIN));
+                if (recorded != null && recorded.key == null) {
+                    // round 3 pinned by directory, and pinned whoever answered first: not an identity, and not an admin's choice
+                    legacyPin = recorded;
+                    if (isMirror()) dbEngine.nameHolder(recorded.holder(), recorded.toString());
+                } else {
+                    adminPin = recorded;
+                }
+            } catch (Exception ex) {
+                adminPin = null;
             }
-        } catch (Exception ex) {
-            adminPin = null;
         }
 
         if (liveRow == null && scanDirString == null && repoDir == null) {
